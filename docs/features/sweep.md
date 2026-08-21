@@ -100,6 +100,24 @@ zero-mutation guarantee is literal — a dry run does not claim, merge,
 park, comment, label, or launch anything; it only prints what would
 happen.
 
+**The synchronous chunked path has a floor of its own, too.** Because it is
+what the overlap tier degrades *to*, it cannot itself degrade into
+improvisation. Availability of the underlying build-invocation capability is
+therefore settled once, up front, as a whole-run fact: when the invocation
+mechanism is missing or withheld from the session, the run stops before
+anything is claimed and says so, naming both what failed and how to restore
+it — never rediscovering the same problem one chunk at a time and
+re-prompting for each. If a chunk's invocation is nevertheless refused at
+call time, the refusal is never retried: every issue in that chunk is
+recorded as parked-but-not-attempted, with the reason left as a comment on
+the issue itself, and the run moves on to the next chunk — one refusal never
+aborts the rest. Those issues are deliberately *not* marked as needing
+clarification, because there is no question to answer: they stay ordinary
+drivable issues and re-enter the next run's pool as soon as the capability
+returns. A second consecutive refusal ends the attempt loop for the run, so a
+nine-chunk run cannot turn one standing permission problem into nine
+identical prompts.
+
 Every pooled issue reaches one of a small set of terminal outcomes by the
 end of a run — merged, resolved as a verdict-only item, or parked on an
 open question — and the run structurally cannot report success while an
