@@ -224,7 +224,7 @@ bash workflows/scripts/validate-state-graph-call.sh	workflows/scripts/validate-s
 bash workflows/scripts/tests/test_state_graph_call.sh	workflows/scripts/validate-state-graph-call.sh workflows/scripts/build/state-graph.sh workflows/scripts/tests/test_state_graph_call.sh claude/commands/build.md
 make test-build-workflow	workflows/scripts/build/** claude/workflows/** workflows/scripts/lib/portable-timeout.sh
 bash workflows/scripts/tests/test_ready_pr_sweep.sh	workflows/scripts/ready-pr-sweep.sh workflows/scripts/board/** workflows/scripts/tests/test_ready_pr_sweep.sh
-make test-env-hygiene-report	workflows/scripts/env-hygiene-report.sh workflows/scripts/build/env-reconcile.sh workflows/scripts/tests/test_env_hygiene_report.sh
+make test-env-hygiene-report	workflows/scripts/env-hygiene-report.sh workflows/scripts/build/env-reconcile.sh workflows/scripts/build/lib/job-scratch.sh workflows/scripts/tests/test_env_hygiene_report.sh
 make lint-pr-body-test	workflows/scripts/lint-pr-body.sh workflows/scripts/tests/test_lint_pr_body.sh
 
 # ── Hooks ───────────────────────────────────────────────────────────────────

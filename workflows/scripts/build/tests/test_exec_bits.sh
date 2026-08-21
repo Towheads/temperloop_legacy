@@ -26,6 +26,7 @@ SOURCED_ONLY=(
   "build.config.sh"
   "merged-detect.sh"   # lib/ helper, `. sourced` by worktree.sh prune + env-reconcile.sh — never run by bare path
   "pr-linkage.sh"      # lib/ helper, `. sourced` by issue-state.sh (temperloop #635) — never run by bare path
+  "job-scratch.sh"     # lib/ helper, `. sourced` by env-reconcile.sh + job-scratch-reclaim.sh (temperloop#1111) — never run by bare path
 )
 
 is_sourced_only() {
