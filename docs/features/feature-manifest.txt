@@ -268,6 +268,17 @@ pipeline-driver workflows/scripts/build/tests/test_pipeline_*
 hooks claude/hooks/*
 hooks claude/status-line.sh
 
+# ── toolkit-provenance — is the running toolkit the release it claims? ─────
+# Overrides the broader `hooks claude/hooks/*` claim below/above for its own
+# two files (longest pattern wins). The `temperloop doctor` subcommand and its
+# test stay claimed by `install-cli bin/*`: the subcommand is a CLI surface
+# that happens to expose this check, not a member of this feature.
+toolkit-provenance workflows/scripts/toolkit-provenance.sh
+toolkit-provenance workflows/scripts/tests/test_toolkit_provenance.sh
+toolkit-provenance workflows/scripts/tests/test_doctor_toolkit_provenance.sh
+toolkit-provenance claude/hooks/session-start-provenance.sh
+toolkit-provenance claude/hooks/tests/test_provenance_notice.sh
+
 # ── install-cli — bin/ CLI, install/doctor, kernel seed/update, onboarding ──
 install-cli bin/*
 install-cli claude/commands/init.md

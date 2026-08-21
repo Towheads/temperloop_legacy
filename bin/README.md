@@ -152,7 +152,7 @@ provisioned by hand either — see § Tracker mode in
 shim was removed in v0.19.0 (see above) and now only refuses, naming
 `temperloop`.
 
-### Verify: `temperloop install` + `doctor.sh`
+### Verify: `temperloop install` + `temperloop doctor`
 
 `init` above works against a target repo and needs no machine-wide setup
 of its own. Its **handoff** is the exception worth calling out: `init`
@@ -171,9 +171,21 @@ temperloop install            # --dry-run to preview, --yes to skip the prompt
 
 Run that printed command any time to re-check link state on its own — `OK`
 per managed path, or `MISSING` / `DRIFT` / `SHADOWED` / `DANGLING` when
-something's drifted. There is no `temperloop doctor` subcommand; `doctor.sh`
-is invoked directly, at the path `temperloop install` prints for you. See
-`docs/features/install-cli.md` for exactly what it checks.
+something's drifted.
+
+```sh
+temperloop doctor             # same health check, same output, no path to copy
+```
+
+`temperloop doctor` is the first-class way in: it `exec`s that same script, so
+its output and exit code are identical by construction, and it takes the same
+optional `<toolkit-root>` argument. (Earlier releases had no such subcommand
+and this page said so; that is no longer true — see the CHANGELOG entry for the
+release that added it.) Beyond link state the health check also reports
+**toolkit provenance** — whether the toolkit code you are running is
+byte-identical to the release it claims to be; see
+[`../docs/features/toolkit-provenance.md`](../docs/features/toolkit-provenance.md).
+See `docs/features/install-cli.md` for exactly what it checks.
 
 ### `temperloop feedback` vs. `temperloop report` — sending vs. rendering
 

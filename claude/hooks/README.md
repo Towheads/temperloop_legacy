@@ -6,6 +6,7 @@
 |---|---|---|---|---|
 | `session-start-drain.sh` | SessionStart | — | Vault drain (`Sessions/_inbox/`), vault snapshot | Yes (drain/snapshot skipped; session-id still emitted) |
 | `mcp-health-preflight.sh` | SessionStart | — | Injects banner into model context | Yes (no banner injected under eval) |
+| `session-start-provenance.sh` | SessionStart | — | Injects an unprompted toolkit-provenance notice into model context, **only** when the verdict is `MODIFIED` | Yes (exits 0 silently under EVAL_RUN) |
 | `session-start-deploy-mini.sh` | SessionStart | — | Board toolkit deploy (mini-only) | No (mini-gate handles it; eval runs are not mini) |
 | `git-stale-branch-guard.sh` | PreToolUse | Bash | None (prod: *ask* decision) | Yes (exits 0 silently under EVAL_RUN) |
 | `claude-p-spawn-guard.sh` | PreToolUse | Bash | None (prod: *ask* decision) | Yes (exits 0 silently under EVAL_RUN) |
@@ -139,6 +140,7 @@ done
 | Sequencing record cleanup | Runs | **Suppressed** |
 | Git stale-branch guard on `checkout -b`/`switch -c` off stale main | `ask` decision | **Suppressed** (exit 0) |
 | Session-id `additionalContext` | Emitted | **Emitted** (eval traceability) |
+| Toolkit-provenance `additionalContext` on a `MODIFIED` checkout | Injected | **Suppressed** (exit 0) |
 | Write-jail guard (build-worktree-guard), incl. its writer-identity arm | Active when armed | Active when armed |
 | Subtree-edit guard on Edit/Write/MultiEdit into `kernel/` (direct or via a compat symlink) | `ask` decision (or silent bypass under `.build-guard`/`KERNEL_EDIT_ACK=1`) | **Suppressed** (exit 0) |
 | Write-lane guard on a mutation targeting a foreign repo's canonical checkout | `ask` decision | **Suppressed** (exit 0) |
