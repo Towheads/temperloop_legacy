@@ -2670,8 +2670,18 @@ function gateSliceResumeAt(out) {
 
 // gateVerdict(terminalOutcome, ledger) — the ONE reconciliation point be — see build-level.design-notes-3.md#gateverdict-terminaloutcome-ledger-the-one-reconciliation-po
 function gateVerdict(terminalOutcome, ledger) {
-  const failedGates = ledger.reduce((n, s) => n + (Number(s.failed) || 0), 0);
-  const failedInSlices = ledger.filter((s) => (Number(s.failed) || 0) > 0).map((s) => s.slice);
+  // temperloop#2133 (a §3e review finding on the #2135 branch, no issue of its
+  // own): read the ledger's failure count STRICTLY. `Number(x) || 0` collapses
+  // BOTH `null` and `NaN` to 0 — the same laundering temperloop#1698 fixed for
+  // elapsedSecs — so the day gateSliceFailed()'s contract grows an
+  // "unreadable failure count" sentinel, an UNKNOWN count would read as a known
+  // zero. The rule, applied at all three ledger-reading sites: a non-finite count
+  // is never a known zero. Identical to the prior expression for every finite
+  // input, which is all the single-writer ledger produces today.
+  const failedGates = ledger.reduce((n, s) => n + (Number.isFinite(s.failed) ? s.failed : 0), 0);
+  const failedInSlices = ledger
+    .filter((s) => !Number.isFinite(s.failed) || s.failed > 0)
+    .map((s) => s.slice);
   // A resume point in the LAST ledger entry is direct evidence that gates — see build-level.design-notes-3.md#a-resume-point-in-the-last-ledger-entry-is-direct-evidence-t
   const lastSliceResumeAt = ledger.length > 0
     ? gateSliceResumeAt(ledger[ledger.length - 1])
@@ -6348,9 +6358,56 @@ async function driveItemBuildPhase(item, arm, box) {
   // precedence (env > machine-conf > repo-local > tracked-default), so an
   // inherited setting wins the env layer and false-FAILs a change CI's `checks`
   // passes green. `build-config-settings.sh` prints the (SSOT-derived) setting names;
-  // unsetting them makes the gate hermetic — tracked defaults, matching CI. A
-  // missing/older helper prints nothing → `unset` no-op → prior behavior.
+  // unsetting them makes the gate hermetic — tracked defaults, matching CI.
+  // temperloop#2142: A FAILING SCRUB MUST NEVER STOP THE GATE FROM RUNNING. The
+  // scrub is best-effort environment hygiene, so its failure is not evidence the
+  // branch under test is broken — yet, chained under `&&`, its exit status decides
+  // whether quality-gates.sh runs at all. When it short-circuits, no
+  // QUALITY_GATES_FAILED=/QUALITY_GATES_RESUME_AT= trailer is printed, `${__f:-1}`
+  // floors to 1, and §3e.5 escalates `acceptance-gate-failed` — "this branch is
+  // broken" — on a tree whose gates never executed.
+  //
+  // The INSTANCE that bit: a missing/older helper prints NOTHING, and a bare
+  // `unset $(…)` resolving to zero arguments is a silent no-op in bash but rc=1 in
+  // zsh ("not enough arguments") — and the executor's Bash tool is zsh on macOS,
+  // the same dialect premise the PIPESTATUS note relies on (temperloop#801). That
+  // is the STRANGER case: every consuming repo on an older vendored toolkit.
+  //
+  // `__qg_noop` alone closes only that one path, and a fix scoped to one instance
+  // is a smell (kernel § Fix the real problem, not the symptom). The CLASS is ANY
+  // failing `unset`, and it has three members — MEASURED, not reasoned about,
+  // against bash 5 and zsh 5.9:
+  //   zero arguments        bash: no-op, rc=0      zsh: rc=1, CATCHABLE
+  //   invalid parameter name  bash: rc=1           zsh: FATAL — kills the shell
+  //   readonly parameter      bash: rc=1           zsh: FATAL — kills the shell
+  // The zsh "FATAL" rows are the finding that shaped the form below: a fatal
+  // parameter error is NOT an exit status, so `||`, `;`, a brace group and a
+  // function wrapper are all powerless against it (all four measured). Only a
+  // SUBSHELL contains it. So the scrub is three layers, each closing one row:
+  //   1. `grep -E '^[A-Za-z_][A-Za-z0-9_]*$'` drops anything that is not a shell
+  //      NAME before `unset` ever sees it — closes the invalid-name row at source,
+  //      including the day this helper's name parser is loosened.
+  //   2. A PROBE in a subshell: if unsetting this name set would kill the shell
+  //      (the readonly row), it kills the throwaway subshell instead and the real
+  //      scrub is skipped. Hygiene is forfeited for that run; the gate still runs,
+  //      which is the correct trade for a best-effort scrub.
+  //   3. `{ … || :; }` swallows whatever status survives, in a brace group rather
+  //      than a `;` terminator so `cd`'s OWN rc stays in the chain — a failed `cd`
+  //      must still stop the gate from running against the wrong tree.
+  // `unset -v` restricts the scrub to VARIABLES so bash cannot fall through to
+  // unsetting a same-named function; `-v` is accepted by bash, zsh and sh.
+  // `__qg_noop` stays: it costs nothing and is what the K2142 guard anchors on.
+  // The helper runs twice (probe + real) because the probe's effects cannot escape
+  // its subshell; it is one short bash fork against a gate slice measured in
+  // minutes. Sibling scrub sites (workflows/scripts/count-prose.sh,
+  // workflows/scripts/build/tests/test_build_config_settings.sh) carry the same
+  // shape. The K2142 guard scans THIS FILE only, so the repo-wide static lint that
+  // would enforce the rule everywhere is temperloop#2157, not shipped here.
   const settingsBin = `${wt}/workflows/scripts/build/build-config-settings.sh`;
+  // ONE LINE ON PURPOSE: the K2142 behavioural prong lifts this exact line out of
+  // the file and executes it, so keep it a single `const` whose only interpolation
+  // is `${sq(settingsBin)}` (which that prong rewrites to a fixture path).
+  const gateScrub = `{ ( unset -v __qg_noop $(bash ${sq(settingsBin)} 2>/dev/null | grep -E '^[A-Za-z_][A-Za-z0-9_]*$') ) 2>/dev/null && unset -v __qg_noop $(bash ${sq(settingsBin)} 2>/dev/null | grep -E '^[A-Za-z_][A-Za-z0-9_]*$') 2>/dev/null || :; }`;
   // gateCmd(startAt) — one SLICE of the suite (temperloop#1021). — see build-level.design-notes-5.md#gatecmd-startat-one-slice-of-the-suite-temperloop-1021
   const gateLog = `/tmp/qg-${item.slug}.log`;
   // ONE SLICE'S OWN OUTPUT, kept separate from the cumulative log above — see build-level.design-notes-5.md#one-slice-s-own-output-kept-separate-from-the-cumulative-log
@@ -6401,7 +6458,7 @@ async function driveItemBuildPhase(item, arm, box) {
   const gateCmd = (startAt, expectSelection) =>
     `set -o pipefail; if [ ! -x ${sq(qgBin)} ]; then echo '{"outcome":"GATE_ABSENT"}'; ` +
     `else ${startAt === 0 ? `rm -f ${sq(gatePin)} ${sq(gateSliceLog)}; : >${sq(gateLog)}; ` : ''}` +
-    `( cd ${sq(wt)} && unset $(bash ${sq(settingsBin)} 2>/dev/null) && ` +
+    `( cd ${sq(wt)} && ${gateScrub} && ` +
     `${gateScopeEnv} QUALITY_GATES_SELECTION_PIN=${sq(gatePin)} ` +
     `${expectSelection ? `QUALITY_GATES_EXPECT_SELECTION=${sq(expectSelection)} ` : ''}` +
     `QUALITY_GATES_START_AT=${startAt} QUALITY_GATES_BUDGET_SECS=${GATE_SLICE_SECS} ${sq(qgBin)} ) ` +
@@ -6488,7 +6545,9 @@ async function driveItemBuildPhase(item, arm, box) {
     if (
       gateSlices + 1 === gateSliceCeiling
       && gateExtensionsUsed < GATE_RESUME_EXTENSIONS
-      && gateSliceLedger.every((s) => (Number(s.failed) || 0) === 0)
+      // temperloop#2133 — the load-bearing one: this grants MORE budget on the
+      // strength of "zero failures so far", so it must require a KNOWN zero.
+      && gateSliceLedger.every((s) => Number.isFinite(s.failed) && s.failed === 0)
     ) {
       gateSliceCeiling += GATE_MAX_SLICES;
       gateExtensionsUsed++;
@@ -6557,7 +6616,18 @@ async function driveItemBuildPhase(item, arm, box) {
       ? ` — NOTE: approaching the per-slice budget; raise BUILD_GATE_SLICE_SECS or split the gate list before it costs a re-slice`
       : '';
     const elapsedNote = gateElapsedUnknown ? '?' : String(gateElapsed);
-    log(`[${item.slug}] 3e.5 gate PASS — ${gateSlices + 1} slice(s), ${elapsedNote}s of gate wall time (slice budget ${GATE_SLICE_SECS}s, cap ${gateSliceCeiling} slices${gateExtensionsUsed > 0 ? `, ${gateExtensionsUsed} resume extension(s) used` : ''})${marginNote}`);
+    log(`[${item.slug}] 3e.5 gate PASS — ${gateSlices + 1} slice(s), ${elapsedNote}s of gate wall time (slice budget ${GATE_SLICE_SECS}s, ` +
+      // temperloop#2133 — this line IS the decay signal an operator reads to decide
+      // whether to raise BUILD_GATE_SLICE_SECS or split the gate list, so every
+      // figure in it must mean the same thing on every run. `cap ${gateSliceCeiling}`
+      // did not: on a run that spent an extension it rendered the MID-RUN ceiling,
+      // which is neither the configured base cap nor the hard bound. Name the base
+      // cap, the extension allowance, the hard bound and the extensions actually
+      // spent, each derived from its constant — never a literal (kernel § Named-
+      // setting convention).
+      `base cap ${GATE_MAX_SLICES} slices (+${GATE_RESUME_EXTENSIONS} extension(s) allowed, ` +
+      `hard cap ${GATE_MAX_SLICES * (GATE_RESUME_EXTENSIONS + 1)}; ${gateExtensionsUsed} used, ` +
+      `ceiling this run ${gateSliceCeiling}))${marginNote}`);
   }
 
   // --- 3e.6. Class-A activation gate (temperloop#1219) ----------------------

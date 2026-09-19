@@ -14755,5 +14755,224 @@ printf '%s' "$K2083_14" | grep -F 'merge_blocked' >/dev/null   || fail "#2083 r3
 printf '%s' "$K2083_SEL" | grep -F 'PLAN NOTE' >/dev/null   || fail "#2083 r3: Step 4's selected set still reads the in-memory level summary as its authority — the one source a resumed run does not have"
 echo "PASS: #2083 r3 — the barrier names its safe branch positively, every summary shape carries the held discriminant, and merge_blocked has a durable writer/parser/resume path"
 
+# --- K2142 §3e.5 emitted-gate-command guards (structural + behavioural) ------
+# temperloop#2142. The emitted gate command scrubs the pipeline's own
+# build.config.sh settings with `unset $(bash build-config-settings.sh)` before
+# running quality-gates.sh (#1241). That scrub is BEST-EFFORT hygiene, so its
+# exit status is never evidence the branch under test is broken — yet chained
+# under `&&` its rc decides whether the gate runs at all. When the rc is
+# non-zero the gate SHORT-CIRCUITS: quality-gates.sh never runs, no
+# QUALITY_GATES_FAILED= trailer is printed, `${__f:-1}` floors to 1, and §3e.5
+# escalates `acceptance-gate-failed` — "this branch is broken" — on a tree whose
+# gates never executed.
+#
+# THE CLASS, MEASURED (bash 5 / zsh 5.9) — three ways the scrub can fail, and the
+# reason the shipped fix is three layers rather than one:
+#   zero arguments         bash: no-op, rc=0   zsh: rc=1, CATCHABLE
+#   invalid parameter name bash: rc=1          zsh: FATAL — kills the shell
+#   readonly parameter     bash: rc=1          zsh: FATAL — kills the shell
+# The INSTANCE that bit is row 1: an absent or older helper prints nothing, and
+# zsh is the machinery-executor's Bash tool on macOS. But rows 2 and 3 are FATAL
+# in zsh — not an exit status at all — so `||`, `;`, a brace group and a function
+# wrapper are ALL powerless against them (each measured); only a SUBSHELL contains
+# them. Hence: filter the names (row 2), probe in a subshell (row 3), decouple the
+# surviving status (row 1 and everything in bash). The arms below execute all
+# three rows in both dialects. Nothing pinned any of it before this guard, which
+# is exactly why the regression survived review.
+#
+# The scan is restricted to EMITTED command text: a `//` line is prose (this
+# defect's own corrected rationale quotes the broken form verbatim), and prose is
+# not a shell command. Everything the gate actually runs lives inside a template
+# literal on a non-comment line.
+# LIVENESS is anchored on the scrub's OWN `const`, not on a repo-wide pattern.
+# The word "unset" also appears in emitted PROSE — a refusal message elsewhere in
+# this file says a credential "is unset" — so a scan loose enough to survive a
+# re-spelling of the scrub is also loose enough to read that prose as coverage
+# and stay green after the scrub is deleted outright.
+_k2142_scrub_line="$(grep -n 'const gateScrub = ' "$MJS" || true)"
+[ -n "$_k2142_scrub_line" ] \
+  || fail "#2142: build-level.mjs no longer defines \`const gateScrub\` — the anchor this whole guard reads is gone. Re-anchor the guard on whatever now carries the §3e.5 environment scrub; do NOT delete it, the defect it pins is a fabricated \`acceptance-gate-failed\` on a tree whose gates never ran"
+printf '%s\n' "$_k2142_scrub_line" | grep -F 'unset' >/dev/null \
+  || fail "#2142: \`const gateScrub\` no longer runs an \`unset\` at all — the gate's #1241 environment scrub has been deleted, so the acceptance gate now runs against whatever build.config.sh settings this process inherited. That is the false-FAIL #1241 fixed, arriving from the other direction"
+
+# THE RULE: every emitted (non-comment) `unset` COMMAND must name a LITERAL NAME
+# as its first argument. The previous spelling of this check tested only for
+# `unset $(`, which passed two equally fatal forms: the reviewer mutated the
+# source to `unset "$(bash …)"` (a QUOTED substitution — `zsh: invalid parameter
+# name`, rc=1) and the guard let it through, and an indirect `unset $names` slips
+# the same way. Both then tripped only the liveness anchor, whose message says
+# "re-anchor this extraction" — i.e. a real reintroduction was reported as guard
+# rot. So the check now rejects a first argument that BEGINS with an expansion,
+# a quote or a backslash, which is the mechanically-testable form of "must be a
+# literal name". Deliberately fail-SAFE rather than exact: `unset $(…) __qg_noop`
+# is provably harmless and is still rejected, because "first argument is a
+# literal" is a rule a reader can apply by eye and a regex can enforce without
+# parsing the shell.
+_k2142_unsets="$(grep -nE '(^|[^[:alnum:]_])unset[[:space:]]' "$MJS" | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' || true)"
+_k2142_bare="$(printf '%s\n' "$_k2142_unsets" | grep -E "unset[[:space:]]+(-[[:alnum:]]+[[:space:]]+)*[\$\"'\\\\\`]" || true)"
+[ -z "$_k2142_bare" ] \
+  || fail "#2142: an emitted shell command runs an \`unset\` whose FIRST argument begins with an expansion, a quote or a backslash rather than being a literal NAME. The unquoted \`unset \$(…)\`, the quoted substitution and the indirect \`unset \$names\` are all equally fatal: each can resolve to zero arguments (rc=1 in zsh, the executor's shell) or to a name the shell rejects (FATAL in zsh — uncatchable by any \`||\`, measured), and either way §3e.5 invents a GATE_FAIL on a tree whose gates never ran. Ship the three-layer form the \`const gateScrub\` line carries: a literal placeholder first, the printed names filtered to shell NAMEs, and the status decoupled behind a probe subshell. Offending line(s):
+$_k2142_bare"
+unset _k2142_scrub_line _k2142_unsets _k2142_bare
+
+# BEHAVIOURAL half: lift the REAL clause out of build-level.mjs and EXECUTE it
+# in each dialect against fixtures that reproduce each row of the class table in
+# that file's own comment. Every arm has a RED counterpart, so the case carries
+# its own discrimination proof rather than asserting one — and every arm runs in
+# BOTH dialects except the one that is dialect-specific by construction.
+#
+# FIXTURES: an ABSENT helper (zero-argument unset), a helper printing a name the
+# test makes `readonly` (zsh-FATAL row), and a helper printing an invalid
+# parameter name next to a real one (invalid-name row + a positive check that the
+# scrub still scrubs).
+_k2142_missing="$WF_TEST_TMPDIR/k2142-absent-build-config-settings.sh"
+[ ! -e "$_k2142_missing" ] \
+  || fail "#2142: the absent-helper fixture path unexpectedly exists — this case needs a MISSING helper to reproduce the empty command substitution"
+_k2142_ro="$WF_TEST_TMPDIR/k2142-readonly-settings.sh"
+printf '%s\n' 'echo K2142_RO' >"$_k2142_ro"
+_k2142_bad="$WF_TEST_TMPDIR/k2142-badname-settings.sh"
+printf '%s\n' 'echo K2142_GOOD' 'echo "K2142_BAD=1"' >"$_k2142_bad"
+
+# The shipped clause is lifted from its own single-line `const`, so this prong
+# can never drift into executing a form the repo does not ship.
+_k2142_src="$(grep -F 'const gateScrub = ' "$MJS" | head -1 || true)"
+[ -n "$_k2142_src" ] \
+  || fail "#2142: could not locate the \`const gateScrub\` line in build-level.mjs — the behavioural prong has nothing left to execute, so the structural prong above is the only remaining cover; re-anchor this extraction. NOTE: a real reintroduction of the bare form should trip the structural prong, not this message — if you are reading this after changing the \`unset\` itself, check that prong first"
+_k2142_tmpl="$(printf '%s\n' "$_k2142_src" | sed -E 's/^[^`]*`//; s/`;[[:space:]]*$//')"
+# LOW 2 (review round 2): $WF_TEST_TMPDIR may contain `&` or `\`, both of which
+# are sed REPLACEMENT metacharacters that would silently corrupt the lifted
+# clause. So the fixture path is NEVER interpolated into a sed replacement: sed
+# only ever sees literal ASCII, and the shell splices the path around a fixed
+# sentinel token below.
+_k2142_token='${sq(settingsBin)}'
+_k2142_splice() {  # $1 = template, $2 = helper path -> runnable shell clause
+  local out='' rest="$1" head
+  while [ -n "$rest" ]; do
+    head="${rest%%"$_k2142_token"*}"
+    if [ "$head" = "$rest" ]; then out="$out$rest"; rest=''
+    else out="$out$head'$2'"; rest="${rest#*"$_k2142_token"}"; fi
+  done
+  printf '%s' "$out"
+}
+case "$_k2142_tmpl" in
+  '{ ( unset -v __qg_noop '*"$_k2142_token"*"$_k2142_token"*'|| :; }') : ;;
+  *) fail "#2142: the extracted gate scrub does not look like the shipped three-layer clause (probe subshell + real unset + \`|| :\`). Got: $_k2142_tmpl" ;;
+esac
+
+# The two MUTANTS. Neither is lifted — they exist only to be proven insufficient.
+#   BARE       — the pre-#2142 form the incident shipped.
+#   NAMED-ONLY — `__qg_noop` + `-v` + the name filter, but the status RE-COUPLED
+#                to the chain. This is the form that closes the INSTANCE without
+#                closing the CLASS, and arm 4 is what makes that concrete.
+_k2142_m_bare='unset $(bash '"$_k2142_token"' 2>/dev/null)'
+_k2142_m_named='unset -v __qg_noop $(bash '"$_k2142_token"' 2>/dev/null | grep -E '"'"'^[A-Za-z_][A-Za-z0-9_]*$'"'"')'
+
+for _k2142_sh in bash zsh; do
+  if ! command -v "$_k2142_sh" >/dev/null 2>&1; then
+    echo "SKIP: #2142 behavioural prong ($_k2142_sh) — $_k2142_sh is not installed on this host, so NO arm below was executed in this dialect. Enforcement here is the STRUCTURAL prong above, which pins the shipped clause by inspection and is dialect-independent; these arms add execution evidence on hosts that have the shell, they are not the only cover"
+    continue
+  fi
+  _k2142_ship_abs="$(_k2142_splice "$_k2142_tmpl" "$_k2142_missing")"
+  _k2142_ship_ro="$(_k2142_splice "$_k2142_tmpl" "$_k2142_ro")"
+  _k2142_ship_bad="$(_k2142_splice "$_k2142_tmpl" "$_k2142_bad")"
+
+  # ARM 1 (GREEN, absent helper): the shipped clause reaches the gate.
+  _k2142_out="$("$_k2142_sh" -c "$_k2142_ship_abs && echo REACHED_GATE" 2>&1 || true)"
+  case "$_k2142_out" in
+    *REACHED_GATE*) : ;;
+    *) fail "#2142 arm 1 ($_k2142_sh): the SHIPPED gate scrub with an ABSENT build-config-settings.sh did NOT reach the gate — the \`&&\` chain short-circuited, which is the original defect. Clause: $_k2142_ship_abs
+Output: $_k2142_out" ;;
+  esac
+
+  # ARM 2 (absent helper, BARE mutant) — the DIALECT premise, asserted in both
+  # directions so neither iteration is vacuous. Under zsh a zero-argument `unset`
+  # is rc=1 and must short-circuit (that is the defect). Under bash it is a no-op
+  # BY DEFINITION and must reach — which is exactly why arm 1 alone cannot
+  # discriminate on a bash-only host, and why this arm is stated rather than
+  # assumed: it goes red if bash's zero-argument behaviour ever changes.
+  _k2142_out="$("$_k2142_sh" -c "$(_k2142_splice "$_k2142_m_bare" "$_k2142_missing") && echo REACHED_GATE" 2>&1 || true)"
+  if [ "$_k2142_sh" = zsh ]; then
+    case "$_k2142_out" in
+      *REACHED_GATE*) fail "#2142 arm 2 (zsh): the BARE \`unset \$(…)\` mutant reached the gate, so this guard's discrimination premise no longer holds — zsh's zero-argument \`unset\` behaviour has changed, or the extraction is matching the wrong text. Re-derive the guard rather than trusting it. Output: $_k2142_out" ;;
+      *) : ;;
+    esac
+  else
+    case "$_k2142_out" in
+      *REACHED_GATE*) : ;;
+      *) fail "#2142 arm 2 (bash): the BARE \`unset \$(…)\` mutant did NOT reach the gate under bash, contradicting the premise this whole fix rests on (a zero-argument \`unset\` is a bash no-op, a zsh error). If bash has changed, the defect's dialect story — and the comment in build-level.mjs that states it — must be re-derived. Output: $_k2142_out" ;;
+    esac
+  fi
+
+  # ARM 3 (GREEN, readonly name) — THE CLASS, and dialect-independent. `unset` of
+  # a readonly parameter fails in bash (rc=1) and is FATAL in zsh; either way the
+  # shipped clause must still reach the gate. This arm is what `__qg_noop` alone
+  # could not satisfy, so it is non-vacuous in BOTH shells.
+  _k2142_out="$("$_k2142_sh" -c "readonly K2142_RO=1; $_k2142_ship_ro && echo REACHED_GATE" 2>&1 || true)"
+  case "$_k2142_out" in
+    *REACHED_GATE*) : ;;
+    *) fail "#2142 arm 3 ($_k2142_sh): a setting name that collides with a \`readonly\` parameter stopped the gate from running. A failing scrub is best-effort-hygiene failure, never evidence the branch is broken — the probe subshell plus \`|| :\` must absorb it. Clause: $_k2142_ship_ro
+Output: $_k2142_out" ;;
+  esac
+
+  # ARM 4 (RED for arm 3): the NAMED-ONLY mutant — the instance-scoped fix — must
+  # NOT reach the gate. Fails in both dialects, so arm 3 discriminates in both.
+  _k2142_out="$("$_k2142_sh" -c "readonly K2142_RO=1; $(_k2142_splice "$_k2142_m_named" "$_k2142_ro") && echo REACHED_GATE" 2>&1 || true)"
+  case "$_k2142_out" in
+    *REACHED_GATE*) fail "#2142 arm 4 ($_k2142_sh): the NAMED-ONLY mutant (\`__qg_noop\` + \`-v\` + filter, status still chained) reached the gate on a readonly-name collision, so arm 3 is no longer discriminating and the probe-subshell layer is unproven. Re-derive this arm rather than trusting arm 3." ;;
+    *) : ;;
+  esac
+
+  # ARM 5 (GREEN, invalid name) — the name FILTER, plus the only positive check
+  # that the scrub still does its job: the well-formed name must actually be
+  # scrubbed while the malformed one is dropped before `unset` ever sees it.
+  _k2142_out="$("$_k2142_sh" -c "export K2142_GOOD=inherited; $_k2142_ship_bad && echo \"REACHED_GATE good=[\${K2142_GOOD-scrubbed}]\"" 2>&1 || true)"
+  case "$_k2142_out" in
+    *"REACHED_GATE good=[scrubbed]"*) : ;;
+    *REACHED_GATE*) fail "#2142 arm 5 ($_k2142_sh): the gate was reached but K2142_GOOD SURVIVED the scrub — the fix has neutered the hygiene it exists to provide (#1241: an inherited setting wins the env layer and false-FAILs a change CI passes green). Output: $_k2142_out" ;;
+    *) fail "#2142 arm 5 ($_k2142_sh): a helper printing an INVALID parameter name alongside a valid one stopped the gate from running — the \`^[A-Za-z_][A-Za-z0-9_]*$\` filter must drop the malformed name before \`unset\` sees it (in zsh an invalid parameter name is FATAL, so no \`||\` can absorb it downstream). Clause: $_k2142_ship_bad
+Output: $_k2142_out" ;;
+  esac
+
+  if [ "$_k2142_sh" = zsh ]; then
+    echo "PASS: #2142 behavioural prong (zsh) — 5 arms executed in the dialect that EXHIBITS the defect: the shipped clause reaches the gate against an absent helper, a readonly-name collision and an invalid printed name, and both mutants (bare pre-#2142 form; instance-only \`__qg_noop\` form) provably short-circuit"
+  else
+    echo "PASS: #2142 behavioural prong (bash) — 5 arms executed. Arms 1-2 are a PREMISE CONTROL here, not coverage: a zero-argument \`unset\` is a bash no-op by definition, so the bare mutant reaches the gate too (asserted in arm 2, which goes red if bash ever changes) and the absent-helper row cannot discriminate in this dialect. Arms 3-5 DO discriminate in bash: the shipped clause absorbs a readonly-name failure and an invalid printed name while still scrubbing, and the instance-only mutant provably does not"
+  fi
+done
+unset -f _k2142_splice
+unset _k2142_missing _k2142_ro _k2142_bad _k2142_src _k2142_tmpl _k2142_token \
+  _k2142_m_bare _k2142_m_named _k2142_sh _k2142_out \
+  _k2142_ship_abs _k2142_ship_ro _k2142_ship_bad
+echo "PASS: #2142 emitted-gate structural guard — every emitted \`unset\` in build-level.mjs takes a LITERAL NAME as its first argument (no \`\$(…)\`, \`\"\$(…)\"\` or \`\$names\` spelling), so a command substitution that resolves to nothing — or to a name the shell rejects — can no longer short-circuit §3e.5 into a fabricated GATE_FAIL"
+
+# STRICT ledger reads (#2133). The resume-extension gate grants MORE slice budget
+# on the strength of "zero failures so far"; `Number(x) || 0` collapses both
+# `null` and `NaN` to 0, so an eventual unreadable-count sentinel would read as a
+# KNOWN zero and extend the budget over a slice whose result was unknown — the
+# same laundering #1698 fixed for elapsedSecs.
+grep -qE 'gateSliceLedger\.every\(\(s\) => Number\.isFinite\(s\.failed\) && s\.failed === 0\)' "$MJS" \
+  || fail "#2133: the §3e.5 resume-extension gate must require a KNOWN zero (Number.isFinite(s.failed) && s.failed === 0). \`(Number(s.failed) || 0) === 0\` launders a null/NaN failure count into 'zero failures, safe to extend'"
+_k2133_launder="$(grep -nE 'Number\(s\.failed\) \|\| 0' "$MJS" || true)"
+[ -z "$_k2133_launder" ] \
+  || fail "#2133: a ledger consumer still reads the failure count through \`Number(s.failed) || 0\`, which collapses a non-finite count to a known zero. Use Number.isFinite() at every ledger-reading site. Offending line(s):
+$_k2133_launder"
+unset _k2133_launder
+echo "PASS: #2133 strict ledger reads — no ledger site launders a non-finite failure count into a known zero"
+
+# The §3e.5 green-path DECAY SIGNAL (#2133). This log line is what an operator
+# reads to decide whether to raise BUILD_GATE_SLICE_SECS or split the gate list,
+# so its cap figures must mean the same thing on every run: the mid-run
+# `gateSliceCeiling` alone rendered a different number after an extension was
+# spent, matching neither the configured base cap nor the hard bound.
+_k2133_pass_log="$(grep -n '3e.5 gate PASS' "$MJS" || true)"
+[ -n "$_k2133_pass_log" ] \
+  || fail "#2133: the §3e.5 gate PASS log line is gone from build-level.mjs — the decay signal this guard defends no longer exists; re-anchor the guard rather than deleting it"
+unset _k2133_pass_log
+grep -qF 'base cap ${GATE_MAX_SLICES} slices' "$MJS" \
+  || fail "#2133: the §3e.5 gate PASS log must name the CONFIGURED base cap, derived from GATE_MAX_SLICES — not the mid-run gateSliceCeiling, whose value shifts between runs"
+grep -qF 'hard cap ${GATE_MAX_SLICES * (GATE_RESUME_EXTENSIONS + 1)}' "$MJS" \
+  || fail "#2133: the §3e.5 gate PASS log must DERIVE the hard cap from GATE_MAX_SLICES and GATE_RESUME_EXTENSIONS (kernel § Named-setting convention) — never restate it as a literal, which silently rots when either constant moves"
+echo "PASS: #2133 gate-PASS decay signal — the green-path log names the base cap, the extension allowance, the derived hard cap, the extensions spent and this run's ceiling, every figure derived from its constant"
+
 echo ""
 echo "All test_workflow.sh cases passed."

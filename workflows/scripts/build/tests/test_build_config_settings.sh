@@ -166,8 +166,11 @@ if [ "$ctrl" = "99999" ]; then ok "negative control: exported setting wins witho
 scrubbed="$(
   export BUILD_CONFIG_MACHINE="$empty" BUILD_CONFIG_LOCAL="$empty"
   export BUILD_MERGE_GATE_WINDOW=99999
+  # temperloop#2142: non-empty arg list (`-v __tbcs_noop`) + decoupled status
+  # (`|| :`). A zero-argument `unset` errors in zsh, and ANY non-zero `unset`
+  # trips the `set -e` in this file; the scrub is best-effort hygiene either way.
   # shellcheck disable=SC2046  # intentional word-split: unset the whole setting set
-  unset $(bash "$HELPER")
+  unset -v __tbcs_noop $(bash "$HELPER") || :
   # shellcheck disable=SC1090
   source "$CONFIG"
   echo "$BUILD_MERGE_GATE_WINDOW"
@@ -184,8 +187,8 @@ survivors="$(
   while IFS= read -r n; do [ -n "$n" ] && export "$n=SENTINEL_1709"; done <<<"$exports"
   # shellcheck disable=SC1090
   source "$CONFIG"
-  # shellcheck disable=SC2046  # intentional word-split: unset the whole setting set
-  unset $(bash "$HELPER")
+  # shellcheck disable=SC2046  # intentional word-split: unset the whole setting set (temperloop#2142 form)
+  unset -v __tbcs_noop $(bash "$HELPER") || :
   env | grep -F '=SENTINEL_1709' | cut -d= -f1 | sort || true
 )"
 if [ -z "$survivors" ]; then ok "no exported setting survives the scrub"; else
