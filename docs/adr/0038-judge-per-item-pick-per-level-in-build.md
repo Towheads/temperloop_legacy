@@ -55,15 +55,26 @@ Two operator levers sit on `build-level.mjs`'s existing escalation →
 verdict → continuation seam (a level re-drive carrying `input.verdicts`),
 deliberately not a new mid-workflow prompt:
 
-1. **Per-item override.** The operator may merge the losing arm's branch for
-   a single item, with a recorded reason; the level is marked `mixed`, and
-   that item's row carries `override: item`.
+1. **Override.** The operator may route an arm the tally did not pick, with a
+   recorded reason. It has two scopes, and the shipped verdict grammar names
+   both: `override-level <arm>` routes that arm for every item in the level
+   (the level stays single-arm-authored, so the pick's own invariant holds);
+   `override-item <slug> <arm> "<reason>"` routes it for the named items only,
+   which marks the level `mixed` and stamps `override: item` on each named
+   item's row.
 2. **Mandatory no-default confirmation while uncalibrated.** While the
    judge's calibration status reads `NEVER CALIBRATED` (or the calibration
    bar is unmet — see the harness's companion calibration ADR), every level
    pick requires an explicit operator confirmation before proceeding to
    PR — there is no default that lets it proceed on the tally alone. Once
    the bar is met, this reverts to the optional override above.
+
+So the shipped grammar is a closed set of **three** verdicts — `confirm`,
+`override-level`, `override-item` — which is lever 2 plus lever 1's two
+scopes, not a third lever. `override-level` is named explicitly here because
+it was implicit in "the operator may merge the losing arm's branch" when this
+ADR was first drafted (temperloop#2083), and a design-of-record that names
+only the per-item scope reads as if the level-wide one were out of contract.
 
 An item on which the winning arm has no gate-passing branch is re-driven once
 on the winner's own model; if still none, the item parks with an

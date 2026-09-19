@@ -5477,6 +5477,13 @@ async function routePickedItem(p, dual, decision, tally) {
   // A spike arm produced a verdict note, not a branch — there is nothing to
   // push. It already completed (driveArm's spike branch), so this is a normal
   // disposition, not a loss, and no PR, stamp or archive applies.
+  // UNREACHABLE BY CONSTRUCTION, kept deliberately as a fail-safe: `spike`
+  // derives from `item.kind`, which is identical across both arms of one item,
+  // so a pair can never be half-spike, and `driveLevelDualBuild` excludes any
+  // pair with `run.arms.some(a => a.spike)` from `pickables` before a pick is
+  // ever attempted. If a future change makes a spike pair pickable, this branch
+  // parks it cleanly instead of letting the winning-arm-lost path below re-drive
+  // a spike (which has no `ctx`) as though its missing branch were a gate loss.
   if (winner && winner.spike) {
     const rec = park(slug, null, null, winner.acceptanceResults ?? []);
     rec.parked.dual_build = { ...dualRecord, pick: { ...basePick, outcome: 'spike-no-pr' } };

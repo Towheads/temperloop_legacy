@@ -14636,5 +14636,77 @@ grep -F 'driveLevelPick' "$REPO_ROOT/claude/presentation-plane.md" >/dev/null \
   || fail "#2083: claude/presentation-plane.md has no row pointing at the level-pick kind's owner — a style template could restyle the verdict grammar the workflow parses"
 echo "PASS: #2083 static guards — the tally, the fail-closed calibration bar, the shared PR boundary, the loser archive, and both prose surfaces are wired"
 
+# --- temperloop#2083 round 2: the two BLOCKING pre-push review findings ------
+# Both HIGHs shipped because the round-1 guards above grep the WHOLE FILE for a
+# sentence. A whole-file grep cannot tell "declared at 3d-esc" from "enforced at
+# the site that fires", which is exactly the gap the kernel's § Mandatory-step
+# birth rule names. Every guard below is therefore REGION-SCOPED to the site the
+# behaviour must fire at, so deleting the enforcement goes red even though the
+# declaration elsewhere survives untouched.
+K2083_BMDF="$REPO_ROOT/claude/commands/build.md"
+[ -f "$K2083_BMDF" ] || fail "#2083 r2: claude/commands/build.md is missing"
+
+# HIGH 1 — `merge_blocked` must be ENFORCED inside Step 4, not only declared at
+# 3d-esc. Observed: Step 4's selected-set definition, its 4a summary, its 4a.5
+# union pre-check and its 4b consent ask mentioned the flag ZERO times, so a
+# merge_blocked item parked `[m]` like any other and nothing an orchestrator
+# reads at merge time excluded or flagged it — a dual-built PR merging with no
+# verified `Model-comparison-arms:` trailer, the one thing ADR 0040 exists to
+# prevent. `|| true` on each substitution per the #1937/#1219 idiom: a grep miss
+# under `set -e`/`pipefail` would otherwise abort before the guard can report.
+K2083_S4="$(awk '/^## Step 4 — Batch merge gate/{f=1} /^## Step 5 —/{f=0} f' "$K2083_BMDF" || true)"
+[ -n "$K2083_S4" ] || fail "#2083 r2: could not isolate Step 4 in build.md — every guard below would be vacuous"
+K2083_SEL="$(printf '%s\n' "$K2083_S4" | grep -F "The gate's selected set is the" || true)"
+[ -n "$K2083_SEL" ] \
+  || fail "#2083 r2: could not locate Step 4's selected-set definition — the one line that decides what reaches the merge gate"
+printf '%s' "$K2083_SEL" | grep -F 'merge_blocked' >/dev/null \
+  || fail "#2083 r2: Step 4's selected-set definition does not subtract \`merge_blocked\` items — a held dual-built PR parks \`[m]\` like any other, so without this filter it reaches the gate and merges unstamped (ADR 0040)"
+printf '%s' "$K2083_S4" | grep -F 'never offered as a 4b option' >/dev/null \
+  || fail "#2083 r2: Step 4 does not exclude a \`merge_blocked\` item from 4b's consent ask — a \"Merge all\" would sweep it up even with 4a rendering it"
+printf '%s' "$K2083_S4" | grep -F 'MERGE BLOCKED' >/dev/null \
+  || fail "#2083 r2: 4a renders no distinct row for a \`merge_blocked\` item — subtracted from the set AND absent from the block, a held item reads identically to one that merged"
+
+# HIGH 2 — `level-pick`'s operator-absent decision issue must be redirected to
+# the LEVEL's own receptacle. Step 2's generic disposition is one async decision
+# issue PER SLUG; `level-pick` fires on every in-scope item of the level by
+# construction and its answer is ONE `levelPick` object, so the unmodified
+# default fragments into N identical issues with no rule for collapsing N
+# replies into the one value `driveLevelPick` expects. 4b's risky-set approval
+# is the in-file precedent for the redirect; this pins the same words on the
+# level-pick handler paragraph, and the fallback when that receptacle is absent.
+K2083_HND="$(grep -F -- '**`level-pick` — the LEVEL-scoped escalation' "$K2083_BMDF" || true)"
+[ -n "$K2083_HND" ] \
+  || fail "#2083 r2: could not locate build.md's level-pick handler paragraph — the operator-absent guards below would be vacuous"
+printf '%s' "$K2083_HND" | grep -F "plan note's epic issue" >/dev/null \
+  || fail "#2083 r2: the level-pick handler names no epic-issue redirect for its operator-absent decision issue — it would fall through to step 2's per-slug default and post N duplicate issues for one level-scoped question"
+printf '%s' "$K2083_HND" | grep -F 'not any single item' >/dev/null \
+  || fail "#2083 r2: the level-pick handler does not EXCLUDE the per-item issue target the way 4b's risky-set approval does — a redirect stated without the exclusion still reads as compatible with the per-slug default"
+printf '%s' "$K2083_HND" | grep -F 'keyed by LEVEL' >/dev/null \
+  || fail "#2083 r2: the level-pick handler does not say the issue is keyed by LEVEL — one issue per level is what makes a single reply the level's verdict"
+printf '%s' "$K2083_HND" | grep -F 'loud terminal halt' >/dev/null \
+  || fail "#2083 r2: the level-pick handler gives no disposition for an unavailable epic issue — with no durable receptacle it would silently revert to the per-slug fan-out this redirect exists to prevent"
+
+# MEDIUM — the capability probe's conditional-key convention must name
+# `levelPick` the way it already names `dualBuild`. Without it a stale engine
+# with no level-pick support gets a false CAPABILITIES_OK and then HOLDS the
+# level on every continuation with no legible degradation notice (kernel K.49).
+K2083_PROBE="$(grep -F -- 'append `levelPick`' "$K2083_BMDF" || true)"
+[ -n "$K2083_PROBE" ] \
+  || fail "#2083 r2: build.md's handoffKeys probe convention does not tell the orchestrator to append \`levelPick\` on a level-pick continuation — the DEGRADED verdict would never name the key a stale engine drops"
+
+# MEDIUM — ADR 0038 is the design-of-record for this feature; it must name every
+# verdict that shipped. It described "two operator levers" while three verdicts
+# ship (`confirm`, `override-level`, `override-item`), leaving the level-wide
+# override unnamed in the document a future reader consults.
+K2083_ADR="$REPO_ROOT/docs/adr/0038-judge-per-item-pick-per-level-in-build.md"
+[ -f "$K2083_ADR" ] || fail "#2083 r2: ADR 0038 is missing — the level pick has no design-of-record"
+K2083_ADR_DEC="$(awk '/^## Decision/{f=1} /^\*\*Rejected alternatives/{f=0} f' "$K2083_ADR" || true)"
+[ -n "$K2083_ADR_DEC" ] || fail "#2083 r2: could not isolate ADR 0038's Decision section"
+printf '%s' "$K2083_ADR_DEC" | grep -F 'override-level' >/dev/null \
+  || fail "#2083 r2: ADR 0038's Decision section never names \`override-level\` — the shipped grammar has three verdicts and the design-of-record must match what ships"
+printf '%s' "$K2083_ADR_DEC" | grep -F 'override-item' >/dev/null \
+  || fail "#2083 r2: ADR 0038's Decision section never names \`override-item\` — same reason"
+echo "PASS: #2083 r2 — merge_blocked is enforced at Step 4, level-pick's operator-absent issue is keyed by level on the epic issue, and both MEDIUM surfaces name what ships"
+
 echo ""
 echo "All test_workflow.sh cases passed."

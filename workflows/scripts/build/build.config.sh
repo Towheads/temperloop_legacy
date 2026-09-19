@@ -1299,7 +1299,7 @@ fi
 # surface. Reseeded to build.md's measured size with ZERO headroom, the same
 # convention as every raise since temperloop#956; the sibling L2 item
 # (`dual-build-report`) is docs-only and adds nothing to this file.
-: "${PROSE_BUDGET_TIER2_FILE_CAP:=1263}"
+: "${PROSE_BUDGET_TIER2_FILE_CAP:=1266}"
 
 # ── Pipeline spend profiler (temperloop#958) ───────────────────────────────
 # Settings for `workflows/scripts/pipeline-spend-report.sh` and its
