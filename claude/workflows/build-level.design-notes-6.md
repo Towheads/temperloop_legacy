@@ -1120,3 +1120,100 @@ added by a branch not yet on main is invisible to that derivation.
  the UNKNOWN-verdict branch only, the kind stays `acceptance-gate-timeout`,
  and a RED verdict still escalates `acceptance-gate-failed` exactly as before.
 ```
+
+## A THROWAWAY COPY of the pin, so the dry run cannot WRITE the sh
+<a id="a-throwaway-copy-of-the-pin-so-the-dry-run-cannot-write-the-sh"></a>
+
+```text
+ A THROWAWAY COPY of the pin, so the dry run cannot WRITE the shared one
+ (temperloop#1650 round 3, review finding 3).
+
+ The probe and the operator-facing `resolve` line are described as READ-ONLY
+ enrichment, and that was true of the BRANCH but not of `/tmp`: when
+ `/tmp/qg-<slug>.selection-pin` is absent or empty, quality-gates.sh's scoped
+ path resolves the changed set and CREATES the caller-supplied pin — so a
+ dry run, or an operator pasting the line, could author the very file the
+ slice loop treats as slice 1's authoritative record, with nothing cleaning
+ it up afterwards.
+
+ So both forms copy the shared pin to `<pin>.probe` first and point
+ QUALITY_GATES_SELECTION_PIN at the copy. An absent or empty shared pin
+ leaves the copy REMOVED rather than stale, so the dry run resolves fresh
+ into the throwaway exactly as it used to — same answer, no shared-state
+ write. Slice 0's `rm -f` retires the copy along with the pin itself.
+
+ The copy is guarded by `[ -s ]` rather than silenced with a redirect, which
+ is finding 1's constraint: the operator-facing line carries NO `2>/dev/null`
+ at all (see the next note), so it must not need one.
+```
+
+## The `resolve` line is the one that must SPEAK — no stderr redirect
+<a id="the-resolve-line-is-the-one-that-must-speak-no-stderr-redirect"></a>
+
+```text
+ The `resolve` line is the one that must SPEAK (temperloop#1650 round 3,
+ review finding 1).
+
+ Round 2 folded the probe and the operator line into one builder and, with
+ them, the probe's `2>/dev/null`. That silencing is wrong on the operator's
+ half, and wrong precisely where it lands: `gateUnknownRemedy` renders
+ `resolve` ONLY on the branch where `inFlight.gate` is absent — i.e. exactly
+ when the automatic probe already came back empty — and the load-bearing
+ explanations for that emptiness are the two lines quality-gates.sh writes to
+ STDERR (`NOTE: --scoped could not resolve a local changed set — running the
+ FULL set.`, `NOTE: a scoped run was requested but QUALITY_GATES_SCOPE=full is
+ set`). Handing the reader a command whose whole job is to explain the
+ emptiness, pre-silenced, is the worst place in the message to hide output.
+
+ So the redirect moved to the PROBE'S CALL SITE (`$( <builder> 2>/dev/null )`)
+ and the builder itself carries none. The operands stay shared — the round-2
+ fix that matters — and only the machine path stays quiet. A fixture asserts
+ the rendered `resolve` string contains no `2>/dev/null`.
+
+ The builder is also a SUBSHELL (`( … )`, finding 4): the line starts with a
+ `cd`, and pasting it must not leave the operator's own shell somewhere else.
+```
+
+## The list identity the STOPPED RUN walked — the oracle the probe
+<a id="the-list-identity-the-stopped-run-walked-the-oracle-the-probe"></a>
+
+```text
+ The list identity the STOPPED RUN walked — the oracle the probe's own
+ answer is checked against (temperloop#1650 round 3, review finding 2).
+
+ An ordinal is only meaningful against the list it was measured in, and the
+ probe RE-DERIVES a list rather than reading the one the run walked. Those
+ can differ, and there is a live path that makes them differ: quality-gates.sh's
+ stale-resume guard sets QG_START_AT=0, SCOPED=0, QUALITY_GATES_SCOPE=full and
+ rebuilds GATES from the FULL set — and it does NOT remove the pin. The run
+ then walks the full list and reports ordinals into it, while the probe, which
+ exports QUALITY_GATES_SCOPED=1 and finds that still-populated pin, lists the
+ SCOPED subset. Two lists, one ordinal, and a confidently WRONG gate name with
+ nothing to distinguish it from a right one — kernel principle 5 (counter AI
+ failure modes structurally) in the exact field this issue exists to make
+ trustworthy.
+
+ The oracle already existed: every GATE_SLICE reports QUALITY_GATES_SELECTION
+ as `<count>:<digest>`, and that value now rides each ledger entry. The probe
+ asks `--list-selected` for the SAME fingerprint (one additive `printf` in
+ quality-gates.sh, changing no existing line and no exit code) and compares.
+
+ Degrade, never error, in all three unverifiable directions:
+   - fingerprints DISAGREE   -> GATE_NAME_UNKNOWN (the name is not trustworthy)
+   - no slice recorded one   -> no comparison, today's behaviour exactly
+   - the listing printed none (an older vendored quality-gates.sh) -> likewise
+ The escalation itself is never at risk; the name has always been enrichment.
+```
+
+## The LIST IDENTITY this slice walked (temperloop#1650 round 3)
+<a id="the-list-identity-this-slice-walked-temperloop-1650-round-3"></a>
+
+```text
+ The LIST IDENTITY this slice walked (temperloop#1650 round 3). Already
+ reported by every GATE_SLICE and already carried forward in `gateSelection`
+ for the NEXT slice's stale-resume check — but it was dropped on the floor
+ afterwards, so the ledger (and the payload built from it) could not say
+ which list an ordinal indexed. Recording it makes the escalation
+ self-describing AND gives the in-flight probe its oracle. Omitted, never
+ empty-stringed, when a slice reported none.
+```

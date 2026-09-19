@@ -2221,6 +2221,18 @@ if (pasted !== EXPECT)
 // …and it must be the SAME builder, not a parallel string that happens to agree.
 if (!/QUALITY_GATES_SCOPED/.test(String(inFlight.resolve)))
   { console.log(JSON.stringify({ ok: false, reason: 'the resolve line omits the scope env: ' + inFlight.resolve })); process.exit(0); }
+// ROUND 3, finding 1: sharing the builder must NOT have given the operator the
+// probe's stderr redirect. \`resolve\` renders ONLY when the probe came back
+// empty, and quality-gates.sh explains that emptiness on STDERR — silencing it
+// hides the one output the reader was sent there for.
+if (String(inFlight.resolve).includes('2>/dev/null'))
+  { console.log(JSON.stringify({ ok: false, reason: 'the resolve line silences the stderr that explains the empty probe: ' + inFlight.resolve })); process.exit(0); }
+// ROUND 3, finding 4: the line opens with a \`cd\`, so pasting it must not move
+// the operator's own shell. Assert the BEHAVIOUR, not the parenthesis.
+const here = process.cwd();
+const after = String(execFileSync('bash', ['-c', String(inFlight.resolve) + '; pwd'], { encoding: 'utf8', cwd: here })).trim().split('\n').pop();
+if (after !== here)
+  { console.log(JSON.stringify({ ok: false, reason: 'the resolve line left the shell in ' + after + ', not ' + here })); process.exit(0); }
 fs.rmSync(root, { recursive: true, force: true });
 
 console.log(JSON.stringify({ ok: true }));
@@ -2276,6 +2288,204 @@ if (!inFlight || inFlight.index !== 1)
 // character smuggled in by an unescaped escape sequence.
 if (inFlight.gate !== 'bash scripts/x.sh --name ab')
   { console.log(JSON.stringify({ ok: false, reason: 'the gate name was not sanitized: ' + JSON.stringify(inFlight.gate) })); process.exit(0); }
+fs.rmSync(root, { recursive: true, force: true });
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-6 (temperloop#1650 round 3, MEDIUM): the probe RE-DERIVES a gate
+#   list; it must verify that list is the SAME one the stopped run walked
+#   before it trusts an ordinal into it. quality-gates.sh's stale-resume guard
+#   rebuilds GATES on the FULL set mid-run WITHOUT removing the pin, so a later
+#   `--list-selected` under that pin resolves the SCOPED subset — two lists,
+#   one ordinal, a confidently wrong name. The oracle is the
+#   QUALITY_GATES_SELECTION fingerprint every GATE_SLICE already reports.
+#   THIS arm: the fingerprints AGREE, so the name is trusted and reported.
+# ============================================================================
+run_node_case "1650 probe: a listing whose selection fingerprint MATCHES the stopped run names the gate" "
+$PREAMBLE
+
+const os = await import('node:os');
+const fs = await import('node:fs');
+const path = await import('node:path');
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qg1650c-'));
+const wt = path.join(root, 'wt');
+fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+const qg = path.join(wt, 'scripts', 'quality-gates.sh');
+fs.writeFileSync(qg, [
+  '#!/usr/bin/env bash',
+  \"echo 'selection: diff-scoped, 3 of 9'\",
+  \"echo 'QUALITY_GATES_SELECTION=3:deadbeefcafe'\",
+  \"echo 'make sel-zero'\",
+  \"echo 'make sel-one'\",
+  \"echo 'bash scripts/tests/test_sel_two.sh'\",
+].join('\n') + '\n');
+fs.chmodSync(qg, 0o755);
+
+setMachinery('item-sel1650',
+  { outcome: 'CREATED', path: wt },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 2, failed: 0, elapsedSecs: 301, selection: '3:deadbeefcafe' },
+  { outcome: 'GATE_TIMEOUT' },
+);
+setGateInFlightExec('item-sel1650');
+happyWorker('item-sel1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-sel1650', branch: 'build/item-sel1650', title: 'SelMatch', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+if (!esc || esc.kind !== 'acceptance-gate-timeout')
+  { console.log(JSON.stringify({ ok: false, reason: 'expected acceptance-gate-timeout: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const inFlight = esc.payload?.inFlightGate;
+if (inFlight?.gate !== 'bash scripts/tests/test_sel_two.sh')
+  { console.log(JSON.stringify({ ok: false, reason: 'a MATCHING selection lost the gate name: ' + JSON.stringify(inFlight) })); process.exit(0); }
+// The oracle itself must ride the payload — the ledger entry and the in-flight
+// block both carry the list identity the ordinal was measured against.
+if (inFlight.selection !== '3:deadbeefcafe')
+  { console.log(JSON.stringify({ ok: false, reason: 'payload does not carry the expected selection: ' + JSON.stringify(inFlight) })); process.exit(0); }
+if (!(esc.payload?.sliceLedger ?? []).some((s) => s.selection === '3:deadbeefcafe'))
+  { console.log(JSON.stringify({ ok: false, reason: 'no ledger entry carries its selection: ' + JSON.stringify(esc.payload?.sliceLedger) })); process.exit(0); }
+fs.rmSync(root, { recursive: true, force: true });
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-7 (temperloop#1650 round 3, MEDIUM): the other arm — the listing's
+#   fingerprint DISAGREES with the one the stopped run reported, so the ordinal
+#   does not identify a gate in this list. Degrade to GATE_NAME_UNKNOWN; never
+#   name a gate on the strength of a list the run never walked, and never let
+#   the degradation cost the escalation itself.
+# ============================================================================
+run_node_case "1650 probe: a listing whose selection fingerprint DISAGREES degrades to GATE_NAME_UNKNOWN" "
+$PREAMBLE
+
+const os = await import('node:os');
+const fs = await import('node:fs');
+const path = await import('node:path');
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qg1650d-'));
+const wt = path.join(root, 'wt');
+fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+const qg = path.join(wt, 'scripts', 'quality-gates.sh');
+fs.writeFileSync(qg, [
+  '#!/usr/bin/env bash',
+  \"echo 'selection: diff-scoped, 3 of 9'\",
+  \"echo 'QUALITY_GATES_SELECTION=3:deadbeefcafe'\",
+  \"echo 'make sel-zero'\",
+  \"echo 'make sel-one'\",
+  \"echo 'bash scripts/tests/test_sel_two.sh'\",
+].join('\n') + '\n');
+fs.chmodSync(qg, 0o755);
+
+// The run walked a 9-gate FULL set (the stale-resume guard's recovery); the
+// probe re-derives the 3-gate SCOPED subset. Ordinal 2 exists in both.
+setMachinery('item-mis1650',
+  { outcome: 'CREATED', path: wt },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 2, failed: 0, elapsedSecs: 301, selection: '9:0011223344ff' },
+  { outcome: 'GATE_TIMEOUT' },
+);
+setGateInFlightExec('item-mis1650');
+happyWorker('item-mis1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-mis1650', branch: 'build/item-mis1650', title: 'SelMismatch', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+// FAIL-SOFT: the escalation is the deliverable and still arrives, unchanged.
+if (!esc || esc.kind !== 'acceptance-gate-timeout')
+  { console.log(JSON.stringify({ ok: false, reason: 'a mismatched selection cost the escalation: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const inFlight = esc.payload?.inFlightGate;
+if (!inFlight || inFlight.index !== 2)
+  { console.log(JSON.stringify({ ok: false, reason: 'the ordinal itself must survive: ' + JSON.stringify(inFlight) })); process.exit(0); }
+if (inFlight.gate !== undefined)
+  { console.log(JSON.stringify({ ok: false, reason: 'named a gate from a list the run never walked: ' + JSON.stringify(inFlight) })); process.exit(0); }
+// …and the reader is handed the command instead of a wrong name.
+const remedy = String(esc.payload?.remedy ?? '');
+if (!/name it with:/.test(remedy) || /test_sel_two/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'remedy did not degrade to the resolve command: ' + remedy })); process.exit(0); }
+fs.rmSync(root, { recursive: true, force: true });
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-8 (temperloop#1650 round 3, LOW): the probe and the pasted resolve
+#   line are described as READ-ONLY enrichment. That was true of the branch but
+#   not of /tmp: quality-gates.sh CREATES a caller-supplied selection pin when
+#   it is absent or empty, so the dry run could author the very file the slice
+#   loop treats as slice 1's authoritative record. Both forms now point at a
+#   throwaway '<pin>.probe' copy; the shared pin must come out untouched.
+# ============================================================================
+run_node_case "1650 probe: neither the probe nor the pasted resolve line writes the SHARED selection pin" "
+$PREAMBLE
+
+const os = await import('node:os');
+const fs = await import('node:fs');
+const path = await import('node:path');
+const { execFileSync } = await import('node:child_process');
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qg1650e-'));
+const wt = path.join(root, 'wt');
+fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+const qg = path.join(wt, 'scripts', 'quality-gates.sh');
+// The stub WRITES its caller-supplied pin, exactly as the real scoped path does
+// when the pin is absent or empty — that write is the thing under test.
+fs.writeFileSync(qg, [
+  '#!/usr/bin/env bash',
+  'printf \"probe-wrote\\\\n\" >>\"\$QUALITY_GATES_SELECTION_PIN\"',
+  \"echo 'selection: diff-scoped'\",
+  \"echo 'make pin-zero'\",
+  \"echo 'make pin-one'\",
+].join('\n') + '\n');
+fs.chmodSync(qg, 0o755);
+
+const sharedPin = '/tmp/qg-item-pin1650.selection-pin';
+const probePin = sharedPin + '.probe';
+fs.writeFileSync(sharedPin, 'ORIGINAL\n');
+fs.rmSync(probePin, { force: true });
+
+setMachinery('item-pin1650',
+  { outcome: 'CREATED', path: wt },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 1, failed: 0, elapsedSecs: 301 },
+  { outcome: 'GATE_TIMEOUT' },
+);
+setGateInFlightExec('item-pin1650');
+happyWorker('item-pin1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-pin1650', branch: 'build/item-pin1650', title: 'PinIsolation', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const inFlight = (result.escalations ?? [])[0]?.payload?.inFlightGate;
+if (inFlight?.gate !== 'make pin-one')
+  { console.log(JSON.stringify({ ok: false, reason: 'the probe did not resolve through the throwaway pin: ' + JSON.stringify(inFlight) })); process.exit(0); }
+if (fs.readFileSync(sharedPin, 'utf8') !== 'ORIGINAL\n')
+  { console.log(JSON.stringify({ ok: false, reason: 'the PROBE wrote the shared pin: ' + JSON.stringify(fs.readFileSync(sharedPin, 'utf8')) })); process.exit(0); }
+if (!fs.existsSync(probePin) || !fs.readFileSync(probePin, 'utf8').includes('probe-wrote'))
+  { console.log(JSON.stringify({ ok: false, reason: 'the write did not land on the throwaway copy' })); process.exit(0); }
+// The pasted operator line is non-mutating for the same reason — same builder.
+execFileSync('bash', ['-c', String(inFlight.resolve)], { encoding: 'utf8' });
+if (fs.readFileSync(sharedPin, 'utf8') !== 'ORIGINAL\n')
+  { console.log(JSON.stringify({ ok: false, reason: 'the pasted resolve line wrote the shared pin' })); process.exit(0); }
+fs.rmSync(sharedPin, { force: true });
+fs.rmSync(probePin, { force: true });
 fs.rmSync(root, { recursive: true, force: true });
 
 console.log(JSON.stringify({ ok: true }));

@@ -31,3 +31,19 @@
     position-to-name lookup only recognises gates that begin `make ` or `bash `;
     one spelled any other way was silently dropped and shifted every later
     position by one. `check-gate-paths.sh` gained a fifth check that fails on it.
+  - **The named gate is now checked against the list the stopped run actually
+    walked.** The lookup re-derives a gate list of its own, and there is a live
+    path — the suite's own recovery from a selection that shifted mid-run — that
+    leaves those two lists different while the position stays the same, so the
+    lookup could name a gate confidently and wrongly. Each stretch of the run
+    already reports a fingerprint of the list it walked; the dry run now prints
+    the same fingerprint, and a disagreement reports the position with no name
+    rather than the wrong one. An older vendored gate script that prints no
+    fingerprint, and a run that recorded none, both behave exactly as before.
+  - **The command handed to the reader no longer swallows its own error
+    output.** It is shown precisely when the automatic lookup came back empty,
+    and the gate script explains that emptiness on standard error — which the
+    shared builder had been silencing. It also runs in a subshell now, so
+    pasting it no longer leaves the reader's shell in the worktree, and it reads
+    a throwaway copy of the gate suite's pinned selection rather than the shared
+    file, which it could previously create.

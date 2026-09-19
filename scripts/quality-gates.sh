@@ -2557,6 +2557,19 @@ fi
 
 if [[ $LIST_SELECTED -eq 1 ]]; then
   printf 'selection: %s\n' "$GATE_SELECTION_REASON"
+  # The FINGERPRINT of the list printed below, in the same `<count>:<digest>`
+  # grammar a real slice reports as QUALITY_GATES_SELECTION (temperloop#1650
+  # round 3). An ordinal into this list is only meaningful against the list it
+  # was measured in, and a DRY RUN has no way to know which list the run that
+  # issued the ordinal actually walked: the stale-resume guard above rebuilds
+  # GATES on the FULL set mid-run WITHOUT removing the pin, so a later
+  # `--list-selected` under that same pin resolves the SCOPED subset and the two
+  # lists disagree at every ordinal. Emitting the fingerprint here lets the
+  # reader (build-level.mjs's in-flight-gate probe) COMPARE rather than assume.
+  # Additive on purpose: it changes no existing line and no exit code, and it
+  # begins neither `make ` nor `bash `, so build-level.mjs's ordinal filter and
+  # check-gate-paths.sh CHECK 5 are both unaffected.
+  printf 'QUALITY_GATES_SELECTION=%s\n' "$QG_SELECTION"
   printf '%s\n' "${GATES[@]}"
   qg_print_skipped_gates
   exit 0

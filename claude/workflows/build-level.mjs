@@ -6801,19 +6801,27 @@ async function driveItemBuildPhase(item, arm, box) {
     `QUALITY_GATES_SCOPED=$(. ${sq(configBin)} >/dev/null 2>&1; echo "\${BUILD_GATE_SCOPED:-1}")`;
   // SLICE-STABLE SELECTION (temperloop#1663). `QUALITY_GATES_START_AT` is — see build-level.design-notes-5.md#slice-stable-selection-temperloop-1663-quality-gates-start-a
   const gatePin = `/tmp/qg-${item.slug}.selection-pin`;
+  // A THROWAWAY COPY of the pin, so the dry run cannot WRITE the shared  — see build-level.design-notes-6.md#a-throwaway-copy-of-the-pin-so-the-dry-run-cannot-write-the-sh
+  const gateProbePin = `${gatePin}.probe`;
   // gateInFlightSelectCmd(idx) — the ONE builder the executed probe AND the — see build-level.design-notes-6.md#gateinflightselectcmd-idx-the-one-builder-the-executed-probe-a
   const gateInFlightSelectCmd = (idx) =>
-    `cd ${sq(wt)} && ${gateScopeEnv} QUALITY_GATES_SELECTION_PIN=${sq(gatePin)} ` +
-    `${sq(qgBin)} --list-selected 2>/dev/null | grep -E '^(make|bash) ' | sed -n '${idx + 1}p'`;
-  // gateInFlightNameCmd(idx) — turn a stopped run's gate ORDINAL into its  — see build-level.design-notes-6.md#gateinflightnamecmd-idx-turn-a-stopped-run-s-gate-ordinal-into
-  const gateInFlightNameCmd = (idx) =>
+    `( if [ -s ${sq(gatePin)} ]; then cp -f ${sq(gatePin)} ${sq(gateProbePin)}; else rm -f ${sq(gateProbePin)}; fi; ` +
+    `cd ${sq(wt)} && ${gateScopeEnv} QUALITY_GATES_SELECTION_PIN=${sq(gateProbePin)} ` +
+    `${sq(qgBin)} --list-selected` +
+    (idx === null ? ' )' : ` | grep -E '^(make|bash) ' | sed -n '${idx + 1}p' )`);
+  // gateInFlightNameCmd(idx, expectSel) — turn a stopped run's gate ORDINA — see build-level.design-notes-6.md#gateinflightnamecmd-idx-turn-a-stopped-run-s-gate-ordinal-into
+  // The `2>/dev/null` lives HERE, on the machine path, never in the builder — see build-level.design-notes-6.md#the-resolve-line-is-the-one-that-must-speak-no-stderr-redirect
+  const gateInFlightNameCmd = (idx, expectSel) =>
     `if [ ! -x ${sq(qgBin)} ]; then echo '{"outcome":"GATE_NAME_UNKNOWN"}'; else ` +
-    `__g=$( ${gateInFlightSelectCmd(idx)} | tr -d '"\\\\' ); ` +
+    `__L=$( ${gateInFlightSelectCmd(null)} 2>/dev/null ); ` +
+    `__ls=$(printf '%s\\n' "$__L" | sed -n 's/^QUALITY_GATES_SELECTION=//p' | tail -1); ` +
+    `__g=$(printf '%s\\n' "$__L" | grep -E '^(make|bash) ' | sed -n '${idx + 1}p' | tr -d '"\\\\'); ` +
+    `if [ -n ${sq(expectSel ?? '')} ] && [ -n "$__ls" ] && [ "$__ls" != ${sq(expectSel ?? '')} ]; then __g=''; fi; ` +
     `if [ -n "$__g" ]; then printf '{"outcome":"GATE_NAMED","gate":"%s"}\\n' "$__g"; ` +
     `else echo '{"outcome":"GATE_NAME_UNKNOWN"}'; fi; fi`;
   const gateCmd = (startAt, expectSelection) =>
     `set -o pipefail; if [ ! -x ${sq(qgBin)} ]; then echo '{"outcome":"GATE_ABSENT"}'; ` +
-    `else ${startAt === 0 ? `rm -f ${sq(gatePin)} ${sq(gateSliceLog)}; : >${sq(gateLog)}; ` : ''}` +
+    `else ${startAt === 0 ? `rm -f ${sq(gatePin)} ${sq(gateProbePin)} ${sq(gateSliceLog)}; : >${sq(gateLog)}; ` : ''}` +
     `( cd ${sq(wt)} && ${gateScrub} && ` +
     `${gateScopeEnv} QUALITY_GATES_SELECTION_PIN=${sq(gatePin)} ` +
     `${expectSelection ? `QUALITY_GATES_EXPECT_SELECTION=${sq(expectSelection)} ` : ''}` +
@@ -6892,6 +6900,10 @@ async function driveItemBuildPhase(item, arm, box) {
       ...(gateSliceResumeAt(gateOut) === undefined ? {} : { resumeAt: gateSliceResumeAt(gateOut) }),
       // The slice's own exit status, when the executor reported one. 75 is the — see build-level.design-notes-5.md#the-slice-s-own-exit-status-when-the-executor-reported-
       ...(gateOut.rc === undefined ? {} : { rc: Number(gateOut.rc) }),
+      // The LIST IDENTITY this slice walked (temperloop#1650 round 3). Already — see build-level.design-notes-6.md#the-list-identity-this-slice-walked-temperloop-1650-round-3
+      ...(typeof gateOut.selection === 'string' && gateOut.selection !== ''
+        ? { selection: gateOut.selection }
+        : {}),
     });
     if (gateOut.outcome !== 'GATE_SLICE') break;
     gateStartAt = Number(gateOut.resumeAt) || 0;
@@ -6960,15 +6972,21 @@ async function driveItemBuildPhase(item, arm, box) {
     const inFlightIndex = gateInFlightIndex(gateSliceLedger);
     let inFlightGate = null;
     if (inFlightIndex !== undefined) {
+      // The list identity the STOPPED RUN walked — the oracle the probe's own — see build-level.design-notes-6.md#the-list-identity-the-stopped-run-walked-the-oracle-the-probe
+      let expectSelection = '';
+      for (const s of gateSliceLedger) {
+        if (typeof s.selection === 'string' && s.selection !== '') expectSelection = s.selection;
+      }
       inFlightGate = {
         index: inFlightIndex,
         slice: gateSliceLedger.length,
         resolve: gateInFlightSelectCmd(inFlightIndex),
         sliceLog: gateSliceLog,
+        ...(expectSelection === '' ? {} : { selection: expectSelection }),
       };
       // Fail-SOFT: the escalation is the deliverable, the name is an enrichment.
       try {
-        const named = await runMachinery(gateInFlightNameCmd(inFlightIndex), {
+        const named = await runMachinery(gateInFlightNameCmd(inFlightIndex, expectSelection), {
           label: `gate-inflight:${item.slug}`,
           slug: item.slug,
           bashTimeoutMs: GATE_INFLIGHT_NAME_TIMEOUT_MS,
