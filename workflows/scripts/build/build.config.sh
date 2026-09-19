@@ -1284,7 +1284,22 @@ fi
 # this commit; the two cited later items reseed the cap to build.md's new
 # measured size when they land, per the usual convention, and may raise or
 # lower it again if their measured cost differs from this projection.
-: "${PROSE_BUDGET_TIER2_FILE_CAP:=1261}"
+# RESEEDED 1261->1263 (2026-09-19, temperloop#2083 'level-pick + operator
+# levers', the second of the two items the 1201->1261 raise above priced in).
+# Its measured cost is +4, not the +25 projected: the level-pick handler is
+# TWO paragraphs in `claude/commands/build.md` 3d-esc (the escalation's
+# no-default confirm plus the verdict grammar, and the merge-blocked
+# disposition for an unstamped arms trailer) rather than a section of its own,
+# because 3d-esc's per-kind disposition list is where an orchestrator already
+# looks for exactly this. A trim ran FIRST, before the ratchet moved: the
+# item's third addition — a standalone hand-off bullet for the new `levelPick`
+# key — was folded into the existing conditional-key sentence, which this item
+# had to rewrite anyway (it said `dualBuild` was "the one CONDITIONAL key",
+# which stopped being true), buying a line back at no cost to contract
+# surface. Reseeded to build.md's measured size with ZERO headroom, the same
+# convention as every raise since temperloop#956; the sibling L2 item
+# (`dual-build-report`) is docs-only and adds nothing to this file.
+: "${PROSE_BUDGET_TIER2_FILE_CAP:=1263}"
 
 # ── Pipeline spend profiler (temperloop#958) ───────────────────────────────
 # Settings for `workflows/scripts/pipeline-spend-report.sh` and its

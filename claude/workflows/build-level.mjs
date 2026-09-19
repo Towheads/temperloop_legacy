@@ -376,6 +376,13 @@ const inputCapabilities = [
   'dualBuild',
   'gateSliceSecs',
   'items',
+  // temperloop#2083 — the operator's answer to a `level-pick` escalation
+  // { verdict, arm?, items? }. Absent on a fresh level; on a continuation it is
+  // what lets the pick route past the calibration gate. An engine without it
+  // ignores the key and HOLDS the level for a confirm that can never arrive —
+  // a visible stall, not a silent auto-merge, which is the safe staleness
+  // direction for a key that gates merges.
+  'levelPick',
   'machineryAgentType',
   'machineryBatchModel',
   'machineryBinDir',
@@ -4773,7 +4780,7 @@ async function judgeArms(item, dual, arms) {
 }
 
 // appendDualBuildRows — the ledger write (temperloop#2072). — see build-level.design-notes-4.md#appenddualbuildrows-the-ledger-write-temperloop-2072
-async function appendDualBuildRows(item, dual, rows) {
+async function appendDualBuildRows(item, dual, rows, labelHint) {
   if (rows.length === 0) return { appended: 0, rejected: 0, unavailable: false };
   const ledgerBin = sq(`${input.repoRoot}/workflows/scripts/model-comparison/dual-build-ledger.sh`);
   const versionFile = sq(`${input.repoRoot}/VERSION`);
@@ -4799,7 +4806,7 @@ async function appendDualBuildRows(item, dual, rows) {
     ].join('\n'),
   }));
   const batch = await runMachineryBatch(steps, {
-    label: `dual-build-rows:${item.slug}`,
+    label: `dual-build-rows${labelHint ? `-${labelHint}` : ''}:${item.slug}`,
     slug: item.slug,
     bashTimeoutMs: BATCH_BASH_TIMEOUT_MS,
     phase: enterStage(STAGE_GATE),
@@ -4947,6 +4954,789 @@ function dualBuildGuarded(fn, onError) {
 }
 
 // driveLevelDualBuild — the level driver, and the BARRIER itself. — see build-level.design-notes-4.md#driveleveldualbuild-the-level-driver-and-the-barrier-itself
+
+// =============================================================================
+// PHASE 4 — THE LEVEL PICK AND THE TWO OPERATOR LEVERS (temperloop#2083)
+// =============================================================================
+// The barrier above stops at "every in-scope item is judged and recorded". This
+// is what happens next, and it is deliberately the ONLY place in this file that
+// turns a comparison into a merge decision:
+//
+//   1. THE PRE-REGISTERED TALLY decides the level's winning arm from the item
+//      dispositions alone — no per-run judgement, no tie-break invented after
+//      seeing the numbers (tallyLevelPick below states the whole rule set).
+//   2. THE CALIBRATION GATE decides whether that pick may route by itself. An
+//      uncalibrated judge means the tally's per-item inputs are not yet known to
+//      agree with a human, so the level STOPS and asks, with no default.
+//   3. THE TWO OPERATOR LEVERS — a level-wide override and a per-item override —
+//      ride the same `level-pick` verdict grammar, and a per-item override is
+//      what makes the level's own pick `mixed`.
+//   4. ROUTING hands the winning arm's phase-1 context to driveItemPr() — the
+//      ordinary PR/CI/park path, unchanged — and only then archives and deletes
+//      the losing arm's branch.
+//
+// Nothing here merges: the merge gate stays the orchestrator's (build.md Step 4),
+// exactly as on the single-arm path.
+// =============================================================================
+
+// The level-pick verdict grammar, fixed here once. `claude/presentation-plane.md`
+// carries the reader-facing row; build.md 3d-esc carries the handler prose.
+const LEVEL_PICK_VERDICTS = ['confirm', 'override-level', 'override-item'];
+
+// levelPickInput — normalize and VALIDATE `input.levelPick`, the continuation
+// input that carries the operator's answer to a `level-pick` escalation.
+// Returns null (no answer — a fresh level), a normalized verdict, or
+// `{ invalid }`. Same posture as dualBuildInput(): a present-but-unusable
+// answer REFUSES rather than degrading to "no answer", because silently
+// discarding an operator's override and proceeding on the tally is
+// indistinguishable, after the fact, from the operator having confirmed it.
+function levelPickInput() {
+  const lp = input.levelPick;
+  if (lp == null) return null;
+  if (typeof lp !== 'object' || Array.isArray(lp)) {
+    return { invalid: 'levelPick must be an object { verdict, arm?, items? }' };
+  }
+  const verdict = typeof lp.verdict === 'string' ? lp.verdict.trim() : '';
+  if (!LEVEL_PICK_VERDICTS.includes(verdict)) {
+    return { invalid: `levelPick.verdict must be one of ${LEVEL_PICK_VERDICTS.join(' | ')} (got ${JSON.stringify(lp.verdict)})` };
+  }
+  if (verdict === 'override-level') {
+    const arm = typeof lp.arm === 'string' ? lp.arm.trim() : '';
+    if (!DUAL_BUILD_ARMS.includes(arm)) {
+      return { invalid: `levelPick.arm must be ${DUAL_BUILD_ARMS.join(' or ')} for an override-level verdict (got ${JSON.stringify(lp.arm)})` };
+    }
+    return { verdict, arm, items: [], reason: typeof lp.reason === 'string' ? lp.reason.trim() : '' };
+  }
+  if (verdict === 'override-item') {
+    const rows = Array.isArray(lp.items) ? lp.items : [];
+    const items = [];
+    for (const r of rows) {
+      const slug = r && typeof r.slug === 'string' ? r.slug.trim() : '';
+      const arm = r && typeof r.arm === 'string' ? r.arm.trim() : '';
+      const reason = r && typeof r.reason === 'string' ? r.reason.trim() : '';
+      if (!slug || !DUAL_BUILD_ARMS.includes(arm)) {
+        return { invalid: `each levelPick.items[] entry needs { slug, arm ∈ ${DUAL_BUILD_ARMS.join('|')}, reason } (got ${JSON.stringify(r)})` };
+      }
+      items.push({ slug, arm, reason });
+    }
+    if (items.length === 0) {
+      return { invalid: 'an override-item verdict needs at least one { slug, arm, reason } entry in levelPick.items' };
+    }
+    return { verdict, arm: '', items, reason: '' };
+  }
+  return { verdict, arm: '', items: [], reason: typeof lp.reason === 'string' ? lp.reason.trim() : '' };
+}
+
+// dualBuildArmCost — ONE arm's whole-job cost across the level, as the tally's
+// tie-break reads it. "Whole-job" is deliberate: the comparison is between two
+// ways of building the SAME level, so the tie-break is the level's total for
+// that arm, never a per-item average that would let one cheap item outvote the
+// rest. Tokens are the unit; wall-clock is the fallback ONLY when neither arm
+// reported tokens at all, so a partly-instrumented level never silently
+// compares tokens against milliseconds. `known` is false when the arm reported
+// neither — which is what makes "the tie-break could not be evaluated" a state
+// the caller names rather than a zero it mistakes for cheap.
+function dualBuildArmCost(pickables, armName) {
+  let tokens = 0;
+  let wallClockMs = 0;
+  let tokensSeen = false;
+  let wallSeen = false;
+  for (const p of pickables) {
+    const a = p.arms.find((x) => x.arm === armName);
+    const c = a && a.cost;
+    if (!c) continue;
+    if (typeof c.tokens_in === 'number' || typeof c.tokens_out === 'number') {
+      tokensSeen = true;
+      tokens += (c.tokens_in ?? 0) + (c.tokens_out ?? 0);
+    }
+    if (typeof c.wall_clock_ms === 'number') {
+      wallSeen = true;
+      wallClockMs += c.wall_clock_ms;
+    }
+  }
+  return { tokens: tokensSeen ? tokens : null, wall_clock_ms: wallSeen ? wallClockMs : null, known: tokensSeen || wallSeen };
+}
+
+// -----------------------------------------------------------------------------
+// tallyLevelPick — THE PRE-REGISTERED TALLY.
+// -----------------------------------------------------------------------------
+// Pre-registered means: every rule below is fixed BEFORE the level runs, and
+// none of them reads anything but the item dispositions the barrier already
+// produced. That is the whole point — a tie-break chosen after seeing which arm
+// it would favour is not a measurement, and this function is the one place that
+// property is checkable.
+//
+// PER ITEM, exactly one of three outcomes, in this order:
+//   1. GATE FAIL = LOSS. An arm with no gate-passing branch loses the item
+//      outright. If exactly one arm gated, that arm WINS the item (`gate`) — a
+//      model that ships a green branch beat one that did not, and no judge is
+//      needed to say so. If NEITHER gated, the item is UNRESOLVED
+//      (`both-arms-failed`): there was nothing to compare.
+//   2. A JUDGED TIE IS UNRESOLVED, counting for NEITHER arm. So is every
+//      non-verdict (`one-arm-only`, `spike-arm`, `judge-unavailable`, …) — the
+//      reason rides the item row, so an unresolved item is never silently
+//      indistinguishable from a judged one.
+//   3. Otherwise the judge's preferred arm wins the item (`judge`).
+//
+// LEVEL: the arm with more item wins. A TALLY TIE — including the 0–0 tie a
+// wholly unresolved level produces — goes to the CHEAPER arm by whole-job cost
+// (`tally-tie-cheaper`). When neither arm's cost is known, or the two are
+// exactly equal, the tie goes to `baseline` (`tally-tie-incumbent`): the
+// incumbent is what the level would have been built on with no harness at all,
+// so "we learned nothing" resolves to changing nothing.
+function tallyLevelPick(pickables) {
+  const items = [];
+  const tally = { baseline: 0, candidate: 0, unresolved: 0 };
+  for (const p of pickables) {
+    const byArm = (n) => p.arms.find((x) => x.arm === n);
+    const passing = DUAL_BUILD_ARMS.filter((n) => (byArm(n) || {}).gate === 'pass');
+    let winner = null;
+    let reason;
+    if (passing.length === 0) {
+      reason = 'both-arms-failed';
+    } else if (passing.length === 1) {
+      winner = passing[0];
+      reason = 'gate';
+    } else if (p.judgeOutcome && p.judgeOutcome.judged && p.judgeOutcome.prefersArm) {
+      winner = p.judgeOutcome.prefersArm;
+      reason = 'judge';
+    } else if (p.judgeOutcome && p.judgeOutcome.judged) {
+      reason = 'judged-tie';
+    } else {
+      reason = `judge-${(p.judgeOutcome && p.judgeOutcome.reason) || 'unavailable'}`;
+    }
+    if (winner) tally[winner] += 1;
+    else tally.unresolved += 1;
+    items.push({ slug: p.item.slug, winner, reason });
+  }
+  const cost = {
+    baseline: dualBuildArmCost(pickables, 'baseline'),
+    candidate: dualBuildArmCost(pickables, 'candidate'),
+  };
+  let winner;
+  let reason;
+  if (tally.baseline > tally.candidate) {
+    winner = 'baseline';
+    reason = 'tally';
+  } else if (tally.candidate > tally.baseline) {
+    winner = 'candidate';
+    reason = 'tally';
+  } else {
+    const cheaper = cheaperArm(cost);
+    winner = cheaper ?? 'baseline';
+    reason = cheaper ? 'tally-tie-cheaper' : 'tally-tie-incumbent';
+  }
+  return { winner, reason, tally, items, cost };
+}
+
+// cheaperArm — the tie-break's own comparison, split out so its "unknown and
+// equal both yield null" rule is one readable statement rather than a nested
+// ternary inside the tally. Tokens win over wall-clock when BOTH arms reported
+// tokens; wall-clock is read only when neither did.
+function cheaperArm(cost) {
+  const b = cost.baseline;
+  const c = cost.candidate;
+  if (typeof b.tokens === 'number' && typeof c.tokens === 'number' && b.tokens !== c.tokens) {
+    return b.tokens < c.tokens ? 'baseline' : 'candidate';
+  }
+  if (typeof b.wall_clock_ms === 'number' && typeof c.wall_clock_ms === 'number' && b.wall_clock_ms !== c.wall_clock_ms) {
+    return b.wall_clock_ms < c.wall_clock_ms ? 'baseline' : 'candidate';
+  }
+  return null;
+}
+
+// -----------------------------------------------------------------------------
+// readCalibrationStatus — the gate's one read (temperloop#2082's pinned file).
+// -----------------------------------------------------------------------------
+// FAILS CLOSED, and that direction is the whole point: an unreadable, absent or
+// unparseable calibration file means we do not KNOW that this repo's pairwise
+// judge agrees with a human, and "we do not know" must produce the same modal
+// confirm an explicitly-uncalibrated judge does. Reading an unavailable seam as
+// "calibrated" would let the one state the gate exists for — a judge nobody has
+// ever checked — auto-route a level's merges.
+async function readCalibrationStatus() {
+  const ledgerBin = sq(`${input.repoRoot}/workflows/scripts/model-comparison/dual-build-ledger.sh`);
+  const cmd = [
+    `__led=${ledgerBin}`,
+    'if [ ! -f "$__led" ]; then',
+    `printf '{"outcome":"CALIBRATION_UNAVAILABLE","reason":"seam-absent"}\\n'`,
+    'else',
+    // Un-piped status read, the same shape judgeArms uses and for the same
+    // reason: `$?` after a pipeline reports the LAST command's status, so a
+    // piped read would structurally report 0 and a refusal would be recorded
+    // as a verdict.
+    '__c=$(bash "$__led" calibrate-status 2>/dev/null); __cr=$?',
+    'if [ "$__cr" -eq 0 ] && [ -n "$__c" ]; then',
+    '__cj=$(printf %s "$__c" | jq -c . 2>/dev/null)',
+    'if [ -n "$__cj" ]; then',
+    `printf '{"outcome":"CALIBRATION","calibration":%s}\\n' "$__cj"`,
+    'else',
+    `printf '{"outcome":"CALIBRATION_UNAVAILABLE","reason":"status-unparseable","rc":0}\\n'`,
+    'fi',
+    'else',
+    `printf '{"outcome":"CALIBRATION_UNAVAILABLE","reason":"status-refused","rc":%s}\\n' "$__cr"`,
+    'fi',
+    'fi',
+  ].join('\n');
+  // The label carries a pseudo-slug (`:_level`) because this read is
+  // LEVEL-scoped, not item-scoped — every other machinery label in this file is
+  // `<kind>:<slug>`, and a label with no slug at all is the one shape the
+  // transcript (and the offline harness's own label→queue routing) cannot place.
+  const out = await runMachinery(cmd, { label: 'level-pick-calibration:_level', phase: enterStage(STAGE_GATE) });
+  if (machineryDenied(out) || out.outcome !== 'CALIBRATION' || !out.calibration || typeof out.calibration !== 'object') {
+    return {
+      available: false,
+      status: 'UNKNOWN',
+      reason: (out && out.reason) || 'calibration-unreachable',
+      n: null,
+      agreement_pct: null,
+      bar_pct: null,
+      bar_n: null,
+    };
+  }
+  const c = out.calibration;
+  return {
+    available: true,
+    status: typeof c.status === 'string' ? c.status : 'UNKNOWN',
+    reason: null,
+    n: c.n ?? null,
+    agreement_pct: c.agreement_pct ?? null,
+    bar_pct: c.bar_pct ?? null,
+    bar_n: c.bar_n ?? null,
+  };
+}
+
+// calibrationBarMet — the bar is met ONLY on the literal `calibrated` status
+// dual-build-ledger.sh writes, which is itself defined as n >= bar_n AND
+// agreement_pct >= bar_pct (ADR 0041). Read as one field rather than
+// re-deriving the two comparisons here: a second implementation of the bar is a
+// second thing to drift.
+function calibrationBarMet(cal) {
+  return !!(cal && cal.available && cal.status === 'calibrated');
+}
+
+// -----------------------------------------------------------------------------
+// resolvePickDecision — the two operator levers, applied to the tally.
+// -----------------------------------------------------------------------------
+// Returns { level, armFor(slug), overrideFor(slug), source }.
+//   no answer / `confirm`  → every item takes the tally's winner; level = winner.
+//   `override-level <arm>` → every item takes <arm>; level = <arm>; every row
+//                            carries `override: { applied, scope: "level" }`.
+//   `override-item …`      → the named items take their own arm, every other
+//                            item takes the tally's winner, and the level's own
+//                            pick becomes **`mixed`** — because it is: the level
+//                            no longer shipped one arm's work, and recording the
+//                            winner's name there would misreport what merged.
+function resolvePickDecision(tally, lp) {
+  if (!lp || lp.verdict === 'confirm') {
+    return {
+      level: tally.winner,
+      source: lp ? 'confirm' : 'tally',
+      armFor: () => tally.winner,
+      overrideFor: () => ({ applied: false }),
+    };
+  }
+  if (lp.verdict === 'override-level') {
+    return {
+      level: lp.arm,
+      source: 'override-level',
+      armFor: () => lp.arm,
+      overrideFor: () => ({ applied: true, scope: 'level', reason: lp.reason || 'operator override-level' }),
+    };
+  }
+  const bySlug = new Map(lp.items.map((r) => [r.slug, r]));
+  return {
+    level: 'mixed',
+    source: 'override-item',
+    armFor: (slug) => (bySlug.has(slug) ? bySlug.get(slug).arm : tally.winner),
+    overrideFor: (slug) =>
+      bySlug.has(slug)
+        ? { applied: true, scope: 'item', reason: bySlug.get(slug).reason || 'operator override-item' }
+        : { applied: false },
+  };
+}
+
+// recordOverrideCalibrationPair — an override IS a human preference expressed
+// against the same pair the judge saw, so it is recorded as a calibration pair
+// (ADR 0041's `--source override`). It is recorded and EXCLUDED from the
+// agreement statistic by that script, never smuggled into the blind corpus:
+// an override-only corpus is a disagreement by construction and would measure
+// 100% disagreement no matter how good the judge is.
+async function recordOverrideCalibrationPair(slug, arm, reason) {
+  const ledgerBin = sq(`${input.repoRoot}/workflows/scripts/model-comparison/dual-build-ledger.sh`);
+  const cmd = [
+    `__led=${ledgerBin}`,
+    'if [ ! -f "$__led" ]; then',
+    `printf '{"outcome":"CALIBRATION_PAIR_UNAVAILABLE","reason":"seam-absent"}\\n'`,
+    `elif bash "$__led" calibrate-record --slug ${sq(slug)} --preference ${sq(arm)} --reason ${sq(reason)} --source override >/dev/null 2>&1; then`,
+    `printf '{"outcome":"CALIBRATION_PAIR_RECORDED"}\\n'`,
+    'else',
+    `printf '{"outcome":"CALIBRATION_PAIR_REFUSED","reason":"calibrate-record refused the pair"}\\n'`,
+    'fi',
+  ].join('\n');
+  const out = await runMachinery(cmd, { label: `level-pick-calibrate:${slug}`, slug, phase: enterStage(STAGE_GATE) });
+  const ok = !machineryDenied(out) && out.outcome === 'CALIBRATION_PAIR_RECORDED';
+  if (!ok) {
+    log(`[${slug}] level-pick override: the calibration pair was NOT recorded (${(out && (out.reason || out.outcome)) || 'denied'}) — the override still stands; the judge's agreement record is short one pair`);
+  }
+  return ok;
+}
+
+// -----------------------------------------------------------------------------
+// stampWinningPr — the `Model-comparison-arms:` disclosure trailer (ADR 0040).
+// -----------------------------------------------------------------------------
+// The trailer is written ALONGSIDE the existing `Model-provenance:` line, never
+// in place of it. `tagging.sh stamp-arms` is the only authorized emitter of the
+// grammar (`claude/presentation-plane.md` freezes it), so this composes nothing
+// itself: it asks that script for the line, appends it, and then VERIFIES with
+// `parse-arms`, the script's own owned inverse. A stamp that cannot be verified
+// is reported as unstamped — and MERGE IS BLOCKED ON IT, because a dual-built PR
+// that merges without the trailer publishes work from a model comparison the
+// record no longer discloses.
+async function stampWinningPr(slug, pr, dual, arm, reason) {
+  const tagBin = sq(`${input.repoRoot}/workflows/scripts/model-comparison/tagging.sh`);
+  // stamp-arms refuses a reason carrying a double-quote or a newline (the
+  // grammar's own trailing `"$` anchor depends on exactly one quote pair), so
+  // the reason is flattened HERE rather than letting the script refuse a line
+  // this driver composed.
+  const oneLine = String(reason).replace(/[\r\n]+/g, ' ').replace(/"/g, "'").slice(0, 200) || 'level pick';
+  const repoFlag = input.ownerRepo ? ` --repo ${sq(input.ownerRepo)}` : '';
+  const cmd = [
+    `__tg=${tagBin}`,
+    'if [ ! -f "$__tg" ]; then',
+    `printf '{"outcome":"ARMS_STAMP_FAILED","reason":"seam-absent"}\\n'`,
+    'else',
+    `__line=$(bash "$__tg" stamp-arms --baseline ${sq(dual.baseline)} --candidate ${sq(dual.candidate)} --pick ${sq(arm)} --reason ${sq(oneLine)} 2>/dev/null); __sr=$?`,
+    'if [ "$__sr" -ne 0 ] || [ -z "$__line" ]; then',
+    `printf '{"outcome":"ARMS_STAMP_FAILED","reason":"stamp-arms refused the values","rc":%s}\\n' "$__sr"`,
+    'else',
+    `__body=$(gh pr view ${sq(String(pr))}${repoFlag} --json body -q .body 2>/dev/null); __br=$?`,
+    'if [ "$__br" -ne 0 ]; then',
+    `printf '{"outcome":"ARMS_STAMP_FAILED","reason":"pr-body-unreadable","rc":%s}\\n' "$__br"`,
+    'else',
+    // A `case` glob, not a piped `grep -q`: the body is already in a variable,
+    // and an idempotent re-stamp must never depend on a pipeline's exit status.
+    'case "$__body" in',
+    '*Model-comparison-arms:*)',
+    `printf '{"outcome":"ARMS_STAMPED","already":true}\\n'`,
+    ';;',
+    '*)',
+    '__bf=$(mktemp) || __bf=""',
+    'if [ -z "$__bf" ]; then',
+    `printf '{"outcome":"ARMS_STAMP_FAILED","reason":"scratch-file-failed"}\\n'`,
+    'else',
+    `printf '%s\\n\\n%s\\n' "$__body" "$__line" > "$__bf"`,
+    `if gh pr edit ${sq(String(pr))}${repoFlag} --body-file "$__bf" >/dev/null 2>&1; then`,
+    '__chk=$(bash "$__tg" parse-arms --pr-body "$__bf" 2>/dev/null); __cr=$?',
+    'if [ "$__cr" -eq 0 ] && [ -n "$__chk" ]; then',
+    `printf '{"outcome":"ARMS_STAMPED","already":false}\\n'`,
+    'else',
+    `printf '{"outcome":"ARMS_STAMP_FAILED","reason":"parse-arms could not verify the appended trailer","rc":%s}\\n' "$__cr"`,
+    'fi',
+    'else',
+    `printf '{"outcome":"ARMS_STAMP_FAILED","reason":"gh pr edit refused the body update"}\\n'`,
+    'fi',
+    'rm -f "$__bf"',
+    'fi',
+    ';;',
+    'esac',
+    'fi',
+    'fi',
+    'fi',
+  ].join('\n');
+  const out = await runMachinery(cmd, { label: `stamp-arms:${slug}`, slug, phase: enterStage(STAGE_PR) });
+  if (machineryDenied(out) || out.outcome !== 'ARMS_STAMPED') {
+    return { stamped: false, reason: (out && out.reason) || 'stamp-denied' };
+  }
+  return { stamped: true, already: !!out.already };
+}
+
+// -----------------------------------------------------------------------------
+// archiveLosingArm — archive FIRST, verify, and only then delete.
+// -----------------------------------------------------------------------------
+// The ordering is the contract, not an implementation detail: `archive-check`
+// runs `git am --check` against the saved patch, so a branch is deleted ONLY
+// once its work has been proven recoverable from the archive. Every failure
+// arm KEEPS the branch and the worktree — a losing arm whose patch did not
+// archive is not garbage, it is the only copy.
+async function archiveLosingArm(slug, loser) {
+  const ledgerBin = sq(`${input.repoRoot}/workflows/scripts/model-comparison/dual-build-ledger.sh`);
+  const repoRoot = sq(input.repoRoot);
+  const wt = sq(loser.wt);
+  const base = loser.wtBase || '';
+  const cmd = [
+    `__led=${ledgerBin}`,
+    'if [ ! -f "$__led" ]; then',
+    `printf '{"outcome":"LOSER_KEPT","reason":"ledger-absent"}\\n'`,
+    `elif [ ! -d ${wt} ]; then`,
+    `printf '{"outcome":"LOSER_KEPT","reason":"worktree-absent"}\\n'`,
+    'else',
+    base
+      ? `__p=$(git -C ${wt} format-patch ${sq(base)}..HEAD --stdout 2>/dev/null); __pr=$?`
+      : `__p=""; __pr=1`,
+    'if [ "$__pr" -ne 0 ] || [ -z "$__p" ]; then',
+    `printf '{"outcome":"LOSER_KEPT","reason":"no-patch-to-archive"}\\n'`,
+    `elif ! printf '%s\\n' "$__p" | bash "$__led" archive ${sq(slug)} ${sq(loser.arm)} --from - >/dev/null 2>&1; then`,
+    `printf '{"outcome":"LOSER_KEPT","reason":"archive-refused"}\\n'`,
+    `elif ! bash "$__led" archive-check ${sq(slug)} ${sq(loser.arm)} --repo ${repoRoot} >/dev/null 2>&1; then`,
+    `printf '{"outcome":"LOSER_KEPT","reason":"archive-check-failed"}\\n'`,
+    'else',
+    // archive-check PASSED — the patch applies, so the branch is now redundant.
+    // No `--force` on either removal: git's own refusal is the last belt, the
+    // same posture the kernel's worktree-disposal rule takes (temperloop#658).
+    `git -C ${repoRoot} worktree remove ${wt} >/dev/null 2>&1; __wr=$?`,
+    `git -C ${repoRoot} branch -D ${sq(loser.branch)} >/dev/null 2>&1; __dr=$?`,
+    `printf '{"outcome":"LOSER_ARCHIVED","worktree_removed":%s,"branch_deleted":%s}\\n' "$([ "$__wr" -eq 0 ] && echo true || echo false)" "$([ "$__dr" -eq 0 ] && echo true || echo false)"`,
+    'fi',
+    'fi',
+  ].join('\n');
+  const out = await runMachinery(cmd, { label: `archive-loser:${slug}`, slug, phase: enterStage(STAGE_PR) });
+  if (machineryDenied(out) || out.outcome !== 'LOSER_ARCHIVED') {
+    const reason = (out && out.reason) || 'archive-denied';
+    log(`[${slug}] level-pick: the losing ${loser.arm} arm was KEPT, not deleted (${reason}) — ${loser.branch} still holds its only copy`);
+    return { archived: false, deleted: false, reason };
+  }
+  return { archived: true, deleted: !!out.branch_deleted, worktree_removed: !!out.worktree_removed, reason: null };
+}
+
+// appendPickRow — the ledger's record OF THE PICK, appended after the PR phase.
+// The barrier's own rows are written before any pick exists and say `pick: null`
+// by construction; this is the row that closes them out, carrying the chosen
+// arm, the operator override (if any) and the POST-PICK CI outcome — which is
+// the only place a CI failure that happened after the comparison was over can
+// be recorded against the arm that caused it.
+async function appendPickRow(item, dual, winner, judgeOutcome, pickFields) {
+  const row = dualBuildRow(item, dual, winner, judgeOutcome, pickFields);
+  const r = await appendDualBuildRows(item, dual, [{ row, wt: winner.wt, arm: winner.arm }], 'pick');
+  return r;
+}
+
+
+// reKeyToItemSlug — a routed record comes back keyed by the ARM slug
+// (`<slug>@<arm>`, which is what phase 1 and driveItemPr see), but the plan
+// note, the board and the orchestrator's writeback all key on the ITEM's own
+// slug. Re-key in ONE place rather than at each of the four return sites: a
+// record that reaches the orchestrator under an arm slug matches no plan item,
+// so its sentinel write silently lands nowhere.
+function reKeyToItemSlug(record, slug) {
+  if (!record) return record;
+  record.slug = slug;
+  if (record.parked) record.parked.slug = slug;
+  if (record.escalation) record.escalation.slug = slug;
+  return record;
+}
+
+// -----------------------------------------------------------------------------
+// routePickedItem — ONE in-scope item, from the pick to its PR.
+// -----------------------------------------------------------------------------
+// Four things happen here and their ORDER is the contract:
+//   1. a per-item override writes its calibration pair (before anything merges,
+//      so the disagreement is on the record even if the PR later fails);
+//   2. a WINNING-ARM-LOST item is re-driven ONCE on the winning arm's own model,
+//      and parks `incomplete` if it still has no gate-passing branch — it is
+//      never quietly shipped from the losing arm, which would silently reverse
+//      the level's own pick for that item;
+//   3. the winning arm's phase-1 context goes through driveItemPr — the ordinary
+//      3f/3g/3h path, unchanged — and the PR is then STAMPED, with merge blocked
+//      until it is;
+//   4. only after the winner has a PR is the losing arm archived and deleted,
+//      and only if `archive-check` passes.
+async function routePickedItem(p, dual, decision, tally) {
+  const slug = p.item.slug;
+  const wantArm = decision.armFor(slug);
+  const override = decision.overrideFor(slug);
+  const loserArm = wantArm === 'baseline' ? 'candidate' : 'baseline';
+  const pickReason = override.applied
+    ? `${decision.source}: ${override.reason}`
+    : `${tally.reason} ${tally.tally.baseline}-${tally.tally.candidate} (${tally.tally.unresolved} unresolved)`;
+
+  // 1. A PER-ITEM override is a human preference over the same pair the judge
+  //    saw, so it is recorded as an override-sourced calibration pair (ADR
+  //    0041, `--source override`: recorded, and excluded from the blind
+  //    agreement statistic). A LEVEL-wide override deliberately writes none —
+  //    it is one decision about the level, not a per-pair preference, and
+  //    fanning it out into N pairs would manufacture N disagreements from one
+  //    click and corrupt the very statistic the pairs feed.
+  if (override.applied && override.scope === 'item') {
+    await recordOverrideCalibrationPair(slug, wantArm, override.reason || pickReason);
+  }
+
+  const basePick = {
+    level: decision.level,
+    arm: wantArm,
+    reason: pickReason,
+    source: decision.source,
+    override,
+    tally: tally.tally,
+    item_reason: (tally.items.find((i) => i.slug === slug) || {}).reason ?? null,
+  };
+  const dualRecord = { ...p.dualBuildRecord, barrier: 'cleared', awaiting: null, pick: basePick };
+
+  let winner = p.arms.find((a) => a.arm === wantArm);
+
+  // A spike arm produced a verdict note, not a branch — there is nothing to
+  // push. It already completed (driveArm's spike branch), so this is a normal
+  // disposition, not a loss, and no PR, stamp or archive applies.
+  if (winner && winner.spike) {
+    const rec = park(slug, null, null, winner.acceptanceResults ?? []);
+    rec.parked.dual_build = { ...dualRecord, pick: { ...basePick, outcome: 'spike-no-pr' } };
+    return { record: rec, pick: { ...basePick, outcome: 'spike-no-pr', pr: null, stamped: null } };
+  }
+
+  // 2. WINNING-ARM-LOST — re-drive ONCE, on the winning arm's OWN model.
+  let reDriven = false;
+  if (!winner || winner.gate !== 'pass' || !winner.ctx) {
+    reDriven = true;
+    log(
+      `[${slug}] level-pick: the winning ${wantArm} arm has no gate-passing branch ` +
+        `(${(winner && winner.lossReason) || 'no arm result'}) — re-driving it ONCE on its own model (${wantArm === 'baseline' ? dual.baseline : dual.candidate})`,
+    );
+    const redo = await driveArm(p.item, dual, wantArm, (winner && winner.order) || 1).catch((err) => ({
+      arm: wantArm, gate: 'fail', lossReason: 'infra',
+      failure: { kind: 'arm-throw', detail: String((err && err.stack) || err) },
+    }));
+    if (redo && redo.gate === 'pass' && redo.ctx) {
+      winner = redo;
+    } else {
+      // Still nothing. PARK INCOMPLETE — never fall back to the losing arm.
+      log(`[${slug}] level-pick: the winning ${wantArm} arm failed its re-drive too — parking INCOMPLETE (the losing arm is NOT shipped in its place)`);
+      const rec = park(slug, null, null, []);
+      rec.parked.incomplete = true;
+      rec.parked.dual_build = {
+        ...dualRecord,
+        pick: { ...basePick, outcome: 'incomplete', re_driven: true, re_drive_loss_reason: (redo && redo.lossReason) || 'infra' },
+      };
+      return { record: rec, pick: { ...basePick, outcome: 'incomplete', re_driven: true, pr: null, stamped: null } };
+    }
+  }
+
+  // 3. The ordinary PR/CI/park path, on the winning arm's own context.
+  let prRecord;
+  try {
+    prRecord = await driveItemPr(winner.ctx);
+  } catch (err) {
+    prRecord = escalate(winner.ctx.item.slug, 'worker-error', {
+      error: String((err && err.stack) || err),
+      phase: 'dual-build level-pick PR phase',
+    });
+  }
+  reKeyToItemSlug(prRecord, slug);
+  const pr = prRecord._kind === 'parked' ? prRecord.parked.pr ?? null : null;
+  const ciFailed = prRecord._kind === 'escalation' && /^ci-/.test(String(prRecord.escalation.kind));
+
+  let stamp = { stamped: false, reason: 'no-pr-opened' };
+  if (pr) stamp = await stampWinningPr(slug, pr, dual, wantArm, pickReason);
+
+  // 4. The losing arm — archived, verified, and only then deleted. Gated on the
+  //    winner actually having a PR: until the winner's work is on origin, the
+  //    loser's branch is not redundant, it is the level's second copy.
+  let loserOutcome = null;
+  const loser = p.arms.find((a) => a.arm === loserArm);
+  if (pr && loser && !loser.spike) {
+    loserOutcome = await archiveLosingArm(slug, loser);
+  } else if (loser && !loser.spike) {
+    loserOutcome = { archived: false, deleted: false, reason: 'winner-has-no-pr' };
+    log(`[${slug}] level-pick: the losing ${loserArm} arm is KEPT — the winning arm opened no PR, so nothing here is redundant yet`);
+  }
+
+  // POST-PICK CI, recorded against the arm that shipped. The barrier's own rows
+  // could not carry this (they are written before any PR exists), which is
+  // exactly why the pick row is appended here rather than there.
+  const postPickCi = prRecord._kind === 'parked'
+    ? (prRecord.parked.no_ci ? 'no-ci' : 'green')
+    : (ciFailed ? 'failed' : 'unknown');
+  const pickFields = {
+    pick: { arm: wantArm, reason: pickReason, level: decision.level },
+    override,
+    post_pick_ci: postPickCi,
+    pr: pr ?? null,
+    arms_trailer_stamped: !!stamp.stamped,
+    re_driven: reDriven,
+    // A CI failure AFTER the pick is a gate loss for the arm that shipped —
+    // named on the arm rather than left as a level-wide footnote, so the report
+    // can read "the candidate arm's picks went red in CI twice" from rows alone.
+    ...(ciFailed ? { loss_reason: 'gate' } : {}),
+  };
+  const rowsOut = await appendPickRow(p.item, dual, winner, p.judgeOutcome, pickFields);
+
+  const pickOut = {
+    ...basePick,
+    outcome: prRecord._kind === 'parked' ? 'routed' : 'escalated',
+    pr,
+    stamped: stamp.stamped,
+    stamp_reason: stamp.stamped ? null : stamp.reason,
+    post_pick_ci: postPickCi,
+    re_driven: reDriven,
+    loser: loser ? { arm: loserArm, branch: loser.branch, ...(loserOutcome ?? { archived: false, deleted: false, reason: 'no-losing-arm-build' }) } : null,
+    pick_row_appended: rowsOut.appended,
+  };
+
+  if (prRecord._kind === 'parked') {
+    prRecord.parked.dual_build = { ...dualRecord, pick: pickOut };
+    // MERGE IS BLOCKED UNTIL THE TRAILER IS ON THE PR. Not advisory: a
+    // dual-built PR that merges unstamped ships work chosen by a model
+    // comparison the merged record no longer discloses (ADR 0040).
+    if (!stamp.stamped) {
+      prRecord.parked.merge_blocked = 'arms-trailer-unstamped';
+      log(
+        `[${slug}] level-pick: PR #${pr ?? '?'} is NOT stamped with Model-comparison-arms (${stamp.reason}) — ` +
+          'MERGE IS BLOCKED for this item until `tagging.sh stamp-arms` lands its trailer on the PR body',
+      );
+    }
+  } else {
+    prRecord.escalation.payload = { ...(prRecord.escalation.payload ?? {}), dual_build: { ...dualRecord, pick: pickOut } };
+  }
+  return { record: prRecord, pick: pickOut };
+}
+
+// -----------------------------------------------------------------------------
+// driveLevelPick — phase 4's entry point: tally, gate, levers, route.
+// -----------------------------------------------------------------------------
+async function driveLevelPick(pickables, dual) {
+  const tally = tallyLevelPick(pickables);
+  log(
+    `dual-build LEVEL PICK — pre-registered tally: baseline=${tally.tally.baseline} ` +
+      `candidate=${tally.tally.candidate} unresolved=${tally.tally.unresolved} → winner=${tally.winner} (${tally.reason}); ` +
+      `whole-job cost baseline=${JSON.stringify(tally.cost.baseline)} candidate=${JSON.stringify(tally.cost.candidate)}`,
+  );
+
+  const lp = levelPickInput();
+  // An override naming a slug this level never built is a TYPO, not a no-op.
+  // levelPickInput() can only check the answer's SHAPE; membership needs the
+  // level, so it is checked here — otherwise a mistyped slug silently leaves
+  // every item on the tally's winner and the operator's override is lost with
+  // no signal, which is the one outcome the refusal-over-degradation posture
+  // above exists to prevent.
+  if (lp && !lp.invalid && lp.verdict === 'override-item') {
+    const known = new Set(pickables.map((p) => p.item.slug));
+    const unknown = lp.items.map((r) => r.slug).filter((slug) => !known.has(slug));
+    if (unknown.length > 0) {
+      lp.invalid =
+        `levelPick.items names slug(s) this level has no in-scope build for: ${unknown.join(', ')} ` +
+        `(in scope: ${[...known].join(', ') || 'none'})`;
+    }
+  }
+  if (lp && lp.invalid) {
+    log(`dual-build level-pick INPUT INVALID — refusing to route: ${lp.invalid}`);
+    return {
+      records: pickables.map((p) =>
+        escalate(p.item.slug, 'level-pick-input-invalid', {
+          reason: lp.invalid,
+          received: input.levelPick,
+          remedy: `pass levelPick as { verdict: ${LEVEL_PICK_VERDICTS.join(' | ')}, arm?, items? } — see claude/commands/build.md 3d-esc's level-pick handler`,
+        }),
+      ),
+      summary: { level: null, confirm_required: true, confirmed: false, refused: lp.invalid, tally: tally.tally, winner: tally.winner },
+    };
+  }
+
+  const cal = await readCalibrationStatus();
+  const calibrated = calibrationBarMet(cal);
+  log(
+    `dual-build level-pick calibration gate: status=${cal.status}` +
+      (cal.available ? ` n=${cal.n} agreement=${cal.agreement_pct}% bar=${cal.bar_pct}%/${cal.bar_n}` : ` (UNAVAILABLE: ${cal.reason})`) +
+      ` → an explicit confirm is ${calibrated ? 'OPTIONAL (the override lever)' : 'REQUIRED before any PR opens'}`,
+  );
+
+  // THE GATE. While the judge is not calibrated — or the bar is unmet, or the
+  // status could not be read at all — the pick does not route itself. There is
+  // NO DEFAULT here by construction: the whole reason to ask is that the
+  // per-item inputs to this tally are not yet known to agree with a human, so
+  // "proceed on silence" would be the harness asserting exactly the thing it
+  // cannot yet support (kernel § Merge autonomy & consent: a no-safe-default
+  // decision never auto-proceeds).
+  if (!calibrated && !lp) {
+    const shared = {
+      winner: tally.winner,
+      pick_reason: tally.reason,
+      tally: tally.tally,
+      items: tally.items,
+      cost: tally.cost,
+      calibration: cal,
+      confirm_required: true,
+      default: null,
+      no_default_reason:
+        'the pairwise judge is not calibrated against a human on this repo, so the tally that produced this pick is not yet known to be trustworthy — a timeout is not consent',
+      verdict_grammar: 'confirm | override-level <arm> | override-item <slug> <arm> "<reason>"',
+      in_scope: pickables.map((p) => p.item.slug),
+      remedy: 'answer the level-pick question, then re-invoke build-level.mjs for this level with input.levelPick carrying the verdict',
+    };
+    log(`dual-build LEVEL PICK HELD — no PR opens for any in-scope item until the operator confirms (${pickables.length} item(s))`);
+    return {
+      records: pickables.map((p) => {
+        const rec = escalate(p.item.slug, 'level-pick', {
+          ...shared,
+          item: {
+            slug: p.item.slug,
+            proposed_arm: tally.winner,
+            item_reason: (tally.items.find((i) => i.slug === p.item.slug) || {}).reason ?? null,
+          },
+          // The SAME record the item would have parked with. Carried verbatim
+          // so a held item is not a thinner surface than a routed one: the
+          // arms, their gates, their costs and the judge disposition are all
+          // the operator needs to answer the question this escalation asks.
+          dual_build: p.dualBuildRecord,
+          worktrees_intact: p.arms.map((a) => ({ arm: a.arm, worktree: a.wt, branch: a.branch })),
+        });
+        return rec;
+      }),
+      summary: {
+        level: null,
+        winner: tally.winner,
+        reason: tally.reason,
+        tally: tally.tally,
+        items: tally.items,
+        cost: tally.cost,
+        calibration: cal,
+        confirm_required: true,
+        confirmed: false,
+        held: true,
+      },
+    };
+  }
+
+  const decision = resolvePickDecision(tally, lp);
+  log(
+    `dual-build LEVEL PICK ${decision.source === 'tally' ? 'AUTO (calibrated judge — the confirm is today an optional override)' : `by operator ${decision.source}`}` +
+      ` → level=${decision.level}` +
+      (decision.level === 'mixed' ? ' (a per-item override means this level shipped BOTH arms — "mixed" is the honest level value, not a winner name)' : ''),
+  );
+
+  const routed = await parallel(
+    pickables.map((p) =>
+      dualBuildGuarded(
+        () => routePickedItem(p, dual, decision, tally),
+        (err) => ({
+          record: escalate(p.item.slug, 'worker-error', {
+            error: String((err && err.stack) || err),
+            phase: 'dual-build level-pick routing phase',
+          }),
+          pick: { level: decision.level, arm: decision.armFor(p.item.slug), outcome: 'threw' },
+        }),
+      ),
+    ),
+  );
+
+  return {
+    records: routed.filter(Boolean).map((r) => r.record),
+    summary: {
+      level: decision.level,
+      winner: tally.winner,
+      reason: tally.reason,
+      source: decision.source,
+      tally: tally.tally,
+      items: tally.items,
+      cost: tally.cost,
+      calibration: cal,
+      confirm_required: !calibrated,
+      confirmed: !!lp,
+      held: false,
+      picks: routed.filter(Boolean).map((r) => ({ slug: r.record.slug, ...r.pick })),
+      merge_blocked: routed.filter(Boolean).filter((r) => r.pick && r.pick.pr && !r.pick.stamped).map((r) => r.record.slug),
+    },
+  };
+}
+
 async function driveLevelDualBuild(activeItems, dual) {
   const boardWrites = [];
   log(
@@ -4990,6 +5780,13 @@ async function driveLevelDualBuild(activeItems, dual) {
   );
 
   // --- Phase 3: judge, record, dispose -------------------------------------
+  // `pickables` is phase 4's input, collected HERE rather than re-derived from
+  // the disposed records: an arm's phase-1 `ctx` is the one thing the level
+  // pick needs and the one thing a returned record deliberately never carries
+  // (dualBuildArmSummary drops it, so the orchestrator never ingests a worker
+  // verdict). Pushing from inside the fan-out is safe — the runtime is
+  // single-threaded, so a push between awaits cannot interleave.
+  const pickables = [];
   const ledger = { appended: 0, rejected: 0, unavailable: 0 };
   const disposed = await parallel(
     runs.map((run) =>
@@ -5079,9 +5876,29 @@ async function driveLevelDualBuild(activeItems, dual) {
       // forbids until the pick. `acceptance_results` is EMPTY on purpose: the
       // arms' results are per-arm and live in `dual_build.arms[]`, and hoisting
       // one arm's to the top level would read as a pick nobody made.
+      // A SPIKE pair is not pickable (temperloop#2083). Its arms produce a
+      // read-only verdict note rather than a branch, so there is no PR to route
+      // and no diff a pick could be about — the item is already finished. It
+      // would otherwise hold a whole level for a confirm over a choice that
+      // changes nothing, and count as an `unresolved` item in a tally it
+      // contributed no evidence to.
+      const spikePair = run.arms.some((a) => a.spike);
+      if (spikePair) {
+        dualBuildRecord.barrier = 'cleared';
+        dualBuildRecord.awaiting = null;
+        dualBuildRecord.pick = {
+          level: null,
+          outcome: 'no-pick-needed',
+          reason: 'a spike arm produces a verdict note, not a branch — there is nothing for a level pick to route to a PR',
+        };
+      }
       const record = park(run.item.slug, null, null, []);
       record.parked.dual_build = dualBuildRecord;
-      record.parked.awaiting_pick = true;
+      record.parked.awaiting_pick = !spikePair;
+      // Hand this item to phase 4. The parked record above is the FALLBACK
+      // disposition — it stands only if the pick never routes this item (the
+      // calibration gate holds the level, or the pick refuses).
+      if (!spikePair) pickables.push({ item: run.item, arms: run.arms, judgeOutcome, dualBuildRecord });
       return record;
       },
       // A throw in the JUDGE/LEDGER/RECORD phase is the same silent-loss risk — see build-level.design-notes-5.md#a-throw-in-the-judge-ledger-record-phase-is-the-same-si
@@ -5092,16 +5909,34 @@ async function driveLevelDualBuild(activeItems, dual) {
     ),
   );
 
+  // --- Phase 4: THE LEVEL PICK (temperloop#2083) ---------------------------
+  // Runs only when the barrier produced something to choose between. Every
+  // item it routes REPLACES that item's phase-3 parked record; an item phase 4
+  // never reaches (both arms failed → escalated above) keeps the record it
+  // already has.
+  let pick = null;
+  let results = disposed;
+  if (pickables.length > 0) {
+    const picked = await driveLevelPick(pickables, dual);
+    pick = picked.summary;
+    const bySlug = new Map(picked.records.filter(Boolean).map((r) => [r.slug, r]));
+    results = disposed.map((r) => (r && bySlug.has(r.slug) ? bySlug.get(r.slug) : r));
+  }
+
   return {
-    results: disposed,
+    results,
     summary: {
       tier: dual.tier,
       baseline: dual.baseline,
       candidate: dual.candidate,
       in_scope: activeItems.filter((it) => dual.inScope.has(it.slug)).map((it) => it.slug),
       not_in_scope: activeItems.filter((it) => !dual.inScope.has(it.slug)).map((it) => it.slug),
-      barrier: 'held',
-      awaiting: 'level-pick',
+      // The barrier is CLEARED once phase 4 has routed the level's pick; it
+      // stays `held` when the calibration gate held the level for a confirm, or
+      // when there was nothing to pick between at all.
+      barrier: pick && !pick.held ? 'cleared' : 'held',
+      awaiting: pick && !pick.held ? null : 'level-pick',
+      pick,
       rows_appended: ledger.appended,
       rows_rejected: ledger.rejected,
       ledger_unavailable_items: ledger.unavailable,
