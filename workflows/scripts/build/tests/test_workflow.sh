@@ -14792,7 +14792,7 @@ echo "PASS: #2083 r3 — the barrier names its safe branch positively, every sum
 _k2142_scrub_line="$(grep -n 'const gateScrub = ' "$MJS" || true)"
 [ -n "$_k2142_scrub_line" ] \
   || fail "#2142: build-level.mjs no longer defines \`const gateScrub\` — the anchor this whole guard reads is gone. Re-anchor the guard on whatever now carries the §3e.5 environment scrub; do NOT delete it, the defect it pins is a fabricated \`acceptance-gate-failed\` on a tree whose gates never ran"
-printf '%s\n' "$_k2142_scrub_line" | grep -q 'unset' \
+printf '%s\n' "$_k2142_scrub_line" | grep -F 'unset' >/dev/null \
   || fail "#2142: \`const gateScrub\` no longer runs an \`unset\` at all — the gate's #1241 environment scrub has been deleted, so the acceptance gate now runs against whatever build.config.sh settings this process inherited. That is the false-FAIL #1241 fixed, arriving from the other direction"
 
 # THE RULE: every emitted (non-comment) `unset` COMMAND must name a LITERAL NAME

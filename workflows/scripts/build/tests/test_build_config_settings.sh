@@ -168,7 +168,7 @@ scrubbed="$(
   export BUILD_MERGE_GATE_WINDOW=99999
   # temperloop#2142: non-empty arg list (`-v __tbcs_noop`) + decoupled status
   # (`|| :`). A zero-argument `unset` errors in zsh, and ANY non-zero `unset`
-  # trips this file's `set -e`; the scrub is best-effort hygiene either way.
+  # trips the `set -e` in this file; the scrub is best-effort hygiene either way.
   # shellcheck disable=SC2046  # intentional word-split: unset the whole setting set
   unset -v __tbcs_noop $(bash "$HELPER") || :
   # shellcheck disable=SC1090
