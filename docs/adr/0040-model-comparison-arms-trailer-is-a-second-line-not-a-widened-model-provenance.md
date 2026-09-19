@@ -4,7 +4,7 @@ title: "0040: Dual-build authorship is disclosed via a new trailer line, not a w
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 

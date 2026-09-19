@@ -4,7 +4,7 @@ title: "0041: The dual-build judge's verdict is withheld until blind-pair calibr
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 

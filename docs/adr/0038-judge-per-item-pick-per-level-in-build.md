@@ -4,7 +4,7 @@ title: "0038: The dual-build harness judges every item but picks a winner per le
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
