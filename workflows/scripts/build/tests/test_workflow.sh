@@ -14755,5 +14755,104 @@ printf '%s' "$K2083_14" | grep -F 'merge_blocked' >/dev/null   || fail "#2083 r3
 printf '%s' "$K2083_SEL" | grep -F 'PLAN NOTE' >/dev/null   || fail "#2083 r3: Step 4's selected set still reads the in-memory level summary as its authority — the one source a resumed run does not have"
 echo "PASS: #2083 r3 — the barrier names its safe branch positively, every summary shape carries the held discriminant, and merge_blocked has a durable writer/parser/resume path"
 
+# --- K2142 §3e.5 emitted-gate-command guards (structural + behavioural) ------
+# temperloop#2142. The emitted gate command scrubs the pipeline's own
+# build.config.sh settings with `unset $(bash build-config-settings.sh)` before
+# running quality-gates.sh (#1241). When that helper is ABSENT or older it prints
+# nothing, and `unset` with zero arguments is a silent no-op in bash but an ERROR
+# in zsh — and the machinery-executor's Bash tool is zsh on macOS. Chained under
+# `&&` that error SHORT-CIRCUITS the gate: quality-gates.sh never runs, no
+# QUALITY_GATES_FAILED= trailer is printed, `${__f:-1}` floors to 1, and §3e.5
+# escalates `acceptance-gate-failed` — "this branch is broken" — on a tree whose
+# gates never executed. Nothing pinned the dialect-safe form before this guard,
+# which is exactly why the regression survived review.
+# The scan is restricted to EMITTED command text: a `//` line is prose (this
+# defect's own corrected rationale quotes the broken form verbatim), and prose is
+# not a shell command. Everything the gate actually runs lives inside a template
+# literal on a non-comment line.
+_k2142_unsets="$(grep -nE 'unset [^;|&]*\$\(' "$MJS" | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' || true)"
+[ -n "$_k2142_unsets" ] \
+  || fail "#2142: the emitted-gate scan found NO \`unset \$(…)\` in build-level.mjs at all — the pattern has drifted away from the shape it is meant to catch and can no longer go red; fix the pattern rather than deleting the guard"
+_k2142_bare="$(printf '%s\n' "$_k2142_unsets" | grep -E 'unset[[:space:]]+\$\(' || true)"
+[ -z "$_k2142_bare" ] \
+  || fail "#2142: an emitted shell command uses the BARE \`unset \$(…)\` form. With an absent or older build-config-settings.sh that command substitution is empty, and a zero-argument \`unset\` is an ERROR in zsh (the executor's shell) — the \`&&\` chain short-circuits and §3e.5 invents a GATE_FAIL on a tree whose gates never ran. Always pass at least one literal name (\`unset __qg_noop \$(…)\`), which is a no-op in both dialects. Offending line(s):
+$_k2142_bare"
+unset _k2142_unsets _k2142_bare
+
+# BEHAVIOURAL half: lift the REAL fragment out of build-level.mjs, point it at a
+# build-config-settings.sh that does not exist (the stranger case), and run it in
+# the executor's own dialect. Both the GREEN (shipped form) and RED (reverted
+# form) arms are executed here, so this case carries its own discrimination proof
+# rather than asserting one.
+_k2142_missing="$WF_TEST_TMPDIR/k2142-absent-build-config-settings.sh"
+[ ! -e "$_k2142_missing" ] \
+  || fail "#2142: the absent-helper fixture path unexpectedly exists — this case needs a MISSING helper to reproduce the empty command substitution"
+_k2142_src="$(grep -F 'unset __qg_noop $(bash ${sq(settingsBin)} 2>/dev/null)' "$MJS" | head -1 || true)"
+[ -n "$_k2142_src" ] \
+  || fail "#2142: could not locate the emitted \`unset\` fragment in build-level.mjs — the behavioural prong has nothing left to execute, so the structural prong above is the only remaining cover; re-anchor this extraction"
+_k2142_frag="$(printf '%s\n' "$_k2142_src" \
+  | sed -E 's/.*(unset [^`]*2>\/dev\/null\)).*/\1/' \
+  | sed -E "s|\\\$\\{sq\\(settingsBin\\)\\}|'$_k2142_missing'|")"
+case "$_k2142_frag" in
+  unset*"$_k2142_missing"*) : ;;
+  *) fail "#2142: the extracted gate fragment does not look like a runnable \`unset\` command (got: $_k2142_frag)" ;;
+esac
+for _k2142_sh in bash zsh; do
+  if ! command -v "$_k2142_sh" >/dev/null 2>&1; then
+    echo "SKIP: #2142 behavioural prong — $_k2142_sh is not installed on this host; the structural prong above still pins the form"
+    continue
+  fi
+  # GREEN: the shipped form must let the `&&` chain continue in BOTH dialects.
+  _k2142_green="$("$_k2142_sh" -c "$_k2142_frag && echo REACHED_GATE" 2>&1 || true)"
+  case "$_k2142_green" in
+    *REACHED_GATE*) : ;;
+    *) fail "#2142: under $_k2142_sh, the SHIPPED gate fragment with an absent build-config-settings.sh did NOT reach the gate — the \`&&\` chain short-circuited, which is the whole defect. Fragment: $_k2142_frag
+Output: $_k2142_green" ;;
+  esac
+  # RED: the same fragment with the placeholder removed — i.e. the pre-#2142
+  # form — must short-circuit under zsh. If it does NOT, the dialect premise this
+  # guard rests on has changed and the guard is no longer measuring anything.
+  _k2142_revert="$(printf '%s\n' "$_k2142_frag" | sed -E 's/unset __qg_noop /unset /')"
+  _k2142_red="$("$_k2142_sh" -c "$_k2142_revert && echo REACHED_GATE" 2>&1 || true)"
+  if [ "$_k2142_sh" = zsh ]; then
+    case "$_k2142_red" in
+      *REACHED_GATE*) fail "#2142: the REVERTED (bare \`unset \$(…)\`) fragment reached the gate under zsh, so this guard's discrimination premise no longer holds — zsh's zero-argument \`unset\` behaviour has changed, or the extraction is matching the wrong text. Re-derive the guard rather than trusting it. Fragment: $_k2142_revert" ;;
+      *) : ;;
+    esac
+  fi
+  echo "PASS: #2142 behavioural prong ($_k2142_sh) — the shipped \`unset __qg_noop \$(…)\` fragment reaches the gate with an ABSENT build-config-settings.sh$([ "$_k2142_sh" = zsh ] && printf '%s' ', and the reverted bare form provably short-circuits (RED arm confirmed)')"
+done
+unset _k2142_missing _k2142_src _k2142_frag _k2142_sh _k2142_green _k2142_revert _k2142_red
+echo "PASS: #2142 emitted-gate structural guard — every emitted \`unset \$(…)\` in build-level.mjs passes a literal placeholder first, so an absent build-config-settings.sh can no longer short-circuit §3e.5 into a fabricated GATE_FAIL"
+
+# STRICT ledger reads (#2142). The resume-extension gate grants MORE slice budget
+# on the strength of "zero failures so far"; `Number(x) || 0` collapses both
+# `null` and `NaN` to 0, so an eventual unreadable-count sentinel would read as a
+# KNOWN zero and extend the budget over a slice whose result was unknown — the
+# same laundering #1698 fixed for elapsedSecs.
+grep -qE 'gateSliceLedger\.every\(\(s\) => Number\.isFinite\(s\.failed\) && s\.failed === 0\)' "$MJS" \
+  || fail "#2142: the §3e.5 resume-extension gate must require a KNOWN zero (Number.isFinite(s.failed) && s.failed === 0). \`(Number(s.failed) || 0) === 0\` launders a null/NaN failure count into 'zero failures, safe to extend'"
+_k2142_launder="$(grep -nE 'Number\(s\.failed\) \|\| 0' "$MJS" || true)"
+[ -z "$_k2142_launder" ] \
+  || fail "#2142: a ledger consumer still reads the failure count through \`Number(s.failed) || 0\`, which collapses a non-finite count to a known zero. Use Number.isFinite() at every ledger-reading site. Offending line(s):
+$_k2142_launder"
+unset _k2142_launder
+echo "PASS: #2142 strict ledger reads — no ledger site launders a non-finite failure count into a known zero"
+
+# The §3e.5 green-path DECAY SIGNAL (#2142). This log line is what an operator
+# reads to decide whether to raise BUILD_GATE_SLICE_SECS or split the gate list,
+# so its cap figures must mean the same thing on every run: the mid-run
+# `gateSliceCeiling` alone rendered a different number after an extension was
+# spent, matching neither the configured base cap nor the hard bound.
+_k2142_pass_log="$(grep -n '3e.5 gate PASS' "$MJS" || true)"
+[ -n "$_k2142_pass_log" ] \
+  || fail "#2142: the §3e.5 gate PASS log line is gone from build-level.mjs — the decay signal this guard defends no longer exists; re-anchor the guard rather than deleting it"
+unset _k2142_pass_log
+grep -qF 'base cap ${GATE_MAX_SLICES} slices' "$MJS" \
+  || fail "#2142: the §3e.5 gate PASS log must name the CONFIGURED base cap, derived from GATE_MAX_SLICES — not the mid-run gateSliceCeiling, whose value shifts between runs"
+grep -qF 'hard cap ${GATE_MAX_SLICES * (GATE_RESUME_EXTENSIONS + 1)}' "$MJS" \
+  || fail "#2142: the §3e.5 gate PASS log must DERIVE the hard cap from GATE_MAX_SLICES and GATE_RESUME_EXTENSIONS (kernel § Named-setting convention) — never restate it as a literal, which silently rots when either constant moves"
+echo "PASS: #2142 gate-PASS decay signal — the green-path log names the base cap, the extension allowance, the derived hard cap, the extensions spent and this run's ceiling, every figure derived from its constant"
+
 echo ""
 echo "All test_workflow.sh cases passed."

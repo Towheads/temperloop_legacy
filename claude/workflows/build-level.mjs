@@ -2670,8 +2670,17 @@ function gateSliceResumeAt(out) {
 
 // gateVerdict(terminalOutcome, ledger) — the ONE reconciliation point be — see build-level.design-notes-3.md#gateverdict-terminaloutcome-ledger-the-one-reconciliation-po
 function gateVerdict(terminalOutcome, ledger) {
-  const failedGates = ledger.reduce((n, s) => n + (Number(s.failed) || 0), 0);
-  const failedInSlices = ledger.filter((s) => (Number(s.failed) || 0) > 0).map((s) => s.slice);
+  // temperloop#2142: read the ledger's failure count STRICTLY. `Number(x) || 0`
+  // collapses BOTH `null` and `NaN` to 0 — the same laundering temperloop#1698
+  // fixed for elapsedSecs — so the day gateSliceFailed()'s contract grows an
+  // "unreadable failure count" sentinel, an UNKNOWN count would read as a known
+  // zero. The rule, applied at all three ledger-reading sites: a non-finite count
+  // is never a known zero. Identical to the prior expression for every finite
+  // input, which is all the single-writer ledger produces today.
+  const failedGates = ledger.reduce((n, s) => n + (Number.isFinite(s.failed) ? s.failed : 0), 0);
+  const failedInSlices = ledger
+    .filter((s) => !Number.isFinite(s.failed) || s.failed > 0)
+    .map((s) => s.slice);
   // A resume point in the LAST ledger entry is direct evidence that gates — see build-level.design-notes-3.md#a-resume-point-in-the-last-ledger-entry-is-direct-evidence-t
   const lastSliceResumeAt = ledger.length > 0
     ? gateSliceResumeAt(ledger[ledger.length - 1])
@@ -6348,8 +6357,20 @@ async function driveItemBuildPhase(item, arm, box) {
   // precedence (env > machine-conf > repo-local > tracked-default), so an
   // inherited setting wins the env layer and false-FAILs a change CI's `checks`
   // passes green. `build-config-settings.sh` prints the (SSOT-derived) setting names;
-  // unsetting them makes the gate hermetic — tracked defaults, matching CI. A
-  // missing/older helper prints nothing → `unset` no-op → prior behavior.
+  // unsetting them makes the gate hermetic — tracked defaults, matching CI.
+  // temperloop#2142: the leading `__qg_noop` placeholder below is LOAD-BEARING,
+  // not cosmetic. A missing/older helper prints NOTHING, and a bare `unset $(…)`
+  // that resolves to zero arguments is a silent no-op in bash but an ERROR in zsh
+  // ("unset: not enough arguments", rc=1) — and the executor's Bash tool is zsh on
+  // macOS, the same dialect premise the PIPESTATUS note relies on (temperloop#801).
+  // Chained under `&&`, that rc=1 SHORT-CIRCUITS the rest of the command:
+  // quality-gates.sh never runs, no QUALITY_GATES_FAILED=/QUALITY_GATES_RESUME_AT=
+  // trailer is printed, `${__f:-1}` floors to 1, and §3e.5 reports GATE_FAIL — an
+  // `acceptance-gate-failed` escalation ("this branch is broken") invented out of a
+  // shell-dialect difference, on a tree whose gates never executed. That is the
+  // STRANGER case: every consuming repo on an older vendored toolkit. Passing one
+  // literal placeholder name keeps the argument list non-empty in BOTH dialects
+  // while still unsetting exactly the names the helper printed.
   const settingsBin = `${wt}/workflows/scripts/build/build-config-settings.sh`;
   // gateCmd(startAt) — one SLICE of the suite (temperloop#1021). — see build-level.design-notes-5.md#gatecmd-startat-one-slice-of-the-suite-temperloop-1021
   const gateLog = `/tmp/qg-${item.slug}.log`;
@@ -6401,7 +6422,7 @@ async function driveItemBuildPhase(item, arm, box) {
   const gateCmd = (startAt, expectSelection) =>
     `set -o pipefail; if [ ! -x ${sq(qgBin)} ]; then echo '{"outcome":"GATE_ABSENT"}'; ` +
     `else ${startAt === 0 ? `rm -f ${sq(gatePin)} ${sq(gateSliceLog)}; : >${sq(gateLog)}; ` : ''}` +
-    `( cd ${sq(wt)} && unset $(bash ${sq(settingsBin)} 2>/dev/null) && ` +
+    `( cd ${sq(wt)} && unset __qg_noop $(bash ${sq(settingsBin)} 2>/dev/null) && ` +
     `${gateScopeEnv} QUALITY_GATES_SELECTION_PIN=${sq(gatePin)} ` +
     `${expectSelection ? `QUALITY_GATES_EXPECT_SELECTION=${sq(expectSelection)} ` : ''}` +
     `QUALITY_GATES_START_AT=${startAt} QUALITY_GATES_BUDGET_SECS=${GATE_SLICE_SECS} ${sq(qgBin)} ) ` +
@@ -6488,7 +6509,9 @@ async function driveItemBuildPhase(item, arm, box) {
     if (
       gateSlices + 1 === gateSliceCeiling
       && gateExtensionsUsed < GATE_RESUME_EXTENSIONS
-      && gateSliceLedger.every((s) => (Number(s.failed) || 0) === 0)
+      // temperloop#2142 — the load-bearing one: this grants MORE budget on the
+      // strength of "zero failures so far", so it must require a KNOWN zero.
+      && gateSliceLedger.every((s) => Number.isFinite(s.failed) && s.failed === 0)
     ) {
       gateSliceCeiling += GATE_MAX_SLICES;
       gateExtensionsUsed++;
@@ -6557,7 +6580,18 @@ async function driveItemBuildPhase(item, arm, box) {
       ? ` — NOTE: approaching the per-slice budget; raise BUILD_GATE_SLICE_SECS or split the gate list before it costs a re-slice`
       : '';
     const elapsedNote = gateElapsedUnknown ? '?' : String(gateElapsed);
-    log(`[${item.slug}] 3e.5 gate PASS — ${gateSlices + 1} slice(s), ${elapsedNote}s of gate wall time (slice budget ${GATE_SLICE_SECS}s, cap ${gateSliceCeiling} slices${gateExtensionsUsed > 0 ? `, ${gateExtensionsUsed} resume extension(s) used` : ''})${marginNote}`);
+    log(`[${item.slug}] 3e.5 gate PASS — ${gateSlices + 1} slice(s), ${elapsedNote}s of gate wall time (slice budget ${GATE_SLICE_SECS}s, ` +
+      // temperloop#2142 — this line IS the decay signal an operator reads to decide
+      // whether to raise BUILD_GATE_SLICE_SECS or split the gate list, so every
+      // figure in it must mean the same thing on every run. `cap ${gateSliceCeiling}`
+      // did not: on a run that spent an extension it rendered the MID-RUN ceiling,
+      // which is neither the configured base cap nor the hard bound. Name the base
+      // cap, the extension allowance, the hard bound and the extensions actually
+      // spent, each derived from its constant — never a literal (kernel § Named-
+      // setting convention).
+      `base cap ${GATE_MAX_SLICES} slices (+${GATE_RESUME_EXTENSIONS} extension(s) allowed, ` +
+      `hard cap ${GATE_MAX_SLICES * (GATE_RESUME_EXTENSIONS + 1)}; ${gateExtensionsUsed} used, ` +
+      `ceiling this run ${gateSliceCeiling}))${marginNote}`);
   }
 
   // --- 3e.6. Class-A activation gate (temperloop#1219) ----------------------
