@@ -999,3 +999,147 @@ added by a branch not yet on main is invisible to that derivation.
  the JSON below is either the plan's validated `branch:`, a literal, or a
  40-hex sha normalized through the `case` guard before it is read.
 ```
+
+## runReviewers — the §3e driver. Fetches the routing inputs (one machine
+<a id="runreviewers-the-3e-driver-fetches-the-routing-inputs-one-ma"></a>
+
+```text
+ runReviewers — the §3e driver. Fetches the routing inputs (one machinery
+ call), resolves the matching reviewer set, and spawns EACH directly via
+ `agent({agentType})` — never delegated to the 3c worker. Every routed reviewer
+ is spawned CONCURRENTLY and the whole fanout waits under one wall-clock
+ ceiling (temperloop#2003, awaitReviewFanout), so one agent that never returns
+ can neither block a later one from launching nor stall the level. Returns:
+   { escalation }                                   — the diff fetch itself failed
+   { summary, notes, blocking: [], ran, skipped }   — normal return (blocking may be non-empty)
+ A THIRD shape (temperloop#2020) is a normal return, not a third branch: when
+ the routing table does not survive the relay even after the one-shot retry,
+ this returns the normal shape with one extra `skipped` degradation notice
+ and `routing_degraded` carrying the gap payload — the drive continues to
+ 3e.5/3f with the skip notice on the PR body. A post-commit advisory pass
+ that cannot route is a DEGRADATION, never a halt. The degradation is
+ PARTIAL: only the table-dependent axes are withdrawn, so the mandatory
+ command-doc route (foundation#1007), the `review:` override and the
+ `kind: architectural` axis — all computed from `item`/`files`, never from
+ the table — still route and still run, and `ran` is therefore NOT
+ necessarily empty in this shape.
+   { …the normal return, plus `escalation` }        — a MANDATORY reviewer hit
+     the ceiling (temperloop#2003): the tally is still computed and returned,
+     AND the item escalates `review-agent-timeout` rather than reading as if the
+     mandatory gate had passed. Callers check `.escalation` first either way.
+ `summary` is a short tally line for the PR body (criterion: the PR must
+ carry real evidence of a real pass, never a guaranteed-skip default).
+ `notes` (temperloop#1450) is the FULL findings text for every reviewer that
+ ran, one `### <reviewer>` block each — a non-blocking (MEDIUM/LOW-only)
+ review is still advisory OUTPUT, not silently discarded after the HIGH
+ check. Empty string when nothing ran. Callers splice `notes` into a durable
+ surface (the PR body, at the 3f call site) rather than letting it evaporate
+ once the blocking check has read it.
+
+ `round` (temperloop#1970) is this pass's 1-based round number for THIS item's
+ worktree, durable across the escalate→re-invoke loop (see reviewDiffCmd). The
+ two blocking call sites compare it against REVIEW_BLOCKING_MAX_ROUNDS.
+
+ `priorFindingsText` (temperloop#2127, optional) — the PRIOR round's findings
+ text, when the caller already has it. The ONLY caller that ever has this is
+ driveItemBuildPhase's 3e call site on a `review-blocking` continuation: the
+ orchestrator captured `findings: review.blocking` off THIS SAME escalation
+ (see the `escalate(item.slug, 'review-blocking', …)` call below) and handed
+ it back as `input.verdicts[item.slug].verdict_section` — the identical seam
+ 3c already reads for the worker's re-spawn prompt (driveItemBuildPhase's own
+ `verdictSection`). This function never re-derives that text; it only decides
+ WHETHER to use it (never on round 1 — see `priorContext` below) and hands it
+ to reviewPrompt(). The CI-fix re-review call site (§3g) passes nothing: its
+ round bump comes from the SAME shared per-worktree counter, but a round-1
+ pass that reached CI-fix by definition had zero BLOCKING findings (that is
+ why it was pushed), so there is nothing to carry forward there — and since
+ round 2 that ABSENCE is itself load-bearing, not merely tolerated: it is what
+ selects reviewContinuationSection()'s clean-prior-round premise instead of
+ the false "round N found blocking finding(s)" one. Same for a continuation
+ resuming from a non-`review-blocking` escalation kind, which the 3e call site
+ deliberately passes nothing for.
+```
+
+## temperloop#2020 — DEGRADE, never halt. Before this item a persistent
+<a id="temperloop-2020-degrade-never-halt-before-this-item-a-persis"></a>
+
+```text
+ temperloop#2020 — DEGRADE, never halt. Before this item a persistent
+ gap escalated `review-diff-error`, and that disposition was the
+ reported harm, not the drop: by the time §3e runs the worker has
+ ALREADY COMMITTED (3c) and passed acceptance (3d), so escalating here
+ stops a drive whose work is complete, for the sake of an ADVISORY pass
+ that is explicitly never a `checks` gate (build.md §3e). On
+ Towheads/foundation at kernel v0.39.0 (run wf_967c2878-0a7, driving
+ foundation#1869) that cost 515 verified lines: the item escalated
+ committed-but-un-PR'd, and /fix's escalation-park path removed the
+ worktree and its local `build/` branch.
+
+ The DETECTORS are untouched — the row/checksum gap check and the
+ one-shot retry above both still run, and this arm is reached only
+ after both have fired. What changed is what happens next: the
+ TABLE-DEPENDENT part of the routing decision cannot be made (routing
+ off a missing/partial table is the #1976/#1982 silent-misroute this
+ whole mechanism exists to prevent), so the extension axis and the
+ prose-`*.md` fallback are withdrawn and that is said out loud — never
+ implied by silence. The notice is a mode-2 `skipped — …` line per
+ `claude/message-schema.md` § Degradation notice, carried into the PR
+ body by reviewBodySuffix() exactly like every other skip notice, so a
+ cold reader of the PR sees which part of §3e did not route rather than
+ reading a thin review section as a clean pass.
+
+ NOT a return (temperloop#2020 round 2). Returning here conflated "the
+ extension-axis table is broken" with "no route can be determined" and
+ silently dropped the one route that never needed the table: the
+ MANDATORY command-doc rule (foundation#1007) is computed purely from
+ `files`, the field that relays reliably, and fires regardless of any
+ tsv row. A `claude/commands/*.md` diff whose relay dropped would then
+ have reported `mandatory_ok: true` with workflow-reviewer never run —
+ byte-identical to a clean pass, i.e. the K.49/foundation#164 silent-skip
+ class reintroduced through this very fallback. So the arm now falls
+ THROUGH with `tableAvailable: false`: every table-independent route
+ still runs, and `mandatory_ok` is computed from real routes again.
+
+ Deliberately NOT the remedy-bearing variant: that one clause is
+ sanctioned only for a subagent that ships as source under
+ claude/agents/ and is merely uninstalled. This is a relay fault with
+ no in-the-moment operator fix, so it takes the bare default shape.
+```
+
+## reviewTally — merge one or more runReviewers() rounds (the original 3e
+<a id="reviewtally-merge-one-or-more-runreviewers-rounds-the-origin"></a>
+
+```text
+ reviewTally — merge one or more runReviewers() rounds (the original 3e pass
+ plus any CI-fix re-review, temperloop#1450) into the ONE summary object
+ park() threads through to the orchestrator's Step 6 tally. `mandatory_ok`
+ is false iff any SKIPPED entry across every round carried `mandatory: true`
+ — i.e. the foundation#1007 command-doc rule was genuinely degraded at least
+ once, never merely "some optional reviewer wasn't available".
+
+ temperloop#1984 — `routed_not_run`, the WEAKER companion field.
+ `mandatory: true` is set by determineReviewers() for `workflow-reviewer` on a
+ command-doc diff and for nothing else, so EVERY extension-axis route
+ (shell-reviewer for `.sh`, typescript-reviewer for `.mjs`, …) could be
+ skipped with `mandatory_ok` still reading `true` — a tally that reads fully
+ clean while the shell diff went unreviewed (observed live: six unrun §3e
+ shell reviews across three items, every one caught by a human reading the
+ roster, never by this tally). `routed_not_run` is the distinct set of
+ reviewer names the routing RESOLVED but that did not run in the round they
+ were routed for — deliberately a VISIBILITY field, not a second gate (ADR
+ 0037; kernel principle 7: a hard block here deadlocks legitimate work in a
+ consuming checkout where a reviewer agent is genuinely absent, which is the
+ ordinary case, not the pathological one). Invariant that closes the hole:
+ `routed_not_run` is non-empty exactly when `skipped` is, so the tally can
+ never read fully clean while any routed reviewer was skipped. A reviewer
+ skipped in one round and run in another stays listed — the skip was real,
+ and which round covered which diff is exactly what a reader needs to see.
+
+ temperloop#1970 adds `residual_blocking` — the convergence bound's PER-RUN
+ EXECUTION SIGNAL (§ Mandatory-step birth rule): one entry per round that hit
+ the bound, carrying the round number and the findings that were CARRIED into
+ the PR body rather than re-escalated. So an operator reading the Step 6
+ summary can see the bound firing, on which items, with what still outstanding
+ — never a prose-only declaration that it exists. OMITTED ENTIRELY when no
+ round hit the bound, so an ordinary item's parked record stays byte-identical.
+```

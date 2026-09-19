@@ -1009,3 +1009,139 @@ added by a branch not yet on main is invisible to that derivation.
  `repo:`, or `repo:` equal to `ownerRepo`) is unaffected: bare `Closes #N`
  exactly as before.
 ```
+
+## THE FAILURE THIS BOUNDS — the sibling of temperloop#1071 one layer up.
+<a id="the-failure-this-bounds-the-sibling-of-temperloop-1071-one-l"></a>
+
+```text
+ THE FAILURE THIS BOUNDS — the sibling of temperloop#1071 one layer up. Run
+ `wf_f3b9c160-6ca` routed four §3e reviewers. Two returned. `shell-reviewer`
+ was spawned and never returned: its own agent transcript ends mid-sentence at
+ "Now compiling the final review output", the workflow stopped writing its
+ journal, and ~41 minutes of silence followed until a human ran `TaskStop`.
+ `workflow-reviewer` — MANDATORY for that item's `claude/commands/*.md` diff —
+ never launched at all, because the §3e pass awaited each reviewer in turn and
+ the second one never resolved.
+
+ WHY THAT IS WORSE THAN A PLAIN HANG. The mandatory-reviewer contract
+ (foundation#1007) guarantees `workflow-reviewer` RUNS, and `review.
+ mandatory_ok` reports whether it did. A hang UPSTREAM of it in the same pass
+ means neither the guarantee nor the tally is ever EVALUATED: the gate does not
+ fail, it never resolves. An operator watching the tally sees nothing wrong,
+ because there is no tally yet — which is exactly why the incident stayed
+ invisible for 41 minutes. So the bound's job is not only to stop waiting; it
+ is to make the pass ALWAYS produce a disposition.
+
+ WHY THE BOUND CANNOT BE A TIMER. Same two runtime facts temperloop#1071 hit:
+ `Date.now()` THROWS here and there is no timer primitive, so a deadline is not
+ directly expressible. But `Promise.race` IS — what #1071 lacked was something
+ that resolves ON A CLOCK to race against, and this file already owns one: a
+ machinery executor running a WAIT. reviewWaitAgent() is that tick.
+
+ TEMPERLOOP#2049 — WHERE THAT TICK HAS TO LIVE. The wait was first written as
+ a bare inline `sleep N; printf '<json>'` Bash command. A harness permission
+ control REFUSES that command shape in the machinery executor's seat, and the
+ executor's prompt then told it to report the interval elapsed anyway: the
+ nominal 1200s ceiling realized in ~30s, abandoning reviewers that were
+ finishing normally at 177-257s. The wait now runs inside the named helper
+ workflows/scripts/build/review-wait.sh (the shape ci-poll.sh already uses,
+ observably honoured in the same seat for a 280s single call), and an elapse
+ is honoured only when it carries the script's OWN `realized_secs`. See
+ reviewWaitAgent() for the measurements and both halves of the fix.
+ A reviewer is an `agent({agentType})` call, NOT a shell command, so #1071's
+ emitted-shell watchdog cannot reach it; the race is the only seam that can.
+
+ THE SHAPE, mirroring #1071's ceiling+observability pair exactly:
+   • REVIEW_AGENT_CEILING_SECS — the wall-clock ceiling on the WHOLE §3e pass,
+     measured from fanout start. Every routed reviewer is spawned CONCURRENTLY
+     (they are independent read-only passes; nothing ordered them), so one
+     hung agent can no longer keep a later one from launching — the observed
+     failure — and the pass costs max(reviewer) rather than sum(reviewer).
+     A reviewer still unsettled at the ceiling is ABANDONED, not killed: this
+     runtime cannot cancel an agent, and the promise is simply never awaited
+     again. Its disposition then respects mandatory-vs-advisory (runReviewers).
+   • REVIEW_AGENT_SLOW_SECS — the observability half: a pass still running at
+     this threshold emits a log() progress notice naming who is outstanding, so
+     a long review is VISIBLE well before it is given up on. 0 disables it.
+ Both are NAMED SETTINGS (BUILD_REVIEW_AGENT_CEILING_SECS /
+ BUILD_REVIEW_AGENT_SLOW_SECS), handed in by the orchestrator at Step 0 on the
+ SAME seam as GATE_SLICE_SECS / the #1071 pair above, for the same structural
+ reason (this runtime has no shell to source build.config.sh).
+```
+
+## temperloop#2127 — the PRIOR reviewed SHA, kept beside build-review-rou
+<a id="temperloop-2127-the-prior-reviewed-sha-kept-beside-build-rev"></a>
+
+```text
+ temperloop#2127 — the PRIOR reviewed SHA, kept beside build-review-rounds
+ in the SAME worktree git dir (never the working tree — identical
+ durability rationale as the round counter above: it must survive the
+ escalate -> orchestrator -> re-invoke loop, and must never appear in
+ `git status`, a `--scoped` gate's untracked-path resolution, or a
+ coverage manifest). Read BEFORE the bump below writes this round's HEAD
+ into it, so what this call emits is always the SHA that was HEAD at the
+ START of the round that is about to run — i.e. the commit the PRIOR
+ round actually reviewed.
+
+ VALIDATE, DO NOT MERELY SANITISE (round 2, HIGH A). `tr -cd` is a
+ FILTER, not a validator: it DELETES the bytes it dislikes and returns
+ whatever survives, so a corrupted marker yields a plausible-but-bogus
+ value that sails through any pure shape check downstream. Measured
+ against the real generated shell: `not a sha at all` -> `aaaa`,
+ `ref: refs/heads/main` -> `efefeada`, `deadbeefcafe deadbeefcafe` ->
+ `deadbeefcafedeadbeefcafe`. Every one of those reaches the reviewer as
+ a `git diff <bogus>..HEAD` instruction that dies `fatal: ambiguous
+ argument` in the reviewer's own shell — SILENTLY, since §3e never sees
+ that shell. So the filtered value is RESOLVED against this very repo
+ before it is emitted:
+   - `git rev-parse --verify --quiet '<sha>^{commit}'` rejects anything
+     that is not a real commit object HERE (filtered garbage, a GC'd or
+     never-existed sha, a sha carried in from another repo).
+   - `git merge-base --is-ancestor <sha> HEAD` rejects a real-but-
+     ORPHANED commit. That is round 2's HIGH B2: §3e writes this marker
+     BEFORE 3e.5-pre's gate-freshness rebase, so on the §3g CI-fix
+     re-review path the recorded SHA can be a pre-rebase commit that no
+     longer sits on the branch, and `<orphan>..HEAD` would span the
+     whole upstream delta PLUS the rebase rewrite PLUS the fix — the
+     opposite of "what changed since the last review". Degrading is the
+     honest outcome: a rewritten history has no delta to point at.
+ Either rejection falls back to the empty string, which
+ reviewContinuationSection() renders as its commit-range-FREE wording —
+ the fails-SOFT contract every other marker step here already keeps.
+```
+
+## driveItem used to be ONE function that interleaved build → local gate
+<a id="driveitem-used-to-be-one-function-that-interleaved-build-loc"></a>
+
+```text
+ driveItem used to be ONE function that interleaved build → local gate → PR →
+ CI per item. The dual-build harness cannot: ADR 0038 fixes the PICK at the
+ LEVEL, so every in-scope item's build, local gate and pairwise judge must be
+ known BEFORE any PR opens for the level (the "level barrier"). That is a
+ phase split, not a flag — so the split is made STRUCTURAL here rather than
+ left as an `if (dualBuild)` branch threaded through 700 lines:
+
+   driveItemBuildPhase()  3a claim → 3b worktree → 3c worker → 3d verdict →
+                          3e review → 3e.5 gate → 3e.6 activation gate.
+                          Returns a TERMINAL record (parked/escalation), or
+                          null having filled `box.ctx` with everything the
+                          second phase needs. NOTHING here pushes, opens a
+                          PR, or merges — that property is what makes the
+                          barrier expressible at all.
+   driveItemPr()          3f push+PR → 3g CI → 3g.5 re-render → 3h park.
+
+ THE SINGLE-ARM PATH IS UNCHANGED BY CONSTRUCTION: driveItem() below calls
+ both phases back to back, in the same order, with nothing between them — so
+ the stage transcript, the agent-spawn sequence and the machinery step
+ ordering a flag-less run produces are byte-for-byte what they were before
+ the split (workflows/scripts/build/tests/test_workflow.sh pins the ORDERING
+ explicitly, not merely the return object).
+
+ WHY A `box` RATHER THAN A RETURNED CONTEXT. The build phase has ~25 early
+ `return escalate(...)` / `return park(...)` sites. Rewriting every one of
+ them into `{ result: … }` would be 25 chances to typo a control-flow edge
+ that only one specific failure fixture exercises. Instead the phase function
+ keeps EVERY existing return statement byte-identical (a terminal record, or
+ null on the fall-through) and hands its context out through the one
+ out-parameter — so the diff touches the fall-through alone.
+```

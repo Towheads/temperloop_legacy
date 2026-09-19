@@ -1004,3 +1004,237 @@ added by a branch not yet on main is invisible to that derivation.
  Command-building helpers — EVERY interpolated value goes through sq().
  -----------------------------------------------------------------------------
 ```
+
+## reviewWaitAgent — the wall-clock TICK this runtime does not otherwise
+<a id="reviewwaitagent-the-wall-clock-tick-this-runtime-does-not-ot"></a>
+
+```text
+ reviewWaitAgent — the wall-clock TICK this runtime does not otherwise have.
+ One machinery executor, one `review-wait.sh <secs>` call, one closed outcome.
+ Resolves to 'REVIEW_WAIT_ELAPSED' ONLY when the interval genuinely elapsed,
+ and to a `timer-*` string otherwise — which the caller reads as "no usable
+ timer" and fails open on.
+
+ TEMPERLOOP#2049 — WHY THE COMMAND IS A SCRIPT AND WHY THE RETURN IS CHECKED.
+ This was an inline `sleep <secs>; printf '<json>'` Bash command, and the
+ prompt told the executor to report the interval elapsed if the command never
+ printed. In the machinery executor's seat that command shape is REFUSED by a
+ harness permission control ("Blocked: sleep 300 followed by: printf …") in a
+ millisecond — so the executor took that sanctioned escape and reported an
+ elapse that had not happened. Measured in run wf_ebd4b5e0-3a8's own agent
+ transcripts: three slices asking 300s/540s/360s returned in 8s/9s/9s, so the
+ nominal 1200s ceiling realized in ~30s of wall clock, while the two reviewers
+ it was bounding completed normally at 177s and 257s. Nothing was slow — the
+ CEILING was ~40x fast, which is why three consecutive items reported
+ `ran: []` with every routed reviewer "timed out".
+
+ Two changes, and BOTH are load-bearing:
+   1. THE WAIT IS REAL. The command is now the named project helper
+      workflows/scripts/build/review-wait.sh, whose deadline loop runs inside
+      a script — the same shape ci-poll.sh already uses and which the same
+      machinery seat observably honours (that run's ci-batch executor held one
+      Bash call open for 280 real seconds).
+   2. THE RETURN IS NOT TAKEN ON TRUST. An elapse is honoured only when it
+      carries `realized_secs` — the script's OWN measurement, printed only
+      after the wait — and that value reaches the interval asked for. The
+      prompt no longer sanctions reporting an elapse the command did not
+      produce; a refused or errored command is REVIEW_WAIT_UNAVAILABLE, a
+      pure observation, and the caller fails open on it loudly. Without (2),
+      any future permission-control change silently re-breaks the ceiling in
+      exactly this way and nothing reports it (kernel principle 5 — counter a
+      known AI failure mode STRUCTURALLY, not with "be careful").
+ A tool timeout stays honoured as elapsed: its budget is secs+60s, so it can
+ only fire AFTER the interval. That is an observation too, and gets its own
+ outcome rather than being folded into a guess.
+
+ TEMPERLOOP#2064 — THE THIRD CHANGE: A BLOCK IS NOT A TIMEOUT. (2) above still
+ left one coin flip standing. A permission BLOCK and a Bash-tool TIMEOUT kill
+ are the same observation to the executor — no JSON line — and the tool-timeout
+ arm is PERMISSIVE. Asked to label a state it cannot see, the executor picked
+ the permissive one: measured in run wf_1b4c373b-8c1, slices asking
+ 300s/540s/360s returned in 11s/11s/17s, a 1200s ceiling realized in ~41s, and
+ a docs-reviewer that returned a full clean review at 98s was discarded — the
+ item then reported `skipped — docs-reviewer unavailable`, sending the next
+ investigator at the AGENT ROSTER rather than at the timer. So: REVIEW_WAIT_
+ BLOCKED is its own outcome, the refusal is classified from the harness's OWN
+ text before any label is read (REVIEW_WAIT_REFUSAL_RE), and the ceiling-breach
+ notice says `timed out after <actual>s` — reserving `unavailable` for the
+ kernel's capability-probe sense (CLAUDE.kernel.md § Subagent usage).
+
+ Deliberately NOT runMachinery(): that path batches its steps and wraps them
+ in the #1071 watchdog, whose own ceiling would then race this one. A timer
+ needs neither.
+```
+
+## THE FAILURE THIS BOUNDS. A `pr-batch` machinery agent ran 35,362,333ms
+<a id="the-failure-this-bounds-a-pr-batch-machinery-agent-ran-35-36"></a>
+
+```text
+ THE FAILURE THIS BOUNDS. A `pr-batch` machinery agent ran 35,362,333ms — 9h49m
+ — on TWO tool calls and 45k tokens. Not a retry loop, not a runaway: ONE Bash
+ invocation blocked and then completed successfully (all four steps green, the
+ PR opened). Every bound that should have made that unreachable failed: the
+ Bash tool's `timeout` parameter is capped at AGENT_BASH_CAP_MS and the prompt
+ above asks for less than that, so a 9.8h call is not supposed to exist — and
+ NOTHING ELSE bounded it. The root cause is NOT established (candidates exist;
+ none is acted on here without a disconfirming probe), so this is deliberately
+ a ROOT-CAUSE-AGNOSTIC seam: a bound that holds regardless of WHICH hypothesis
+ is true.
+
+ WHY IT LIVES IN THE EMITTED SHELL, NOT IN THIS FILE'S CONTROL FLOW. Two hard
+ runtime facts. (a) `Date.now()` THROWS in the Workflow runtime (see the
+ tunables header above), so this file cannot measure elapsed time at all — a
+ `Promise.race` deadline is not expressible here, there is no timer primitive
+ to race against. (b) The thing that failed to fire IS the harness's own
+ tool-timeout layer, so putting the new bound in that same layer would inherit
+ the failure. So the ceiling is compiled INTO the command text every machinery
+ step already runs through: a bash + `sleep` + `kill` watchdog, modelled on
+ `workflows/scripts/lib/portable-timeout.sh`'s dependency-free fallback tier
+ (its pipe-leak redirect included, verbatim in spirit — see stepBoundPreamble).
+ It is still a WORKFLOW-LEVEL bound: this file decides it, this file emits it,
+ this file branches on the STEP_TIMEOUT it produces, and it applies to every
+ machinery executor (`prelude` / `pr-batch` / `ci-batch` / solo `gate`) rather
+ than to any one script.
+
+ WHY NOT run_with_timeout(1) ITSELF. `portable-timeout.sh`'s preferred backends
+ are `timeout`/`gtimeout`, which `exec` a BINARY — they cannot run a shell
+ FUNCTION, and a batched step body is exactly that (a multi-command shell
+ snippet with `&&`, `;`, redirections and command substitutions). Re-wrapping
+ each body as `bash -c '<quoted script>'` to reach those backends would also
+ re-introduce the nested-quoting shape temperloop#72 found the auto-mode safety
+ classifier reads as an obfuscated command — the class of failure that denied
+ every push/worktree step on unattended runs. So the fallback tier is
+ reproduced inline, with its provenance named here.
+
+ The two settings are NAMED SETTINGS (BUILD_MACHINERY_STEP_CEILING_SECS /
+ BUILD_MACHINERY_STEP_SLOW_SECS), handed in by the orchestrator at Step 0 on
+ the SAME seam as gateSliceSecs above, and for the same structural reason. `||`
+ vs `??`: same empty-string safety documented at the model settings.
+```
+
+## reviewDiffCmd — ONE solo runMachinery call that reads the two raw inpu
+<a id="reviewdiffcmd-one-solo-runmachinery-call-that-reads-the-two-"></a>
+
+```text
+ reviewDiffCmd — ONE solo runMachinery call that reads the two raw inputs the
+ routing DECISION needs off the worktree: the changed-file list (relative to
+ the fresh origin/<default>, three-dot so only THIS branch's own commits
+ count) and the raw reviewer-routing.tsv text (empty string when the
+ worktree ships none — a consuming repo that has not vendored it). Mirrors
+ pr.sh's own `default_branch()` fallback chain (origin/HEAD, else
+ main/master) so this never depends on pr.sh being invoked first.
+
+ temperloop#1976: alongside `tsv` this also emits `tsv_rows` (count of
+ non-blank, non-`#` lines — the SAME first-stage filter parseTsvRows()
+ applies before its column check), computed HERE off the worktree's own
+ file, independently of whatever the machinery-executor relay hands back
+ for `tsv` itself. That independence is the whole point: the relay is a
+ separate agent copying this step's JSON line, and it has been observed
+ dropping the (large) `tsv` field entirely while leaving `files` intact
+ (evidence: wf_cbc556f5-7be). `tsv_rows` gives runReviewers() a cheap
+ row-count check that the `tsv` it received is the SAME one this command
+ actually read, without re-reading the file itself — a ROW-COUNT check
+ only: it catches a dropped or truncated table (a row-count mismatch), not
+ a same-length garble (content corrupted without changing the row count).
+
+ temperloop#1982: this also emits `tsv_checksum` — a content checksum, not
+ a row count. A prior attempt at a content check (`tsv_sha256`, temperloop
+ #1976 round 1) was reverted as dead code: it hashed the SOURCE file but
+ nothing could ever recompute a comparable hash from the RECEIVED `tsv`
+ string, because SHA-256 needs a matching implementation on the JS side and
+ none existed — "no hashing primitive" meant no SHA-256, not that no check
+ is possible. `tsvChecksum()` below closes that gap with a checksum needing
+ no primitive at all: a POSITION-WEIGHTED sum of character codes over the
+ SAME row-count-filtered lines (temperloop#1982 round 2 — see tsvChecksum's
+ own comment for why position-sensitivity, not just a sum, is the point),
+ expressible in pure arithmetic on both sides — this bash pipeline (byte
+ values via `od`, weighted and summed in awk) and tsvChecksum() (JS char
+ codes, weighted and summed in a loop) are independent implementations of
+ the identical algorithm, verified (by an automated test that executes
+ THIS bash pipeline for real — test_workflow.sh, "bash/JS parity") to agree
+ against this repo's own reviewer-routing.tsv (including its non-ASCII
+ comment-header punctuation, which is excluded from the sum by the same
+ comment/blank filter tsv_rows already applies). The two sides agree only
+ while every DATA row stays pure ASCII (byte value == UTF-16 code unit) —
+ see reviewer-routing.tsv's own header for that constraint, which governs
+ data rows only; the comment header's non-ASCII punctuation is filtered out
+ before either side sums, so it never touches this. A worktree that
+ genuinely ships no tsv
+ emits `tsv:""`, `tsv_rows:0`, `tsv_checksum:0` — never an omitted `tsv`
+ key — so "missing" stays a signal of the relay dropping the field, not of
+ a legitimate no-tsv worktree.
+
+ temperloop#1970: it ALSO reads — and, on a bumping call, increments — the
+ per-worktree §3e ROUND COUNTER the REVIEW_BLOCKING convergence bound reads.
+ `review_rounds` is the PRE-increment value: how many review rounds this
+ worktree had already run before this one. Three properties are load-bearing:
+   - it lives in the worktree's GIT DIR (`git rev-parse --git-dir`, which for a
+     linked worktree is that worktree's own `…/.git/worktrees/<name>`), NEVER
+     in the working tree — a stray untracked file there would surface in
+     `git status`, in the 3e.5 gate's `--scoped` untracked-path resolution, and
+     in the tracked-path coverage manifests. It is removed with the worktree.
+   - it rides THIS call, which §3e already makes — zero extra agent spawns, and
+     the counter survives the escalate → orchestrator → re-invoke loop it
+     bounds (a continuation skips 3b, so the worktree and its git dir persist).
+   - `bump` is false on the #1976 tsv-gap RE-FETCH, so one driver round bumps
+     the counter exactly once no matter how many times the command runs.
+ Every step fails SOFT (a missing/unwritable marker reads 0, and a
+ corrupted-but-present one degrades to 0 rather than aborting the step), so a
+ worktree whose git dir cannot be resolved simply behaves as it did before
+ this item.
+```
+
+## reviewDiffTsvGap — temperloop#1976 (row-count), extended by temperloop
+<a id="reviewdifftsvgap-temperloop-1976-row-count-extended-by-tempe"></a>
+
+```text
+ reviewDiffTsvGap — temperloop#1976 (row-count), extended by temperloop#1982
+ (content). The routing-table field (`tsv_lines` since temperloop#2020, the
+ legacy `tsv` scalar before it — reviewDiffTsvText normalizes both) is
+ hand-copied by the machinery-executor agent from the diff-fetch command's
+ own JSON line, a SEPARATE step from the one that computed
+ `tsv_rows`/`tsv_checksum` off the same worktree file — so any of the three
+ can disagree only if the relay dropped, truncated, or otherwise garbled the
+ (potentially large) table field on the way through.
+
+ Both detectors below are UNCHANGED by #2020 — that item moved only the
+ DISPOSITION after detection (runReviewers now degrades legibly rather than
+ escalating `review-diff-error` on a persistent gap), never how much is
+ detected.
+
+ PATH A (missing/truncated — temperloop#1976, evidence: wf_cbc556f5-7be):
+ neither table shape is present, or the received table's own non-comment row
+ count disagrees with the relayed `tsv_rows` — a row-count mismatch.
+
+ PATH B (content-preserving garble — temperloop#1982, evidence:
+ temperloop#1978 round 4): `tsv` IS a string, and its row count DOES match
+ `tsv_rows` (the guard above sees nothing wrong), yet its content differs
+ from what reviewDiffCmd actually read off the worktree — the relay
+ reproduced a plausible-LOOKING table (right length) that was not the real
+ one, and determineReviewers() silently routed off it (that run's diff
+ touched four `.sh` files with a `reviewer-routing.tsv` `.sh` row, yet only
+ docs-reviewer ran). A row-count check structurally cannot see this: the
+ row count survives the garble unchanged. Caught here by comparing
+ `tsv_checksum` (relayed off the source file, a short scalar exactly like
+ `tsv_rows`, and observed — same as `tsv_rows` — to survive the relay even
+ when `tsv` itself does not) against `tsvChecksum(diffOut.tsv)` (recomputed
+ HERE from the received string, no hashing primitive needed — see
+ tsvChecksum()'s own comment for why the prior sha256 attempt, temperloop
+ #1976 round 1, couldn't close this gap and this can).
+
+ Returns null when the table is trustworthy, else the payload naming what's
+ wrong, always carrying `files` (the changed-file list) so the degradation
+ notice names what would have been routed: `{ missing: 'tsv', files }` when
+ neither shape is present (the key stays `'tsv'` — it names the ROUTING
+ TABLE, not one wire field, and is a stable payload key across both
+ shapes); `{ mismatch: { expected, got }, files }` on a row-count
+ disagreement (`got` is `?? null` since `tsv_rows` can itself be absent, and
+ JSON.stringify silently drops an `undefined` key); `{ content_mismatch: {
+ expected, got }, files }` when the row count agrees but the checksum
+ doesn't (`got` is likewise `?? null` for an absent `tsv_checksum`). Only
+ checked when `files` is non-empty: an empty diff never needs a routing
+ table, so this never fires on the legitimate no-tsv-worktree case
+ (`tsv_lines: []`, `tsv_rows:0`, `tsv_checksum:0`) either, regardless of
+ `files` — a genuinely empty tsv is complete by construction (0 === 0 and
+ tsvChecksum('') === 0).
+```
