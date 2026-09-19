@@ -28,6 +28,11 @@
 #  10  the carve-out's FAILURE PATH: an errored open-PR read, and an
 #      unparseable one, both produce ZERO strips (unknown is never permissive).
 #  11  the held bucket carries its AGE on the report-only path too.
+#  12  a non-zero UNKNOWN count reaches the DURABLE pending-decisions surface
+#      even when nothing was cleared — the failing-open-PR-read case, whose
+#      danger is that it persists silently across runs.
+#  13  held and unknown stay SEPARATELY identifiable numbers in both surfaces
+#      (the emitted line and the entry) — never collapsed into one total.
 #
 # Zero network: reconcile.sh is SOURCED (its execute-guard suppresses the
 # auto-run) and its `_board_gh` / `_reconcile_session_mtime` / `_reconcile_now`
@@ -479,6 +484,79 @@ grep -q "In sync:" <<<"$OUT" \
 [ ! -s "$WRITES" ] || fail "case11: a dry run must issue ZERO writes\n$(cat "$WRITES")"
 OPEN_PRS_JSON='[]'
 echo "PASS: case 11 the open-PR held bucket carries its age on the report-only path"
+
+# =========================================================================
+# Case 12: the UNKNOWN bucket is a FAILURE path, and a failure path that only
+# ever reaches one night's stdout is invisible. With the open-PR read erroring
+# for every candidate, NOTHING is cleared — and an --unattended run must still
+# record the unknown COUNT to the durable pending-decisions surface, so a
+# persistently-inert sweep is visible to the next check-in ACROSS runs.
+# =========================================================================
+KS_ROOT12="$(mktemp -d "${TMPDIR:-/tmp}/reconcile-claims-ks12-XXXXXX")"
+TEST_TMP_DIRS+=("$KS_ROOT12")
+export KNOWLEDGE_STORE_ROOT="$KS_ROOT12"
+ALL_ISSUES_JSON='[
+  {"number":1938,"state":"OPEN","title":"Four days dead","labels":[{"name":"'"$IP_LABEL"'"},{"name":"'"$DEAD_STAMP"'"}]},
+  {"number":1910,"state":"OPEN","title":"Also four days dead","labels":[{"name":"'"$IP_LABEL"'"},{"name":"'"$DEAD_STAMP"'"}]}
+]'
+SESSION_MTIMES="$DEAD_SESS=$FOUR_DAYS_AGO"
+PR_LIST_FAIL=1
+CLAIMS_APPLY=0
+CLAIMS_UNATTENDED=1
+run_claims
+
+grep -q "^applied:" <<<"$OUT" \
+  && fail "case12: nothing may be applied when every candidate's PR state is unknown\n$OUT"
+grep -qF "not stripped by design: 0 held by an open PR, 2 with an unestablished PR state." <<<"$OUT" \
+  || fail "case12: the zero-strip path must still emit the two bucket counts\n$OUT"
+DOC12="$KS_ROOT12/Context/pipeline - pending decisions.md"
+[ -f "$DOC12" ] \
+  || fail "case12: a non-zero unknown count must record a pending-decision entry even with 0 cleared\n$(find "$KS_ROOT12" -type f)"
+grep -qF "2 with an UNESTABLISHED open-PR state" "$DOC12" \
+  || fail "case12: the entry must carry the unknown COUNT, not just the fact\n$(cat "$DOC12")"
+grep -qF "cleared 0 dead-session claim stamp(s)" "$DOC12" \
+  || fail "case12: the entry must still report what it cleared (zero)\n$(cat "$DOC12")"
+grep -q "held by an open PR" "$DOC12" \
+  && fail "case12: a zero held count must not be named — it would read as a refusal that never happened\n$(cat "$DOC12")"
+[ ! -s "$WRITES" ] || fail "case12: an unreadable PR state must issue ZERO writes\n$(cat "$WRITES")"
+PR_LIST_FAIL=0
+unset KNOWLEDGE_STORE_ROOT
+echo "PASS: case 12 a non-zero unknown count reaches the durable surface even with nothing cleared"
+
+# =========================================================================
+# Case 13: held and unknown are two DIFFERENT conditions — a designed refusal
+# vs an unresolved read failure — so they must stay separately identifiable
+# numbers in BOTH surfaces. A single collapsed total is exactly what would let
+# a rising read-failure count hide inside a benign-looking one.
+# =========================================================================
+KS_ROOT13="$(mktemp -d "${TMPDIR:-/tmp}/reconcile-claims-ks13-XXXXXX")"
+TEST_TMP_DIRS+=("$KS_ROOT13")
+export KNOWLEDGE_STORE_ROOT="$KS_ROOT13"
+ALL_ISSUES_JSON='[
+  {"number":2154,"state":"OPEN","title":"Parked [m] awaiting the merge gate","labels":[{"name":"'"$IP_LABEL"'"},{"name":"'"$DEAD_STAMP"'"}]},
+  {"number":1938,"state":"OPEN","title":"Epic with 4 open members","labels":[{"name":"'"$IP_LABEL"'"},{"name":"'"$DEAD_STAMP"'"}]}
+]'
+OPEN_PRS_JSON='[{"number":3001,"closingIssuesReferences":[{"number":2154}]}]'
+SESSION_MTIMES="$DEAD_SESS=$FOUR_DAYS_AGO"
+CLAIMS_APPLY=0
+CLAIMS_UNATTENDED=1
+run_claims
+
+grep -qF "applied: cleared 1 dead-session claim stamp(s)" <<<"$OUT" \
+  || fail "case13: the no-PR candidate must still strip\n$OUT"
+grep -qF "not stripped by design: 1 held by an open PR, 0 with an unestablished PR state." <<<"$OUT" \
+  || fail "case13: the emitted line must keep held and unknown as separate numbers\n$OUT"
+DOC13="$KS_ROOT13/Context/pipeline - pending decisions.md"
+[ -f "$DOC13" ] || fail "case13: expected a pending-decision entry\n$(find "$KS_ROOT13" -type f)"
+grep -qF "cleared 1 dead-session claim stamp(s)" "$DOC13" \
+  || fail "case13: the entry must carry the cleared count\n$(cat "$DOC13")"
+grep -qF "1 held by an open PR" "$DOC13" \
+  || fail "case13: the entry must carry the held count as its own number\n$(cat "$DOC13")"
+grep -q "UNESTABLISHED open-PR state" "$DOC13" \
+  && fail "case13: a zero unknown count must not be named\n$(cat "$DOC13")"
+OPEN_PRS_JSON='[]'
+unset KNOWLEDGE_STORE_ROOT
+echo "PASS: case 13 held and unknown stay separate numbers in the emitted line and the durable entry"
 
 echo
 echo "ALL reconcile --claims (Lens 4) tests passed."

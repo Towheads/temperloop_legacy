@@ -1620,9 +1620,21 @@ label_reconcile_main() {
 # missing/unavailable knowledge store degrades to a stderr notice and NEVER
 # fails the sweep. The store plumbing lives exactly once, in
 # _reconcile_pending_decisions_doc.
-#   _claims_reconcile_append_pending_decision <board#> <repo> <cleared>
+# The held/unknown counts ride the entry alongside the cleared count, as THREE
+# separately-identifiable numbers (temperloop#2069 round 3). `held` is a correct,
+# designed refusal (the K#275 held claim, which clears itself on the merge
+# cascade); `unknown` is an unresolved READ FAILURE. Collapsing them into one
+# total is what would let a rising failure count hide inside a benign-looking
+# number: if the open-PR read starts failing for this host, every candidate
+# lands in `unknown` every night and the lens degrades to permanently inert
+# behind a green exit code. A one-night stdout line is not a surface for a
+# condition whose whole danger is that it PERSISTS, which is why the counts
+# reach this durable cross-run surface too — and why a non-zero `unknown`
+# records an entry even when nothing was cleared.
+#   _claims_reconcile_append_pending_decision <board#> <repo> <cleared> [<held>] [<unknown>]
 _claims_reconcile_append_pending_decision() {
-  local board="$1" repo="$2" cleared="$3" doc ts host
+  local board="$1" repo="$2" cleared="$3" held="${4:-0}" unknown="${5:-0}"
+  local doc ts host taken_extra=""
 
   _reconcile_pending_decisions_doc "dead-session claim stamps" || return 0
   doc="$_RECONCILE_PENDING_DOC"
@@ -1635,11 +1647,17 @@ _claims_reconcile_append_pending_decision() {
   # carry build.config.sh.
   ts="$(TZ="${DISPLAY_TZ:-America/Los_Angeles}" date '+%Y-%m-%d %H:%M %Z')"
   host="$(board_host_label)"
+  # Name each carve-out bucket only when it actually held something back, so a
+  # sweep with nothing held and nothing unknown keeps its prior wording verbatim
+  # (the same convention _label_reconcile_append_pending_decision uses). The two
+  # clauses are always SEPARATE numbers — never summed.
+  [ "${held:-0}" -gt 0 ] && taken_extra+="$(printf '; %s held by an open PR (not stripped by design — the claim is held until Done)' "$held")"
+  [ "${unknown:-0}" -gt 0 ] && taken_extra+="$(printf '; %s with an UNESTABLISHED open-PR state (not stripped — this is a READ FAILURE, not a refusal: if it persists across runs the sweep is degrading to inert)' "$unknown")"
   if {
     printf '### %s · dead-session claim-stamp sweep · %s:board%s\n' "$ts" "$host" "$board"
     # shellcheck disable=SC2016  # backticks below are literal markdown spans, not expansion
     printf -- '- **Decision:** clear the `fnd:host/session:*` stamp from In-Progress items claimed by a provably-dead session on this host, leaving `fnd:status:*` untouched, on board %s (%s)\n' "$board" "$repo"
-    printf -- '- **Default taken:** applied — cleared %s dead-session claim stamp(s); no status label changed, no item closed or moved to Ready\n' "$cleared"
+    printf -- '- **Default taken:** applied — cleared %s dead-session claim stamp(s)%s; no status label changed, no item closed or moved to Ready\n' "$cleared" "$taken_extra"
     printf -- '- **Disposition:** auto-taken (unattended; no live operator)\n'
     printf -- '- **Status:** open\n'
   } | ks_append "$doc" 2>/dev/null; then
@@ -1710,6 +1728,7 @@ claims_reconcile_main() {
   local now candidates="" foreign="" strip_rows="" fresh_rows=""
   local dead_rows="" held="" unknown="" prs
   local num stamp title shost ssess mt age_secs age n l cleared=0
+  local held_n=0 unknown_n=0
 
   board_resolve "$PROJECT_NUMBER"
   repo="$(board_repo "$PROJECT_NUMBER")" || {
@@ -1790,6 +1809,14 @@ claims_reconcile_main() {
     done <<<"$dead_rows"
   fi
 
+  # Counted ONCE, here, and reused by every surface below — the emitted summary
+  # line and the durable pending-decision entry alike — so the two can never
+  # disagree about how many were held back or why (temperloop#2069 round 3).
+  # They stay two numbers, never one sum: `held` is a designed refusal that
+  # clears itself on the merge cascade, `unknown` is an unresolved read failure.
+  held_n="$(printf '%s' "$held" | grep -c '^  #' || true)"
+  unknown_n="$(printf '%s' "$unknown" | grep -c '^  #' || true)"
+
   echo "Dead-session claim stamps — board $PROJECT_NUMBER ($repo)"
   echo
 
@@ -1816,8 +1843,19 @@ claims_reconcile_main() {
   if [ -z "$candidates" ]; then
     if [ -n "$held" ] || [ -n "$unknown" ]; then
       echo "Nothing to strip: every dead-session claim stamp on this host is held by an open PR, or its PR state could not be established."
+      # The same count line the apply path prints, so a fold of this lens's
+      # verdict line carries the two buckets on the zero-strip path too — which
+      # is exactly the path a failing open-PR read pins the sweep to.
+      echo "not stripped by design: $held_n held by an open PR, $unknown_n with an unestablished PR state."
     else
       echo "In sync: no In-Progress item on this host carries a claim stamp from a dead session (nothing to strip)."
+    fi
+    # An all-held board is a benign steady state; a non-zero UNKNOWN count is a
+    # read failure that must reach the durable cross-run surface even though
+    # nothing was cleared — otherwise a permanently-inert sweep is visible only
+    # in one night's stdout.
+    if [ "$CLAIMS_UNATTENDED" = 1 ] && [ "$unknown_n" -gt 0 ]; then
+      _claims_reconcile_append_pending_decision "$PROJECT_NUMBER" "$repo" 0 "$held_n" "$unknown_n"
     fi
     return 0
   fi
@@ -1861,11 +1899,11 @@ claims_reconcile_main() {
   # The carve-out counts ride the apply summary too, so a Step-6 fold of this
   # one line still shows that something was deliberately left alone.
   if [ -n "$held" ] || [ -n "$unknown" ]; then
-    echo "not stripped by design: $(printf '%s' "$held" | grep -c '^  #' || true) held by an open PR, $(printf '%s' "$unknown" | grep -c '^  #' || true) with an unestablished PR state."
+    echo "not stripped by design: $held_n held by an open PR, $unknown_n with an unestablished PR state."
   fi
 
-  if [ "$CLAIMS_UNATTENDED" = 1 ] && [ "$cleared" -gt 0 ]; then
-    _claims_reconcile_append_pending_decision "$PROJECT_NUMBER" "$repo" "$cleared"
+  if [ "$CLAIMS_UNATTENDED" = 1 ] && { [ "$cleared" -gt 0 ] || [ "$unknown_n" -gt 0 ]; }; then
+    _claims_reconcile_append_pending_decision "$PROJECT_NUMBER" "$repo" "$cleared" "$held_n" "$unknown_n"
   fi
   return 0
 }

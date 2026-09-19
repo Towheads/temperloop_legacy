@@ -19,4 +19,10 @@
   held until the merge cascade clears it, so clearing the stamp early would let
   a later claim silently overwrite the owner. If the open-PR read errors, or
   its result cannot be established, every candidate is reported and nothing is
-  stripped. `claude/commands/tidy.md` runs the sweep on its nightly pass.
+  stripped — and an `--unattended` run records how many candidates that
+  covered to the pending-decisions note, as its own number, separate from the
+  count it held back for an open PR, even when it cleared nothing. A failing
+  open-PR read is therefore visible at the next check-in as a count that keeps
+  recurring, instead of only in one night's output while the sweep quietly
+  stops clearing anything. `claude/commands/tidy.md` runs the sweep on its
+  nightly pass.
