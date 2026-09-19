@@ -308,17 +308,27 @@ seed_config "$REPO4" '[
   {"type":"required_check","repo":"acme/widget","branch":"main","name":"checks"},
   {"type":"board","owner":"acme","project_number":42,"url":"https://github.com/orgs/acme/projects/42"}
 ]'
+# Both report.d/ producer shims (tokens + dual-build, temperloop#2084) carry
+# NO manifest entry of their own — `temperloop init` places them as tree
+# artifacts, and this is the removal side of that: `eject` reverts them by
+# deleting the whole `.temperloop/` tree, never a per-shim installs[] entry.
+mkdir -p "$REPO4/.temperloop/report.d"
+printf '#!/usr/bin/env bash\necho tokens\n' > "$REPO4/.temperloop/report.d/tokens"
+printf '#!/usr/bin/env bash\necho dual-build\n' > "$REPO4/.temperloop/report.d/dual-build"
+chmod 755 "$REPO4/.temperloop/report.d/tokens" "$REPO4/.temperloop/report.d/dual-build"
 run 0 --dir "$REPO4" --yes
 [ "$(call_count 'label delete fnd:status:backlog')" -ge 1 ] || fail "label delete call missing"
 [ "$(call_count 'required_status_checks')" -ge 1 ] || fail "required-check revert call missing"
 [ "$(call_count 'project delete 42')" -ge 1 ] || fail "board delete call missing"
+[ ! -e "$REPO4/.temperloop/report.d/tokens" ] || fail "eject left the tokens producer shim behind"
+[ ! -e "$REPO4/.temperloop/report.d/dual-build" ] || fail "eject left the dual-build producer shim behind"
 [ ! -e "$REPO4/.temperloop" ] || fail "full revert did not remove .temperloop/"
 grep -q "temperloop eject: done" <<<"$out" || fail "full revert did not report done (got: $out)"
 
 run 0 --dir "$REPO4" --yes
 [ ! -s "$CALL_LOG" ] || fail "second run made gh calls (should be zero — idempotent):\n$(cat "$CALL_LOG")"
 grep -q "no-op" <<<"$out" || fail "second run did not report no-op (got: $out)"
-echo "PASS: consented full revert fires the exact gh calls per install type, removes .temperloop/; re-run is a zero-call no-op"
+echo "PASS: consented full revert fires the exact gh calls per install type, removes .temperloop/ (including both report.d/ producer shims); re-run is a zero-call no-op"
 
 # =============================================================================
 # 5. proposal_pr MERGED: left alone (no close/delete-branch call), still

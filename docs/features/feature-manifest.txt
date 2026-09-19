@@ -761,6 +761,24 @@ model-comparison workflows/scripts/tests/test_model_usage_emit.sh
 model-comparison workflows/scripts/tests/test_validate_provider_disclosure.sh
 model-comparison workflows/scripts/config/default-pricing.json
 model-comparison workflows/scripts/report-producers/model-comparison
+# dual-build (temperloop#2084, epic #2065 "new-work dual-build harness")
+# lives at workflows/scripts/report-producers/, same reasoning as
+# report-producers/model-comparison one line up — a single file outside the
+# workflows/scripts/model-comparison/** subtree, needing its own exact-path
+# claim. Its locator shim, UNLIKE model-comparison's own (ADR 0027, no shim
+# shipped), is wired by `temperloop init` and lives at
+# .temperloop/report.d/dual-build — same reasoning as the `telemetry`
+# section's own .temperloop/report.d/tokens claim below, so it needs the
+# same kind of exact-path claim here too (no .temperloop/* directory-level
+# glob exists in this manifest for report.d/* to inherit from).
+model-comparison workflows/scripts/report-producers/dual-build
+# Its fixture suite lives at workflows/scripts/report-producers/tests/ (a
+# new subdirectory — neither tokens nor model-comparison has a producer
+# test file at this exact location), so it needs its own exact-path claim
+# too; a future SECOND file under report-producers/tests/ would want this
+# widened to a directory-level glob instead of a second exact-path line.
+model-comparison workflows/scripts/report-producers/tests/test_dual_build_report.sh
+model-comparison .temperloop/report.d/dual-build
 # cannot-evaluate.sh (temperloop#1475) lives at workflows/scripts/lib/ (a
 # shared "cannot evaluate" idiom, sourced by batch.sh/judge.sh/score.sh/
 # replay.sh under workflows/scripts/model-comparison/) rather than under

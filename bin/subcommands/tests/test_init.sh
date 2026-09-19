@@ -95,6 +95,9 @@ INIT="$HERE/../init.sh"
 # copies verbatim (bin/subcommands/init.sh § "TOKENS PRODUCER SHIM").
 KERNEL_SRC="$(cd "$HERE/../../.." && pwd)"
 SHIM_SRC="$KERNEL_SRC/.temperloop/report.d/tokens"
+# The dual-build shim's own canonical source (temperloop#2084) — same
+# treatment as SHIM_SRC above.
+DUAL_BUILD_SHIM_SRC="$KERNEL_SRC/.temperloop/report.d/dual-build"
 
 fail() { printf 'FAIL: %b\n' "$1" >&2; exit 1; }
 
@@ -775,6 +778,42 @@ grep -qF "skipped -- tokens: producer unavailable" <<<"$producer_out" \
 echo "PASS: init proposes the tokens producer shim verbatim at mode 755, executable, contract-honoring in a kernel-less repo, with no new installs[] entry type"
 
 # =============================================================================
+# 14b. THE SAME RUN ALSO PLACES THE DUAL-BUILD PRODUCER SHIM (temperloop
+#      #2084, epic #2065 "new-work dual-build harness"). Same run as test 14
+#      above, same manifest, same byte-exact-copy/mode-755/soft-seam/no-new-
+#      installs-entry properties — asserted here for the SECOND shim init
+#      wires unconditionally (unlike model-comparison's own inert shim,
+#      ADR 0027 — see bin/subcommands/init.sh's "DUAL-BUILD PRODUCER SHIM"
+#      header note for why that is still zero standing cost).
+# =============================================================================
+grep -qF "report.d producer: proposing .temperloop/report.d/dual-build (mode 755)" <<<"$out" \
+  || fail "the same run did not report proposing the dual-build producer (got: $out)"
+
+DBP14="$REPO14/.temperloop/report.d/dual-build"
+[ -f "$DBP14" ] || fail "init did not place .temperloop/report.d/dual-build into the target repo"
+git -C "$REPO14" show "HEAD:.temperloop/report.d/dual-build" > "$WORK/dblanded14" 2>/dev/null \
+  || fail "the dual-build producer was not committed by the proposal (not in HEAD)"
+cmp -s "$WORK/dblanded14" "$DUAL_BUILD_SHIM_SRC" \
+  || fail "the landed dual-build producer is not a byte-exact copy of the kernel shim at $DUAL_BUILD_SHIM_SRC"
+
+dbmode14="$(git -C "$REPO14" ls-tree HEAD .temperloop/report.d/dual-build | awk '{print $1}')"
+[ "$dbmode14" = "100755" ] \
+  || fail "the landed dual-build producer is not committed executable (git mode $dbmode14, want 100755)"
+[ -x "$DBP14" ] || fail "the landed dual-build producer is not executable on disk"
+
+dbprc=0
+dbproducer_out="$(cd "$REPO14" && env -u TEMPERLOOP_HOME PATH=/usr/bin:/bin \
+  ./.temperloop/report.d/dual-build 2>&1)" || dbprc=$?
+[ "$dbprc" -eq 0 ] \
+  || fail "the placed dual-build producer exited $dbprc in a kernel-less repo — output: $dbproducer_out"
+grep -qF "skipped -- dual-build: producer unavailable" <<<"$dbproducer_out" \
+  || fail "the placed dual-build producer did not emit the contract's skip line in a kernel-less repo (got: $dbproducer_out)"
+
+[ "$(jq '[.installs[] | select(.type != "proposal_pr")] | length' "$REPO14/.temperloop/config")" -eq 0 ] \
+  || fail "placing the dual-build producer minted a non-proposal_pr installs[] entry (got: $(jq -c '.installs' "$REPO14/.temperloop/config"))"
+echo "PASS: the same run also proposes the dual-build producer shim verbatim at mode 755, executable, contract-honoring in a kernel-less repo, with no new installs[] entry type"
+
+# =============================================================================
 # 15. AN EXISTING PRODUCER IS NEVER OVERWRITTEN (temperloop#984). A producer
 #     already at that path belongs to the ADOPTER — hand-written, or edited
 #     after an earlier `init`. Silently clobbering it would destroy work
@@ -798,8 +837,19 @@ echo '{"tokens_spent": 4242}'
 ADOPTER_PRODUCER_EOF
 chmod 755 "$REPO15/.temperloop/report.d/tokens"
 cp "$REPO15/.temperloop/report.d/tokens" "$WORK/producer15.before"
+# Seed an adopter-owned dual-build producer too (temperloop#2084) — the
+# SAME rule 1 the tokens shim just above exercises applies to BOTH shims
+# independently, and without this second seed the bare "proposing" absence
+# assertion below would trip on dual-build's own (unrelated) fresh proposal.
+cat > "$REPO15/.temperloop/report.d/dual-build" <<'ADOPTER_DUAL_BUILD_PRODUCER_EOF'
+#!/usr/bin/env bash
+# An adopter's OWN dual-build producer. `temperloop init` must never touch this.
+echo '{"producer": "dual-build", "tiers": []}'
+ADOPTER_DUAL_BUILD_PRODUCER_EOF
+chmod 755 "$REPO15/.temperloop/report.d/dual-build"
+cp "$REPO15/.temperloop/report.d/dual-build" "$WORK/dbproducer15.before"
 git -C "$REPO15" add -A
-git -C "$REPO15" commit -q -m "seed an adopter-owned tokens producer"
+git -C "$REPO15" commit -q -m "seed adopter-owned tokens + dual-build producers"
 # No `2>/dev/null` here: this push is load-bearing for the test's validity
 # (see the comment above), and under `set -euo pipefail` a swallowed failure
 # would abort the whole suite with no diagnostic at all.
@@ -819,7 +869,17 @@ git -C "$REPO15" show --name-only --format= HEAD | grep -F ".temperloop/report.d
   && fail "the proposal commit touched the pre-existing tokens producer (it must not appear in the diff at all)"
 mode15="$(git -C "$REPO15" ls-tree HEAD .temperloop/report.d/tokens | awk '{print $1}')"
 [ "$mode15" = "100755" ] || fail "the pre-existing producer's mode changed (git mode $mode15, want 100755)"
+
+grep -qF "report.d producer: .temperloop/report.d/dual-build already on main — leaving it untouched" <<<"$out" \
+  || fail "init did not report skipping the pre-existing dual-build producer (got: $out)"
+cmp -s "$WORK/dbproducer15.before" "$REPO15/.temperloop/report.d/dual-build" \
+  || fail "init OVERWROTE a pre-existing dual-build producer — it must be byte-identical after the run"
+git -C "$REPO15" show --name-only --format= HEAD | grep -F ".temperloop/report.d/dual-build" >/dev/null \
+  && fail "the proposal commit touched the pre-existing dual-build producer (it must not appear in the diff at all)"
+dbmode15="$(git -C "$REPO15" ls-tree HEAD .temperloop/report.d/dual-build | awk '{print $1}')"
+[ "$dbmode15" = "100755" ] || fail "the pre-existing dual-build producer's mode changed (git mode $dbmode15, want 100755)"
 echo "PASS: a pre-existing tokens producer is byte-identical after init, absent from the proposal commit, and its mode is unchanged"
+echo "PASS: a pre-existing dual-build producer gets the identical rule-1 treatment (byte-identical, absent from the commit, mode unchanged)"
 
 # =============================================================================
 # 16. THE IDEMPOTENT RE-RUN KEEPS WHAT RUN 1 PROPOSED (the blocking defect).
@@ -899,10 +959,17 @@ printf '%s\n' '#!/usr/bin/env bash' 'echo ADOPTER-OWNED-PRODUCER' \
   > "$OTHER17/.temperloop/report.d/tokens"
 chmod 755 "$OTHER17/.temperloop/report.d/tokens"
 cp "$OTHER17/.temperloop/report.d/tokens" "$WORK/producer17.onbase"
+# Same second seed as test 15 (temperloop#2084) — without it, dual-build's
+# OWN unrelated fresh-proposal line would trip the bare "proposing" absence
+# assertion below.
+printf '%s\n' '#!/usr/bin/env bash' 'echo ADOPTER-OWNED-DUAL-BUILD-PRODUCER' \
+  > "$OTHER17/.temperloop/report.d/dual-build"
+chmod 755 "$OTHER17/.temperloop/report.d/dual-build"
+cp "$OTHER17/.temperloop/report.d/dual-build" "$WORK/dbproducer17.onbase"
 git -C "$OTHER17" add -A
-git -C "$OTHER17" commit -q -m "adopter commits their own tokens producer"
+git -C "$OTHER17" commit -q -m "adopter commits their own tokens + dual-build producers"
 git -C "$OTHER17" push -q origin main \
-  || fail "could not push the adopter's producer from the second clone"
+  || fail "could not push the adopter's producers from the second clone"
 
 # REPO17's working tree has never seen it — a stale clone, exactly the shape
 # the reviewer reproduced. (The fetch only moves the remote-tracking ref;
@@ -922,7 +989,17 @@ git -C "$REPO17" show "HEAD:.temperloop/report.d/tokens" > "$WORK/producer17.aft
   || fail "the adopter's producer vanished from the proposal branch"
 cmp -s "$WORK/producer17.onbase" "$WORK/producer17.after" \
   || fail "init OVERWROTE an adopter's producer that existed on the base branch but not in the local checkout"
+
+grep -qF "report.d producer: .temperloop/report.d/dual-build already on main — leaving it untouched" <<<"$out" \
+  || fail "init did not detect the base-branch dual-build producer (got: $out)"
+git -C "$REPO17" show --name-only --format= HEAD | grep -F ".temperloop/report.d/dual-build" >/dev/null \
+  && fail "the proposal commit touched the adopter's base-branch dual-build producer"
+git -C "$REPO17" show "HEAD:.temperloop/report.d/dual-build" > "$WORK/dbproducer17.after" 2>/dev/null \
+  || fail "the adopter's dual-build producer vanished from the proposal branch"
+cmp -s "$WORK/dbproducer17.onbase" "$WORK/dbproducer17.after" \
+  || fail "init OVERWROTE an adopter's dual-build producer that existed on the base branch but not in the local checkout"
 echo "PASS: a producer present on the base branch but absent locally is left byte-identical — the stale-clone overwrite direction is closed"
+echo "PASS: the dual-build producer gets the identical base/working-tree-divergence treatment"
 
 # =============================================================================
 # 18. THE SOFT-SEAM ARM: an unusable shim degrades legibly and, above all,

@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+#
+# .temperloop/report.d/dual-build — the `dual-build` drop-in producer's
+# LOCATOR SHIM for `temperloop report` (temperloop#2084, epic #2065
+# "new-work dual-build harness"). Same shape as the sibling `tokens` shim
+# (temperloop#958/#980) — see that file's own header for the fuller
+# rationale this one deliberately restates rather than points at, since a
+# shim in this directory is meant to be read standalone by whoever finds it
+# in an adopter's tree.
+#
+# THIS FILE IS LOCATOR + EXEC ONLY. The real implementation — reading the
+# dual-build ledger, the win-rate/level-pick/cost/calibration math, the JSON
+# shaping — lives kernel-side at workflows/scripts/report-producers/
+# dual-build (see that file's own header for the full contract). Do NOT add
+# ledger-reading or jq shaping here: this file's whole reason to exist is
+# that a producer copied into an adopter's tree is frozen (`temperloop
+# update` never touches .temperloop/report.d/dual-build) and invisible to
+# check-producer-egress.sh's per-repo scan — moving the logic kernel-side
+# fixes both, but only if this file stays a thin shim.
+#
+# UNLIKE model-comparison (ADR 0027, deliberately inert/no shim shipped),
+# this shim IS wired by `temperloop init` — see workflows/scripts/
+# report-producers/dual-build's own header for why that is still a
+# no-standing-cost choice (a repo that never ran `/build --dual-build`
+# carries an empty ledger, and the real producer degrades to one `skipped
+# -- ` line for that repo).
+#
+# CONTRACT (workflows/scripts/lib/report.contract.md § Overlay drop-in
+# contract): invoked with no arguments; must exit 0; stdout is either the
+# real producer's output (a JSON object) or the skip line below — never
+# anything else.
+#
+# RESOLUTION ORDER — identical to .temperloop/report.d/tokens (read that
+# file's header for the full rationale; restated here only as the ordered
+# list, not re-argued):
+#   1. $TEMPERLOOP_HOME/<producer>, if set and it actually carries the
+#      producer.
+#   2. $(dirname "$0")/../../<producer> — SELF-CHECKOUT.
+#   3. `command -v temperloop`, symlink-resolved to its real checkout root.
+#   4. Nothing resolves to a real kernel checkout -> skip.
+#
+# EGRESS: none — local file checks plus one exec. Scanned by
+# check-producer-egress.sh's --overlay-report-d glob.
+
+set -uo pipefail
+
+skip() { echo "skipped -- dual-build: producer unavailable"; exit 0; }
+
+producer_rel="workflows/scripts/report-producers/dual-build"
+kernel_root=""
+
+# 1. $TEMPERLOOP_HOME, if set and non-empty, and it actually carries the
+# producer (a stale/partial install shouldn't be trusted over the fallbacks
+# below).
+if [ -n "${TEMPERLOOP_HOME:-}" ] && [ -f "$TEMPERLOOP_HOME/$producer_rel" ]; then
+  kernel_root="$TEMPERLOOP_HOME"
+fi
+
+# 2. SELF-CHECKOUT: this shim lives at <checkout-root>/.temperloop/report.d/
+# dual-build, so <checkout-root> is two levels up from its own location.
+# Checked only when it actually resolves to a real file — fails closed in a
+# real adopter repo (no workflows/ tree at that relative position) and
+# falls through to step 3, exactly like step 1's own existence check above.
+if [ -z "$kernel_root" ]; then
+  self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || self_dir=""
+  if [ -n "$self_dir" ]; then
+    self_root="$(cd "$self_dir/../.." 2>/dev/null && pwd)" || self_root=""
+    if [ -n "$self_root" ] && [ -f "$self_root/$producer_rel" ]; then
+      kernel_root="$self_root"
+    fi
+  fi
+fi
+
+# 3. `command -v temperloop`, walked through its own symlink chain to the
+# real checkout root — same portable loop (no GNU readlink -f) bin/temperloop
+# uses to find ITS OWN sibling subcommands/lib dirs.
+if [ -z "$kernel_root" ]; then
+  cli_path="$(command -v temperloop 2>/dev/null)" || cli_path=""
+  if [ -n "$cli_path" ]; then
+    _src="$cli_path"
+    while [ -L "$_src" ]; do
+      _dir="$(cd -P "$(dirname "$_src")" 2>/dev/null && pwd)" || { _src=""; break; }
+      _target="$(readlink "$_src")"
+      case "$_target" in
+        /*) _src="$_target" ;;
+        *) _src="$_dir/$_target" ;;
+      esac
+    done
+    if [ -n "$_src" ] && [ -f "$_src" ]; then
+      _bin_dir="$(cd -P "$(dirname "$_src")" 2>/dev/null && pwd)" || _bin_dir=""
+      # bin/temperloop lives at <checkout-root>/bin/temperloop.
+      if [ -n "$_bin_dir" ]; then
+        _checkout_root="$(cd -P "$_bin_dir/.." 2>/dev/null && pwd)" || _checkout_root=""
+        if [ -n "$_checkout_root" ] && [ -f "$_checkout_root/$producer_rel" ]; then
+          kernel_root="$_checkout_root"
+        fi
+      fi
+    fi
+  fi
+fi
+
+# 4. Nothing resolved a real checkout carrying the producer -> skip.
+[ -n "$kernel_root" ] || skip
+[ -x "$kernel_root/$producer_rel" ] || skip
+
+# execfail: a bad interpreter or a noexec install root can make `exec` ITSELF
+# fail even though the executable bit is set (realistic trigger: `report`
+# racing `temperloop update` mid-checkout). Without this shell option, a
+# failed exec normally terminates the shell outright — never reaching the
+# `|| skip` below — leaking exec's own stderr and exiting 126, both things
+# this file's own CONTRACT paragraph above promises never happen.
+shopt -s execfail
+# Args passthrough ("$@"): the drop-in contract is "invoked with no
+# arguments" today, so this is zero-cost now, but it closes off having to
+# re-edit this exact file — the one that gets frozen, unedited, in every
+# adopter repo that runs `temperloop init` — if that contract ever grows a
+# flag.
+exec "$kernel_root/$producer_rel" "$@" || skip

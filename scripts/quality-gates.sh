@@ -824,6 +824,29 @@ KERNEL_GATES=(
   # Synthetic fixtures in a tmpdir; a claude/gh/curl/wget canary on PATH is
   # asserted never invoked. Same direct-`bash` form as the sibling gates.
   "bash workflows/scripts/model-comparison/tests/test_comparison_report.sh"
+  # Dual-build cumulative report producer (temperloop#2084, epic #2065
+  # "new-work dual-build harness"): workflows/scripts/report-producers/
+  # dual-build, the report.d drop-in that rolls the dual-build ledger's
+  # per-item, per-arm rows into a per-tier win rate + level-pick tally +
+  # cost + calibration status block. Sibling of the tokens/model-comparison
+  # producers above, gated here beside them for the same reason — same
+  # exit-0 drop-in contract, registered because a suite this file does not
+  # name NEVER RUNS IN CI (activation gate: `--list | grep -q
+  # test_dual_build_report`). Fixtures build real ledgers through
+  # dual-build-ledger.sh's own append/calibrate-record commands, never
+  # hand-shaped rows.jsonl. Each load-bearing gate proved by mutation: the
+  # sample-floor withhold ("below floor - keep accumulating"), the
+  # calibration withhold ("judge uncalibrated - verdict withheld") both from
+  # an uncalibrated judge AND from an unresolved rate over
+  # DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT, and the level-pick tally's
+  # override-inclusive divergence from the (override-blind) win rate — each
+  # verified red when its own gating branch is disabled and green once
+  # restored. Also pins the 7/10 fixture's exact-binom interval bounds and
+  # per-arm cost totals, the honesty block's unresolved breakdown by reason
+  # (tied/infra/incomplete/unjudged), and that splits.task_type/splits.seat
+  # report {available:false,...} rather than a fabricated number. Synthetic
+  # fixtures in a tmpdir; same direct-`bash` form as the sibling gates.
+  "bash workflows/scripts/report-producers/tests/test_dual_build_report.sh"
   # Comparison report RENDERER (temperloop#2058, epic #1225):
   # workflows/scripts/model-comparison/render.sh — the decision-first Markdown
   # page a human reads instead of the producer's JSON. The load-bearing checks

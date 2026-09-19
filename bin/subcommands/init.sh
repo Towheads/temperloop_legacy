@@ -255,6 +255,20 @@
 # it reports a legible skip and `init` continues. An unplaceable report
 # headline is never worth failing an adopter's bootstrap over.
 #
+# DUAL-BUILD PRODUCER SHIM (temperloop#2084, epic #2065). Same placement
+# rules, same manifest treatment, same soft-seam skip as the TOKENS shim
+# just above — this note only says what's DIFFERENT. Unlike model-
+# comparison (ADR 0027, no shim shipped at all — deliberately inert), the
+# dual-build report producer IS wired here, unconditionally, exactly like
+# `tokens`: a repo that never runs `/build --dual-build` carries an empty
+# ledger, and workflows/scripts/report-producers/dual-build degrades to one
+# `skipped -- ` line for that repo — the same "no standing cost when
+# unused" property that lets `tokens` be wired unconditionally too. The
+# shim finds an installed kernel and `exec`s
+# workflows/scripts/report-producers/dual-build, which reads the
+# `.temperloop/model-comparison/dual-build/` ledger (gitignored, per-repo,
+# already outside this manifest's own tree).
+#
 # Usage:
 #   init.sh [--dir DIR] [--gh-repo OWNER/REPO] [--no-network] [--timeout SECS]
 #           [--branch NAME] [--base BRANCH] [--remote NAME]
@@ -369,6 +383,11 @@ BASELINE_SNAPSHOT="$SUBCOMMAND_DIR/baseline-snapshot.sh"
 # claimed by workflows/scripts/kernel/kernel-manifest.txt and
 # docs/features/feature-manifest.txt — so there is no second copy to drift.
 PRODUCER_SHIM="$KERNEL_ROOT/.temperloop/report.d/tokens"
+# The `dual-build` drop-in producer's LOCATOR SHIM (temperloop#2084, epic
+# #2065), wired the same way as PRODUCER_SHIM above — see the "DUAL-BUILD
+# PRODUCER SHIM" note below for why this one is unconditionally wired too
+# rather than shipped inert (ADR 0027's model-comparison treatment).
+DUAL_BUILD_PRODUCER_SHIM="$KERNEL_ROOT/.temperloop/report.d/dual-build"
 
 if [ ! -f "$PROBE" ]; then
   echo "init.sh: conventions-probe.sh not found at $PROBE (broken kernel checkout)" >&2
@@ -1439,6 +1458,67 @@ it costs you only \`temperloop report\`'s tokens-spent headline."
 fi
 echo
 
+# --- the `dual-build` report.d producer shim (temperloop#2084) ------------
+# Identical three-rule placement to the tokens block just above — see
+# "DUAL-BUILD PRODUCER SHIM" in the header for what's different (nothing in
+# the mechanics, only in why it's wired unconditionally). Deliberately its
+# own block rather than a shared loop: the two shims' human-facing body
+# notes differ, and this codebase's existing convention (this file has
+# exactly one other such block, tokens') has no generic n-producer loop yet
+# to extend — see the verification-surface note on why duplicating the
+# well-tested three-rule shape here is the lower-risk choice over a first
+# generalization attempt on this file.
+db_producer_target=".temperloop/report.d/dual-build"
+db_producer_abs="$repo_dir/$db_producer_target"
+db_producer_body_note=""
+db_producer_source=""
+db_producer_mode=""
+if base_has "$db_producer_target"; then
+  echo "report.d producer: $db_producer_target already on ${base:-the base branch} — leaving it untouched (never overwritten)"
+elif [ -e "$db_producer_abs" ] || [ -L "$db_producer_abs" ]; then
+  if [ -f "$db_producer_abs" ] && [ -r "$db_producer_abs" ]; then
+    db_producer_source="$db_producer_abs"
+    if [ -x "$db_producer_abs" ]; then db_producer_mode="755"; else db_producer_mode="644"; fi
+    db_producer_carry_note=""
+    [ -L "$db_producer_abs" ] && db_producer_carry_note=", flattened from a symlink to a regular file"
+    echo "report.d producer: carrying the existing $db_producer_target forward — content and mode ($db_producer_mode) preserved$db_producer_carry_note (present here, not yet on ${base:-the base branch})"
+  else
+    echo "init.sh: WARNING — $db_producer_target exists but is not a readable regular file; it cannot be carried into the proposal, and re-creating the proposal branch off ${base:-the base branch} may remove it. Commit it to ${base:-the base branch}, or make it readable, then re-run." >&2
+  fi
+elif [ ! -f "$DUAL_BUILD_PRODUCER_SHIM" ] || [ ! -r "$DUAL_BUILD_PRODUCER_SHIM" ] || [ ! -s "$DUAL_BUILD_PRODUCER_SHIM" ]; then
+  echo "report.d producer: skipped — shim unavailable at $DUAL_BUILD_PRODUCER_SHIM"
+else
+  db_producer_source="$DUAL_BUILD_PRODUCER_SHIM"
+  db_producer_mode="755"
+fi
+
+if [ -n "$db_producer_source" ]; then
+  db_producer_content="$(cat "$db_producer_source")"
+  if [ -z "$db_producer_content" ]; then
+    echo "init.sh: WARNING — read $db_producer_source but got no content; not proposing $db_producer_target (refusing to commit a zero-byte executable)" >&2
+  else
+    manifest_entries+=("$(jq -cn --arg p "$db_producer_target" --arg c "$db_producer_content" \
+      --arg m "${db_producer_mode:-755}" '{path:$p, content:$c, mode:$m}')")
+    title_parts="$title_parts + report.d/dual-build"
+    if [ "$db_producer_source" = "$DUAL_BUILD_PRODUCER_SHIM" ]; then
+      db_producer_body_note="
+
+\`$db_producer_target\` is a **drop-in report producer** (mode 755, executable —
+\`temperloop report\` runs every executable in \`.temperloop/report.d/\`). It is
+a thin LOCATOR: it finds an installed temperloop kernel and \`exec\`s that
+kernel's own implementation, which reads this repo's dual-build ledger
+(\`.temperloop/model-comparison/dual-build/\`, gitignored) to report the
+new-work dual-build harness's cumulative win-rate/cost/calibration figures.
+It makes no network calls of its own, and it exits 0 with a one-line
+\`skipped\` notice on any host with no kernel installed, or in any repo that
+has never run \`/build --dual-build\`. Deleting it costs you only
+\`temperloop report\`'s dual-build block."
+      echo "report.d producer: proposing $db_producer_target (mode 755) — the drop-in that gives \`temperloop report\` its dual-build cumulative block"
+    fi
+  fi
+fi
+echo
+
 echo "-- 3. Proposal PR (tree-only; nothing lands without review) --"
 title="chore: temperloop init — $title_parts"
 body="Proposed by \`temperloop init\` (opt-in, reviewable — foundation #765 Epic D).
@@ -1453,7 +1533,7 @@ first epic's work, applied later with per-write consent via
 Tracker mode: **issues-only** (\`board.$board_num.backend=issues\`), the sole
 tracker backend. The Projects-v2 arm was removed outright (ADR 0004, epic
 #524) and there is no configuration path back — see
-\`docs/features/install-cli.md\` § Tracker mode.$producer_body_note"
+\`docs/features/install-cli.md\` § Tracker mode.$producer_body_note$db_producer_body_note"
 
 if [ "$dry_run" -eq 1 ]; then
   # --dry-run GATE (temperloop#413): genuinely zero-write — compute and

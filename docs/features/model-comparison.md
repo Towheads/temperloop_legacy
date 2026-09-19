@@ -462,6 +462,36 @@ adds no autonomous or cron arm of its own. Which candidate models and
 vendors an operator actually tests, and their API keys, are overlay/operator
 configuration, never a kernel default.
 
+### Dual-build cumulative report (temperloop#2084, epic #2065)
+
+A sibling to the comparison report above, over a different corpus: rather
+than a replayed corpus of closed issues, `/build --dual-build` builds *new*
+work under two models and judges each item pairwise (ADR 0038). The
+`dual-build-ledger.sh` ledger those runs write to
+(`.temperloop/model-comparison/dual-build/`, gitignored, single-host) feeds
+its own drop-in producer, `workflows/scripts/report-producers/dual-build`,
+which `temperloop report` renders per tier: a candidate item-win rate with
+an exact binomial interval (never a bootstrap — `stats.sh exact-binom`),
+the level-pick tally (which arm's code actually shipped, override-inclusive
+— a distinct number from the win rate above, which is override-blind by
+design), whole-job cost per arm, the override rate, and the judge's own
+calibration status. A winner is only ever named once the judge is
+`calibrated` (≥70% pairwise agreement over ≥20 human-labelled blind pairs,
+ADR 0041) *and* the sample clears `MODEL_COMPARISON_MIN_SAMPLE_N` *and* the
+unresolved rate (tied/unjudged/infra/incomplete items, excluded from the
+win-rate numerator and denominator) stays under
+`DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT` — otherwise it prints "below floor -
+keep accumulating" or "judge uncalibrated - verdict withheld" rather than a
+number it cannot support.
+
+**Unlike this module's own shim (above), the dual-build producer's locator
+shim IS wired by `temperloop init`** — an adopter repo gets
+`.temperloop/report.d/dual-build` unconditionally, the same treatment as
+the kernel's `tokens` shim. This is still zero standing cost: a repo that
+has never run `/build --dual-build` carries an empty ledger, and the
+producer degrades to one `skipped -- dual-build: ...` line, exactly as an
+absent `tokens` producer would.
+
 ## Integration
 
 **Consumes:**

@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+#
+# workflows/scripts/report-producers/dual-build — kernel-side implementation
+# of the `dual-build` `.temperloop/report.d/` drop-in producer (temperloop
+# #2084, epic #2065 "new-work dual-build harness", Contract dimension 4 #8).
+# Aggregates the dual-build ledger (workflows/scripts/model-comparison/
+# dual-build-ledger.sh) into the cumulative report a human reads to decide
+# whether the candidate model is worth routing to for real.
+#
+# ── WHAT THIS FILE IS, AND WHERE IT SITS ───────────────────────────────────
+# A kernel-side `.temperloop/report.d/` drop-in IMPLEMENTATION, the same
+# shape and the same location as the sibling `tokens` producer (temperloop
+# #980 "producer-kernel-side-relocation"): the real logic lives here so it
+# updates with the kernel checkout and stays inside check-producer-egress
+# .sh's reach; the file actually committed to an adopter's
+# `.temperloop/report.d/dual-build` is a thin locator + `exec` shim with no
+# ledger-reading or jq-shaping of its own (see that file's own header).
+#
+# UNLIKE model-comparison (ADR 0027, deliberately inert/no shim shipped),
+# THIS producer's locator shim IS wired by `temperloop init` — the same
+# treatment as `tokens` (see `bin/subcommands/init.sh`'s dual-build block).
+# That is safe under the same "no standing cost" reasoning ADR 0027 states
+# for model-comparison: a repo that has never run `/build --dual-build`
+# carries an empty (or absent) ledger, and this producer degrades to one
+# `skipped -- ` line for that repo, imposing no real cost. `/build
+# --dual-build` itself stays per-invocation opt-in (epic Contract #1); only
+# the REPORT half is unconditionally wired, exactly as this item's
+# acceptance asks ("same shape as the existing tokens shim").
+#
+# ── THE CONTRACT SEAM ───────────────────────────────────────────────────
+# As a report drop-in (workflows/scripts/lib/report.contract.md § Overlay
+# drop-in contract) this file MUST exit 0 and print a self-contained block
+# of stdout — a broken producer must never break `temperloop report`.
+#   * exit 0 always. A failure renders ONE line, `skipped -- dual-build:
+#     <reason>`, and nothing else (two hyphens, matching report.contract.md's
+#     own `skipped -- ` channel and the `tokens`/`model-comparison`
+#     producers' own literal).
+#   * On success, stdout is EXACTLY ONE JSON object and nothing else.
+#   * What it NEVER does is emit a number it did not compute, or name a
+#     winner it cannot support — mirroring model-comparison's own
+#     discipline. Three verdict states, kept textually distinct:
+#       - "below floor - keep accumulating"        (epic Contract #8, D13)
+#       - "judge uncalibrated - verdict withheld"   (epic Contract #8, D13)
+#       - a real verdict ("candidate is better" / "baseline is better" /
+#         "inconclusive - no significant difference")
+#     Withheld for TWO independent reasons — an uncalibrated judge, or an
+#     unresolved rate above DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT — but the
+#     SAME withholding string covers both ("the same way an uncalibrated
+#     judge does" — epic Contract #8's own wording).
+#
+# ── EVERY STATISTIC IS CONSUMED, NEVER RECOMPUTED ──────────────────────────
+# `dual-build-ledger.sh read`/`calibrate-status` own the ledger's rows and
+# the calibration verdict; `stats.sh exact-binom` owns the binomial interval
+# and the inconclusive floor. This file computes none of those itself — it
+# shells out for all three and copies the returned fields verbatim, exactly
+# as report-producers/model-comparison does for stats.sh/score.sh.
+#
+# ── ITEM-LEVEL WIN CLASSIFICATION vs THE LEVEL-PICK TALLY ──────────────────
+# Two DIFFERENT numbers this report prints, easy to conflate:
+#   * `win_rate` — "did the candidate's own work resolve better than the
+#     baseline's, on the merits" — derived HERE from each item's two ledger
+#     rows' `gate`/`judge.preference` fields directly, NEVER from `.pick`.
+#     Per ADR 0038: a gate failure is a decisive loss for that arm (`.pick`
+#     never overrides it); with both gates passing, the judge's preference
+#     decides; a judged tie or an unjudged/infra/both-gates-failed item is
+#     `unresolved` and excluded from both the numerator and denominator
+#     (epic Contract #8's honesty clause).
+#   * `level_pick_tally` — "which arm's code actually shipped" — a raw tally
+#     of each item's `.pick.arm`, which DOES reflect a per-item operator
+#     override (ADR 0038 lever (i)) when one was recorded. An overridden
+#     item can carry a `.pick.arm` that disagrees with its own win
+#     classification above — that disagreement is the whole point of an
+#     override existing, so the two numbers are reported side by side
+#     rather than collapsed into one.
+#
+# ── SPLITS BY TASK TYPE AND SEAT (epic Contract #8) ─────────────────────
+# The ledger row schema (schema_version 1, frozen by temperloop#2072) carries
+# no `task_type` or `seat` field — only `tier`/`model`/`arm`. Rather than
+# fabricate a mapping onto fields that mean something else, this producer
+# reports `splits.task_type`/`splits.seat` as `{"available":false,"reason":
+# ...}`, mirroring model-comparison's own precedent for a dimension it
+# cannot honestly populate (its `coverage_unavailable_reason`) — never a
+# number this file did not actually compute. `splits.tier` (which the
+# ledger DOES carry, and which the epic's own "per tier" framing already
+# names as the primary grouping) is populated for real.
+#
+# ── SETTINGS — RESOLVED, NEVER RE-VALUED HERE ───────────────────────────
+# MODEL_COMPARISON_MIN_SAMPLE_N (stats.sh's own floor), DUAL_BUILD_
+# UNRESOLVED_THRESHOLD_PCT, DUAL_BUILD_CALIBRATION_BAR_PCT/_N are all
+# declared+defaulted in workflows/scripts/build/build.config.sh; this file
+# only ever references them symbolically (per CLAUDE.kernel.md § Named-
+# setting convention) and carries layer-6 non-vendoring-caller fallbacks
+# that match the registry exactly (same idiom as report-producers/
+# model-comparison and stats.sh itself). The two calibration-bar fallbacks
+# are EXPORTED (not just shell-local) because their only consumer,
+# `calibrate-status`, runs in a separate `bash "$LEDGER_SH"` subprocess —
+# an unexported `:=` never reaches it (review round 1 finding, MEDIUM).
+#
+# ── LEDGER-DIR SCOPING BOUNDARY (review round 1, temperloop#2065) ─────────
+# LEDGER_DIR/REPO_LABEL are resolved from the INVOKING repo — `git
+# rev-parse --show-toplevel` run at cwd, per report.contract.md:64-65's
+# "invoked with cwd = the target repo" invariant — never from this
+# producer's own $0 location. Contrast the settings/sibling-script
+# resolution just above (BUILD_CONFIG, LEDGER_SH, STATS_SH), which climbs
+# from $0 on purpose: that is the temperloop#980 kernel-vs-adopter boundary,
+# where settings and the ledger/stats LIBRARIES always come from the kernel
+# checkout so an adopter cannot fork them. DATA (the ledger rows
+# themselves) must never follow that same climb, or once the kernel
+# checkout dogfoods `/build --dual-build` and grows its own ledger, every
+# adopter's `temperloop report` would silently render the KERNEL's win
+# rate, cost totals and verdict under the adopter's own heading — exactly
+# the "wrong corpus" class report.contract.md warns against. The sibling
+# `tokens` producer solves the analogous problem with the same
+# `git rev-parse --show-toplevel` idiom. `dual-build-ledger.sh`'s own
+# LEDGER_DIR still climbs from $0 (filed separately as temperloop#2119) —
+# this file's fix is READ-side only; a caller wanting a specific repo's
+# ledger regardless of cwd still passes DUAL_BUILD_LEDGER_DIR explicitly,
+# exactly as `/build --dual-build` already does.
+#
+# ── EGRESS: none. Local file reads (the ledger) plus subprocess calls to
+# sibling scripts in this same checkout (dual-build-ledger.sh, stats.sh).
+# No curl, no gh, no API — scanned by check-producer-egress.sh.
+
+set -uo pipefail
+export LC_ALL=C
+
+PRODUCER_NAME="dual-build"
+
+# THE one degradation path (mirrors report-producers/model-comparison's
+# `skip`): one line, exit 0, no JSON — a degraded run structurally cannot
+# carry a verdict or a cost figure it did not actually compute.
+skip() { printf 'skipped -- %s: %s\n' "$PRODUCER_NAME" "$1"; exit 0; }
+
+# The report.d contract invokes a producer with NO arguments — no arg-parse
+# loop here at all (temperloop#1342's "cannot infinite-loop on a trailing
+# flag" shape).
+[ "$#" -eq 0 ] || skip "invoked with $# argument(s); the .temperloop/report.d/ contract invokes a producer with none"
+
+command -v jq >/dev/null 2>&1 || skip "jq not found on PATH"
+command -v git >/dev/null 2>&1 || skip "git not found on PATH"
+
+self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || skip "could not resolve this producer's own directory"
+LEDGER_SH="$self_dir/../model-comparison/dual-build-ledger.sh"
+STATS_SH="$self_dir/../model-comparison/stats.sh"
+BUILD_CONFIG="$self_dir/../build/build.config.sh"
+
+[ -f "$LEDGER_SH" ] || skip "the dual-build ledger library is missing at workflows/scripts/model-comparison/dual-build-ledger.sh — refusing to re-derive its row schema here"
+[ -f "$STATS_SH" ] || skip "the comparison-statistics library is missing at workflows/scripts/model-comparison/stats.sh — refusing to compute the binomial interval itself"
+
+if [ -f "$BUILD_CONFIG" ]; then
+  # shellcheck source=../build/build.config.sh
+  . "$BUILD_CONFIG"
+fi
+
+# Layer-6 non-vendoring-caller fallbacks, matching the setting registry.
+: "${MODEL_COMPARISON_MIN_SAMPLE_N:=20}"
+: "${DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT:=20}"
+: "${DUAL_BUILD_CALIBRATION_BAR_PCT:=70}"
+: "${DUAL_BUILD_CALIBRATION_BAR_N:=20}"
+# Exported so the separate `bash "$LEDGER_SH" calibrate-status` subprocess
+# below actually sees a non-vendoring caller's fallback (review round 1,
+# MEDIUM) -- a plain `:=` sets a shell variable only, invisible to a child
+# process.
+export DUAL_BUILD_CALIBRATION_BAR_PCT DUAL_BUILD_CALIBRATION_BAR_N
+
+# Validate BEFORE use: both feed bash arithmetic (`-gt` below) and an
+# unguarded --argjson in the terminal jq call, and a non-numeric value in
+# either place would otherwise surface as a bash arithmetic error or a
+# jq exit 2 with empty stdout -- against this file's own "exit 0 always"
+# contract (review round 1, MEDIUM). Same `case ''|*[!0-9]*)` idiom as
+# dual-build-ledger.sh's own bar validation.
+case "$MODEL_COMPARISON_MIN_SAMPLE_N" in
+  ''|*[!0-9]*) skip "MODEL_COMPARISON_MIN_SAMPLE_N is not a valid non-negative integer (\"$MODEL_COMPARISON_MIN_SAMPLE_N\") -- refusing to report with a misconfigured sample floor" ;;
+esac
+case "$DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT" in
+  ''|*[!0-9]*) skip "DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT is not a valid non-negative integer (\"$DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT\") -- refusing to report with a misconfigured unresolved-rate threshold" ;;
+esac
+
+# LEDGER_DIR/REPO_LABEL are scoped to the INVOKING repo (cwd), never to
+# this producer's own $0 location -- see the header's "LEDGER-DIR SCOPING
+# BOUNDARY" note. `git -C "$PWD"` rather than a bare `git` so this reads
+# explicitly off the invocation cwd regardless of any later `cd` in this
+# file (there is none today, but the explicit form makes the invariant
+# self-evident at the call site rather than incidental).
+INVOKING_REPO_ROOT="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || INVOKING_REPO_ROOT=""
+[ -n "$INVOKING_REPO_ROOT" ] || skip "could not resolve the invoking repo's root via git rev-parse --show-toplevel (not inside a git checkout, or git unavailable) -- refusing to guess which repo's ledger to report on"
+LEDGER_DIR="${DUAL_BUILD_LEDGER_DIR:-$INVOKING_REPO_ROOT/.temperloop/model-comparison/dual-build}"
+REPO_LABEL="$(basename "$INVOKING_REPO_ROOT")"
+
+# ── read the ledger ─────────────────────────────────────────────────────
+# `read`'s own contract: `[]` (exit 0) when no ledger exists yet — that IS
+# the common, "never run --dual-build here" case, not an error. A non-zero
+# exit is a real ledger consistency failure (malformed line, sequence gap)
+# and this producer degrades rather than printing a report over corrupt data.
+rows_json="$(bash "$LEDGER_SH" read --dir "$LEDGER_DIR" 2>/dev/null)"
+ledger_rc=$?
+[ "$ledger_rc" -eq 0 ] || skip "dual-build-ledger.sh read reported an inconsistent ledger at $LEDGER_DIR (records missing) — refusing to report over it"
+jq -e . >/dev/null 2>&1 <<<"$rows_json" || skip "dual-build-ledger.sh read did not return valid JSON"
+
+row_count="$(jq 'length' <<<"$rows_json")"
+[ "$row_count" -gt 0 ] || skip "no ledger rows found at $LEDGER_DIR — /build --dual-build has never run in this repo"
+
+# ── calibration status (the ledger's own read path — recompute+write is
+# its documented no-side-effect-beyond-the-write behavior) ─────────────
+# Distinguish "calibrate-status genuinely ran and reports n=0" (a real
+# statistical finding: `status` reads its own pinned "NEVER CALIBRATED"
+# literal) from "the call itself failed" (a misconfiguration -- e.g. the
+# calibration-bar settings above did not reach the child, or the ledger
+# dir could not be read/written) -- collapsing the two previously rendered
+# a misconfiguration as a substantive statistical finding (review round 1,
+# MEDIUM).
+calibration_json="$(bash "$LEDGER_SH" calibrate-status --dir "$LEDGER_DIR" 2>/dev/null)"
+calibration_rc=$?
+if [ "$calibration_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$calibration_json"; then
+  calibration_json='{"n":0,"agreement_pct":null,"status":"CALIBRATION STATUS UNAVAILABLE","bar_pct":null,"bar_n":null}'
+fi
+
+# ── per-tier item classification (bash+jq; the numeric floor/CI math is
+# stats.sh's job, never re-derived here) ────────────────────────────────
+# For each distinct slug, fold its (up to two) rows into one classification:
+#   win        ∈ {baseline, candidate}   — decisive (gate-decided or judged)
+#   unresolved reason ∈ {infra, incomplete, unjudged, tied}
+# infra takes precedence (an infra row means "could not evaluate" for that
+# arm, mirroring model-comparison's own infra-trumps-everything reading);
+# then a both-gates-failed item is `incomplete` (ADR 0038: re-driven once,
+# then parked incomplete — never silently awarded to either arm); then a
+# one-gate-failed item is gate-decided; only when both gates pass does the
+# judge's `.preference` decide (tie → `tied`, missing → `unjudged`).
+items_json="$(jq -c '
+  group_by(.slug) | map({
+    slug: .[0].slug,
+    tier: (map(.tier) | map(select(. != null)) | first),
+    baseline: (map(select(.arm == "baseline")) | first),
+    candidate: (map(select(.arm == "candidate")) | first)
+  }) | map(
+    . as $item
+    | ($item.baseline.loss_reason // null) as $blr
+    | ($item.candidate.loss_reason // null) as $clr
+    | ($item.baseline.gate // null) as $bg
+    | ($item.candidate.gate // null) as $cg
+    | (($item.baseline.judge.preference // $item.candidate.judge.preference) // null) as $pref
+    | (($item.baseline.pick.arm // $item.candidate.pick.arm) // null) as $pick
+    | (($item.baseline.override.applied // false) or ($item.candidate.override.applied // false)) as $overridden
+    | (
+        if ($blr == "infra" or $clr == "infra") then {win: null, unresolved: "infra"}
+        elif ($bg == "fail" and $cg == "fail") then {win: null, unresolved: "incomplete"}
+        elif ($bg == "fail" and $cg == "pass") then {win: "candidate", unresolved: null}
+        elif ($cg == "fail" and $bg == "pass") then {win: "baseline", unresolved: null}
+        elif ($bg == "pass" and $cg == "pass") then (
+          if $pref == "candidate" then {win: "candidate", unresolved: null}
+          elif $pref == "baseline" then {win: "baseline", unresolved: null}
+          elif $pref == "tie" then {win: null, unresolved: "tied"}
+          else {win: null, unresolved: "unjudged"}
+          end
+        )
+        else {win: null, unresolved: "unjudged"}
+        end
+      ) as $cls
+    | {slug: $item.slug, tier: $item.tier, win: $cls.win, unresolved: $cls.unresolved,
+       pick: $pick, overridden: $overridden,
+       baseline_cost: ($item.baseline.cost // null), candidate_cost: ($item.candidate.cost // null)}
+  )
+' <<<"$rows_json")" || skip "could not classify ledger rows by slug/tier"
+
+tiers_json="$(jq -c '[.[].tier] | unique' <<<"$items_json")"
+tier_count="$(jq 'length' <<<"$tiers_json")"
+[ "$tier_count" -gt 0 ] || skip "no tier could be resolved from any ledger row — a row is missing its tier field"
+
+tier_reports="[]"
+tiers="$(jq -r '.[]' <<<"$tiers_json")"
+while IFS= read -r tier; do
+  [ -n "$tier" ] || continue
+  tier_items="$(jq -c --arg t "$tier" '[.[] | select(.tier == $t)]' <<<"$items_json")"
+  total_items="$(jq 'length' <<<"$tier_items")"
+  candidate_wins="$(jq '[.[] | select(.win == "candidate")] | length' <<<"$tier_items")"
+  baseline_wins="$(jq '[.[] | select(.win == "baseline")] | length' <<<"$tier_items")"
+  resolved=$((candidate_wins + baseline_wins))
+  unresolved=$((total_items - resolved))
+  unresolved_breakdown="$(jq -c '[.[] | select(.unresolved != null) | .unresolved] | group_by(.) | map({(.[0]): length}) | add // {}' <<<"$tier_items")"
+
+  unresolved_rate_pct="null"
+  [ "$total_items" -gt 0 ] && unresolved_rate_pct="$(jq -n --argjson u "$unresolved" --argjson t "$total_items" '(($u / $t * 100) | round)')"
+
+  # Descriptive bounds — ALWAYS computed, even below the floor (mirrors
+  # model-comparison's "cost keeps its CI ... as DESCRIPTIVE figures" —
+  # `--min-sample 1` here is the dispersion-probe idiom applied to a
+  # binomial rather than a bootstrap). The GATING call (default floor) is
+  # separate and decides `below_min_sample` for the verdict below.
+  binom_descriptive="$(bash "$STATS_SH" exact-binom --n "$resolved" --k "$candidate_wins" --min-sample 1 2>/dev/null)"
+  [ $? -eq 0 ] && jq -e . >/dev/null 2>&1 <<<"$binom_descriptive" || binom_descriptive='null'
+  binom_gated="$(bash "$STATS_SH" exact-binom --n "$resolved" --k "$candidate_wins" 2>/dev/null)"
+  [ $? -eq 0 ] && jq -e . >/dev/null 2>&1 <<<"$binom_gated" || binom_gated='null'
+  below_min_sample="$(jq -r 'if . == null then true else .below_min_sample end' <<<"$binom_gated")"
+
+  pick_baseline="$(jq '[.[] | select(.pick == "baseline")] | length' <<<"$tier_items")"
+  pick_candidate="$(jq '[.[] | select(.pick == "candidate")] | length' <<<"$tier_items")"
+  pick_none="$(jq '[.[] | select(.pick == null)] | length' <<<"$tier_items")"
+
+  override_count="$(jq '[.[] | select(.overridden == true)] | length' <<<"$tier_items")"
+  override_rate_pct="null"
+  [ "$total_items" -gt 0 ] && override_rate_pct="$(jq -n --argjson o "$override_count" --argjson t "$total_items" '(($o / $t * 100) | round)')"
+
+  baseline_tokens_in="$(jq '[.[] | (.baseline_cost.tokens_in // 0)] | add' <<<"$tier_items")"
+  baseline_tokens_out="$(jq '[.[] | (.baseline_cost.tokens_out // 0)] | add' <<<"$tier_items")"
+  baseline_wall_clock_ms="$(jq '[.[] | (.baseline_cost.wall_clock_ms // 0)] | add' <<<"$tier_items")"
+  baseline_retry_tokens="$(jq '[.[] | (.baseline_cost.retry_tokens // 0)] | add' <<<"$tier_items")"
+  candidate_tokens_in="$(jq '[.[] | (.candidate_cost.tokens_in // 0)] | add' <<<"$tier_items")"
+  candidate_tokens_out="$(jq '[.[] | (.candidate_cost.tokens_out // 0)] | add' <<<"$tier_items")"
+  candidate_wall_clock_ms="$(jq '[.[] | (.candidate_cost.wall_clock_ms // 0)] | add' <<<"$tier_items")"
+  candidate_retry_tokens="$(jq '[.[] | (.candidate_cost.retry_tokens // 0)] | add' <<<"$tier_items")"
+
+  calibration_status="$(jq -r '.status' <<<"$calibration_json")"
+  calibrated=0
+  [ "$calibration_status" = "calibrated" ] && calibrated=1
+
+  # ── verdict — the ONE decision this whole file exists to gate honestly ──
+  if [ "$resolved" -eq 0 ] || [ "$below_min_sample" = "true" ]; then
+    verdict="below floor - keep accumulating"
+  elif [ "$unresolved_rate_pct" != "null" ] && [ "$unresolved_rate_pct" -gt "$DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT" ]; then
+    verdict="judge uncalibrated - verdict withheld"
+  elif [ "$calibrated" -ne 1 ]; then
+    verdict="judge uncalibrated - verdict withheld"
+  else
+    excludes_null="$(jq -r '.excludes_null' <<<"$binom_gated")"
+    if [ "$excludes_null" = "true" ]; then
+      phat="$(jq -r '.phat' <<<"$binom_gated")"
+      if awk -v p="$phat" 'BEGIN{exit !(p>0.5)}'; then
+        verdict="candidate is better"
+      else
+        verdict="baseline is better"
+      fi
+    else
+      verdict="inconclusive - no significant difference"
+    fi
+  fi
+
+  tier_report="$(jq -n \
+    --arg tier "$tier" \
+    --argjson total_items "$total_items" \
+    --argjson resolved "$resolved" \
+    --argjson candidate_wins "$candidate_wins" \
+    --argjson baseline_wins "$baseline_wins" \
+    --argjson unresolved "$unresolved" \
+    --argjson unresolved_rate_pct "$unresolved_rate_pct" \
+    --argjson unresolved_breakdown "$unresolved_breakdown" \
+    --argjson binom "$binom_descriptive" \
+    --argjson pick_baseline "$pick_baseline" --argjson pick_candidate "$pick_candidate" --argjson pick_none "$pick_none" \
+    --argjson override_count "$override_count" --argjson override_rate_pct "$override_rate_pct" \
+    --argjson b_in "$baseline_tokens_in" --argjson b_out "$baseline_tokens_out" --argjson b_ms "$baseline_wall_clock_ms" --argjson b_retry "$baseline_retry_tokens" \
+    --argjson c_in "$candidate_tokens_in" --argjson c_out "$candidate_tokens_out" --argjson c_ms "$candidate_wall_clock_ms" --argjson c_retry "$candidate_retry_tokens" \
+    --arg verdict "$verdict" \
+    '{
+      tier: $tier,
+      win_rate: {
+        candidate_wins: $candidate_wins, baseline_wins: $baseline_wins, resolved: $resolved,
+        candidate_win_pct: (if $resolved > 0 then (($candidate_wins / $resolved * 100) | round) else null end),
+        interval: $binom
+      },
+      level_pick_tally: {baseline: $pick_baseline, candidate: $pick_candidate, not_yet_picked: $pick_none},
+      cost: {
+        baseline: {tokens_in: $b_in, tokens_out: $b_out, wall_clock_ms: $b_ms, retry_tokens: $b_retry},
+        candidate: {tokens_in: $c_in, tokens_out: $c_out, wall_clock_ms: $c_ms, retry_tokens: $c_retry}
+      },
+      override: {count: $override_count, rate_pct: $override_rate_pct},
+      honesty: {
+        total_dual_built_items: $total_items,
+        unresolved_count: $unresolved,
+        unresolved_rate_pct: $unresolved_rate_pct,
+        unresolved_breakdown: $unresolved_breakdown,
+        tier_scope: $tier,
+        not_in_scope_count: null,
+        not_in_scope_basis: "the ledger (schema_version 1, temperloop#2072) records dual-built items only — a not-in-scope item never writes a row, so this producer has no ledger-side way to count it; a caller that knows the driving level'"'"'s full item count may supply it out of band. Reported as null rather than 0, since 0 would read as \"nothing was out of scope\" when it may simply be unmeasured here.",
+        host_scope: "single-host (declared, no cross-host reconciliation — matches dual-build-ledger.sh'"'"'s own single-host scope)"
+      },
+      splits: {
+        tier: $tier,
+        task_type: {available: false, reason: "the ledger row schema (schema_version 1) carries no task_type field — only tier/model/arm — so this split cannot be honestly computed from the ledger alone"},
+        seat: {available: false, reason: "the ledger row schema (schema_version 1) carries no seat field — only tier/model/arm — so this split cannot be honestly computed from the ledger alone"}
+      },
+      verdict: $verdict
+    }')" || skip "could not build the tier report for tier $tier"
+
+  tier_reports="$(jq -c --argjson r "$tier_report" '. + [$r]' <<<"$tier_reports")"
+done <<<"$tiers"
+
+# The one exit path formerly left unguarded (review round 1, MEDIUM): every
+# other failure funnels through `skip` (exit 0, one line); this final
+# emission now does too, rather than letting a bad jq invocation exit 2
+# with empty stdout -- against this file's own "exit 0 always" contract.
+final="$(jq -n \
+  --arg repo "$REPO_LABEL" \
+  --argjson tiers "$tier_reports" \
+  --argjson calibration "$calibration_json" \
+  --argjson min_sample_n "$MODEL_COMPARISON_MIN_SAMPLE_N" \
+  --argjson unresolved_threshold_pct "$DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT" \
+  '{
+    producer: "dual-build",
+    repo: $repo,
+    calibration: $calibration,
+    settings: {min_sample_n: $min_sample_n, unresolved_threshold_pct: $unresolved_threshold_pct},
+    tiers: $tiers
+  }')" || skip "could not assemble the final report object"
+printf '%s\n' "$final"
