@@ -298,6 +298,14 @@ const freshnessMap = new Map();
 // case predating this item models a worktree holding the worker's commits,
 // which is exactly the case the push preserves, so none of them need changing.
 const preserveMap = new Map();
+// gateInFlightMap: slug → [outcome, ...] — temperloop#1650's ordinal→name
+// probe (`gate-inflight:<slug>`), which fires ONLY on the UNKNOWN-verdict
+// escalation path. Its OWN queue, for the same reason as preserveMap above:
+// it runs after every gate slice of an escalating item, so sharing the
+// per-slug machineryMap FIFO would consume whatever entry that test queued
+// next. Default (map miss): GATE_NAMED with a plausible gate command, so every
+// pre-#1650 GATE_TIMEOUT case keeps working unchanged.
+const gateInFlightMap = new Map();
 // workerClockMap / workerUsageMap: slug → [outcome, ...] — temperloop#2065's
 // worker-cost-capture seam (`worker-clock:<slug>#<tag>` / `worker-usage:
 // <slug>#<tag>`), each its OWN queue, mirroring freshnessMap/preserveMap/
@@ -382,6 +390,7 @@ globalThis.mergeCheckMap = mergeCheckMap;
 globalThis.reviewMap = reviewMap;
 globalThis.freshnessMap = freshnessMap;
 globalThis.preserveMap = preserveMap;
+globalThis.gateInFlightMap = gateInFlightMap;
 globalThis.workerClockMap = workerClockMap;
 globalThis.workerUsageMap = workerUsageMap;
 globalThis.setWorkerClock = (slug, ...outcomes) => { workerClockMap.set(slug, outcomes); };
@@ -405,6 +414,14 @@ globalThis.agent = async function agent(prompt, opts = {}) {
       // the machineryMap FIFO.
       if (/^preserve-push:/.test(String(opts.label || ''))) {
         return nextFromMap(preserveMap, slug, { outcome: 'WORK_PRESERVED', branch: 'build/' + slug, commits_ahead: 1, pushed: true });
+      }
+      // temperloop#1650: the in-flight gate ordinal→name probe, own queue (see
+      // gateInFlightMap). A queued { __throw: msg } models runMachinery() itself
+      // throwing — the case the caller's fail-soft try/catch exists for.
+      if (/^gate-inflight:/.test(String(opts.label || ''))) {
+        const v = nextFromMap(gateInFlightMap, slug, { outcome: 'GATE_NAMED', gate: 'bash workflows/scripts/build/tests/test_state_graph_soak.sh' });
+        if (v && v.__throw) throw new Error(v.__throw);
+        return v;
       }
       // temperloop#2065: the worker-cost-capture seam's OWN queues — see
       // workerClockMap/workerUsageMap's comment above for why they cannot
@@ -519,6 +536,7 @@ globalThis.setWorker = (slug, ...verdicts) => { workerMap.set(slug, verdicts); }
 globalThis.setMergeCheck = (slug, ...states) => { mergeCheckMap.set(slug, states); };
 globalThis.setFreshness = (slug, ...outcomes) => { freshnessMap.set(slug, outcomes); };
 globalThis.setPreserve = (slug, ...outcomes) => { preserveMap.set(slug, outcomes); };
+globalThis.setGateInFlight = (slug, ...outcomes) => { gateInFlightMap.set(slug, outcomes); };
 globalThis.setReview = (slug, ...responses) => { reviewMap.set(slug, responses); };
 // tsvRows(text) — temperloop#1976: the harness's OWN independent restatement
 // of reviewDiffCmd's row-count rule (non-blank, non-`#` lines — the same
@@ -1952,6 +1970,146 @@ if (!/BUDGET/.test(esc.payload?.reason ?? ''))
 // And it must NOT push a branch on an unknown verdict.
 if ((result.parked ?? []).length !== 0)
   { console.log(JSON.stringify({ ok: false, reason: 'expected 0 parked: ' + JSON.stringify(result) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-1 (temperloop#1650): the GATE_TIMEOUT remedy must be a move the
+#   reader can MAKE. Pre-#1650 it said 'raise BUILD_GATE_SLICE_SECS (bounded by
+#   the agent Bash cap) or split the gate list' — a lever clamped to ~+11% of
+#   the kill deadline, pointed at the one-slow-gate case it cannot fix, and a
+#   gate list with no gate named. This pins: the ONE-SLOW-GATE shape, the clamp
+#   stated with its derivation (GATE_BASH_TIMEOUT_MS from the slice budget,
+#   clamped to AGENT_BASH_CAP_MS), and the in-flight gate NAME in the payload.
+# ============================================================================
+run_node_case "1650 remedy: GATE_TIMEOUT names the one-slow-gate shape, the clamp and the in-flight gate" "
+$PREAMBLE
+
+setMachinery('item-rem1650',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/item-rem1650' },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 47, failed: 0, elapsedSecs: 301 },
+  { outcome: 'GATE_TIMEOUT' },
+);
+setGateInFlight('item-rem1650', { outcome: 'GATE_NAMED', gate: 'bash scripts/tests/test_very_slow_gate.sh' });
+happyWorker('item-rem1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-rem1650', branch: 'build/item-rem1650', title: 'Remedy', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+if (!esc || esc.kind !== 'acceptance-gate-timeout')
+  { console.log(JSON.stringify({ ok: false, reason: 'the #1021 GATE_TIMEOUT/GATE_FAIL split did not survive: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const remedy = String(esc.payload?.remedy ?? '');
+// SHAPE 1 — one slow gate, and it must NOT read as the aggregate-slow case.
+if (!/ONE SLOW GATE/.test(remedy) || /AGGREGATE-SLOW/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'remedy does not name the one-slow-gate shape: ' + remedy })); process.exit(0); }
+// THE CLAMP, with its derivation — not a bare 'bounded by the agent Bash cap'.
+for (const needle of ['GATE_BASH_TIMEOUT_MS', 'AGENT_BASH_CAP_MS', 'CLAMPED', 'DERIVED'])
+  if (!remedy.includes(needle))
+    { console.log(JSON.stringify({ ok: false, reason: 'remedy does not state the clamp (' + needle + ' missing): ' + remedy })); process.exit(0); }
+// …and it must NOT send the reader at the clamped lever to fix THIS shape.
+if (!/CANNOT fix this shape/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'remedy still points a one-slow-gate timeout at the slice budget: ' + remedy })); process.exit(0); }
+// THE IN-FLIGHT GATE — by ordinal AND by name, in the payload and the remedy.
+const inFlight = esc.payload?.inFlightGate;
+if (!inFlight || inFlight.index !== 47)
+  { console.log(JSON.stringify({ ok: false, reason: 'payload does not name the in-flight gate index: ' + JSON.stringify(inFlight) })); process.exit(0); }
+if (inFlight.gate !== 'bash scripts/tests/test_very_slow_gate.sh')
+  { console.log(JSON.stringify({ ok: false, reason: 'payload does not carry the in-flight gate NAME: ' + JSON.stringify(inFlight) })); process.exit(0); }
+if (!remedy.includes('bash scripts/tests/test_very_slow_gate.sh'))
+  { console.log(JSON.stringify({ ok: false, reason: 'remedy does not name the in-flight gate: ' + remedy })); process.exit(0); }
+// The probe is READ-ONLY enrichment: it must not have cost the branch a push.
+if ((result.parked ?? []).length !== 0)
+  { console.log(JSON.stringify({ ok: false, reason: 'expected 0 parked: ' + JSON.stringify(result) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-2 (temperloop#1650): the OTHER failure shape. A slice CEILING
+#   exhausted with every slice returning cleanly is an aggregate-slow suite —
+#   more gate wall time genuinely helps — and must read differently from the
+#   one-slow-gate timeout above. One message conflated them before #1650.
+# ============================================================================
+run_node_case "1650 remedy: slice-ceiling exhaustion reads as the AGGREGATE-slow shape" "
+$PREAMBLE
+
+// GATE_MAX_SLICES (8) x 1 + GATE_RESUME_EXTENSIONS (2) more allotments = 24
+// clean slices before the loop gives up with a terminal GATE_SLICE.
+const slices = Array.from({ length: 24 }, (_, i) => ({ outcome: 'GATE_SLICE', resumeAt: i + 1, failed: 0, elapsedSecs: 300 }));
+setMachinery('item-agg1650',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/item-agg1650' },
+  { outcome: 'REVIEW_DIFF' },
+  ...slices,
+);
+happyWorker('item-agg1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-agg1650', branch: 'build/item-agg1650', title: 'Aggregate', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+if (!esc || esc.kind !== 'acceptance-gate-timeout')
+  { console.log(JSON.stringify({ ok: false, reason: 'expected acceptance-gate-timeout: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const remedy = String(esc.payload?.remedy ?? '');
+if (!/AGGREGATE-SLOW SUITE/.test(remedy) || /ONE SLOW GATE/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'remedy does not distinguish the aggregate-slow shape: ' + remedy })); process.exit(0); }
+// This shape is the one where MORE budget actually helps — say so.
+if (!/MORE gate wall time genuinely helps/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'aggregate-slow remedy does not offer the budget lever: ' + remedy })); process.exit(0); }
+// …and it still states the clamp, so the raise it offers is a BOUNDED one.
+if (!remedy.includes('GATE_BASH_TIMEOUT_MS') || !remedy.includes('AGENT_BASH_CAP_MS'))
+  { console.log(JSON.stringify({ ok: false, reason: 'aggregate-slow remedy omits the clamp: ' + remedy })); process.exit(0); }
+// The gate the run stopped at is the LAST slice's resume point, named.
+if (esc.payload?.inFlightGate?.index !== 24)
+  { console.log(JSON.stringify({ ok: false, reason: 'aggregate-slow payload does not name where the run stopped: ' + JSON.stringify(esc.payload?.inFlightGate) })); process.exit(0); }
+if (!/test_state_graph_soak/.test(String(esc.payload?.inFlightGate?.gate ?? '')))
+  { console.log(JSON.stringify({ ok: false, reason: 'aggregate-slow payload carries no in-flight gate name: ' + JSON.stringify(esc.payload?.inFlightGate) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-3 (temperloop#1650): a slice budget ALREADY at its clamp must not be
+#   offered as a lever at all. GATE_SLICE_SECS_MAX is (AGENT_BASH_CAP_MS -
+#   GATE_SLICE_OVERRUN_MS)/1000 = 360s, so an operator who already raised
+#   BUILD_GATE_SLICE_SECS to it has nothing left to raise.
+# ============================================================================
+run_node_case "1650 remedy: a slice budget at the clamp is reported as such, not offered as a raise" "
+$PREAMBLE
+
+setMachinery('item-clamp1650',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/item-clamp1650' },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_TIMEOUT' },
+);
+happyWorker('item-clamp1650');
+
+globalThis.args = { ...baseArgs, gateSliceSecs: 360, items: [
+  { slug: 'item-clamp1650', branch: 'build/item-clamp1650', title: 'Clamped', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+const remedy = String(esc?.payload?.remedy ?? '');
+if (!/ALREADY AT its clamp/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'an at-clamp slice budget is not reported as clamped: ' + remedy })); process.exit(0); }
+if (/can rise only/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'an at-clamp slice budget is still offered as a raise: ' + remedy })); process.exit(0); }
+// The slice budget the payload reports is the CLAMPED one it just described.
+if (esc?.payload?.sliceBudgetSecs !== 360)
+  { console.log(JSON.stringify({ ok: false, reason: 'slice budget did not resolve to the clamp: ' + JSON.stringify(esc?.payload) })); process.exit(0); }
 
 console.log(JSON.stringify({ ok: true }));
 "

@@ -985,3 +985,112 @@ added by a branch not yet on main is invisible to that derivation.
  Both extra keys are OMITTED when their condition does not hold, so an
  ordinary level's return stays byte-identical to before #2006/#2004.
 ```
+
+## gateInFlightIndex(ledger) — WHICH gate the stopped run was ON (temperlo
+<a id="gateinflightindex-ledger-which-gate-the-stopped-run-was-on-t"></a>
+
+```text
+ gateInFlightIndex(ledger) — WHICH gate the stopped run was ON, read off the
+ LAST ledger entry (temperloop#1650).
+
+ Two shapes, two readings. A slice that REPORTED a resume point stopped
+ cleanly at a gate boundary, so the run's next gate IS that index. A slice
+ the Bash cap KILLED reported nothing at all, so the only index anyone has
+ is the `startAt` it was handed — the overrun is at that gate or after it
+ (the pooled executor runs a CHUNK at a time, so the killed window can be
+ wider than one gate; the payload's `sliceLog` is what narrows it further,
+ since every gate that FINISHED printed its own `[ok]`/`[FAIL]` line).
+
+ Ledger-derived, not loop-counter-derived, for the same reason gateVerdict()
+ is: the ledger is the authoritative record of what the slices reported, and
+ a second derivation path is a second thing that can disagree.
+```
+
+## gateSliceClampNote() — what raising BUILD_GATE_SLICE_SECS can ACTUALLY
+<a id="gatesliceclampnote-what-raising-build-gate-slice-secs-can-act"></a>
+
+```text
+ gateSliceClampNote() — what raising BUILD_GATE_SLICE_SECS can ACTUALLY buy
+ (temperloop#1650).
+
+ The pre-#1650 remedy said "raise BUILD_GATE_SLICE_SECS (bounded by the agent
+ Bash cap)" and stopped there, which reads as a lever with room in it. It is
+ not one. GATE_BASH_TIMEOUT_MS — the deadline that actually killed the slice —
+ is DERIVED from the slice budget (slice*1000 + GATE_SLICE_OVERRUN_MS, i.e.
+ 1.8x at the 300s default) and then clamped to AGENT_BASH_CAP_MS, the agent's
+ hard foreground-Bash ceiling. At the default that leaves the slice 300s ->
+ 360s (+20%) and the kill deadline 540000ms -> 600000ms (+11%). A reader sent
+ to a +11% lever to fix a gate that overran a 540s window has been sent on an
+ errand that cannot succeed.
+
+ So the note states the derivation and the arithmetic, and — at or within
+ GATE_SLICE_CLAMP_NEAR_RATIO of GATE_SLICE_SECS_MAX — says plainly that there
+ is no headroom left rather than naming the raise at all. Both figures are
+ COMPUTED from the constants they describe, never typed as literals, so a
+ retuned overrun or cap cannot leave the prose stating a stale percentage.
+```
+
+## gateUnknownRemedy(terminalOutcome, inFlight, slices) — the TWO failure
+<a id="gateunknownremedy-terminaloutcome-inflight-slices-the-two-fai"></a>
+
+```text
+ gateUnknownRemedy(terminalOutcome, inFlight, slices) — the TWO failure
+ shapes an UNKNOWN verdict can be in (temperloop#1650).
+
+ One message covered both before, and their remedies are OPPOSITES:
+
+   • GATE_TIMEOUT — the executor's Bash cap fired mid-slice. The slice budget
+     is honoured only BETWEEN gates, so this can only mean ONE gate ran past
+     the whole window. More slice budget cannot reach it (see the clamp note
+     above); only splitting or speeding up THAT gate can.
+   • GATE_SLICE — the slice CEILING was exhausted while every slice returned
+     cleanly. This is the aggregate-slow suite, and more gate wall time
+     genuinely does help: the slice budget, the slice ceiling, or a shorter
+     list.
+
+ A third arm covers the remaining UNKNOWN case (an unrecognized terminal
+ outcome, or a "finished"-named outcome over a final resume point): it names
+ NEITHER shape rather than guessing one, because a budget raise recommended
+ on an unestablished shape is exactly the errand this item removed.
+```
+
+## gateInFlightNameCmd(idx) — turn a stopped run's gate ORDINAL into
+<a id="gateinflightnamecmd-idx-turn-a-stopped-run-s-gate-ordinal-into"></a>
+
+```text
+ gateInFlightNameCmd(idx) — turn a stopped run's gate ORDINAL into its NAME
+ (temperloop#1650).
+
+ "Split the gate list" is only actionable if the reader knows WHICH gate to
+ split; an ordinal alone sends them searching. The ordinal space is the
+ PINNED selection (temperloop#1663), and `quality-gates.sh --list-selected`
+ prints exactly that list, in that order, as a dry run — so the name is one
+ filtered `sed -n` away. The gate lines are the ones starting `make ` or
+ `bash `, which is what separates them from the selection banner, the pin
+ notice and the trailing skipped-gate block.
+
+ It runs as ONE machinery call on the escalation path only — never on the hot
+ path, and never inside the slice loop, so the gate's own timing is untouched
+ — and it is FAIL-SOFT in both directions: an unresolved name (an absent
+ script, a refused command, a throw) leaves the payload carrying the ordinal
+ and the `resolve` command line, and the escalation itself is never at risk.
+```
+
+## temperloop#1650 — NAME the gate in flight and the CLAMP, so the
+<a id="temperloop-1650-name-the-gate-in-flight-and-the-clamp-so-the"></a>
+
+```text
+ temperloop#1650 — NAME the gate in flight and the CLAMP, so the remedy is a
+ move the reader can make.
+
+ `inFlightGate` rides the payload as a FACT the escalation carries, the same
+ shape `committed_work` uses: `index` (always, when the ledger establishes
+ one), `gate` (the resolved name, when the selection still resolves),
+ `resolve` (the one command that turns the ordinal into the name by hand) and
+ `sliceLog` (which gates had already finished). `null` when the ledger
+ establishes no index — an honest absence, never a guessed ordinal.
+
+ The GATE_TIMEOUT vs GATE_FAIL split (temperloop#1021) is untouched: this is
+ the UNKNOWN-verdict branch only, the kind stays `acceptance-gate-timeout`,
+ and a RED verdict still escalates `acceptance-gate-failed` exactly as before.
+```
