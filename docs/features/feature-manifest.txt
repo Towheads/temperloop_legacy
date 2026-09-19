@@ -779,3 +779,6 @@ model-comparison workflows/scripts/lib/tests/test_cannot_evaluate.sh
 # B3b-B3e), each carrying a mutation proof, so it ships no separate
 # lib-level test file.
 model-comparison workflows/scripts/lib/spawn-diagnostic.sh
+none claude/workflows/build-level.design-notes*.md
+none workflows/scripts/check-workflow-script-size.sh
+none workflows/scripts/tests/test_workflow_script_size.sh

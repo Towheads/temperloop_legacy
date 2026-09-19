@@ -735,6 +735,24 @@ fi
 # threshold costs exactly one cheap `sleep` executor spawn — the micro-agent cost
 # temperloop#942 exists to keep down. Handed in as `input.reviewAgentSlowSecs`.
 : "${BUILD_REVIEW_AGENT_SLOW_SECS:=300}"
+
+# ── Workflow-script size ceiling (temperloop#2126) ──────────────────────
+# The harness Workflow tool refuses a `scriptPath` whose file exceeds a hard
+# byte limit, and that limit is the harness's, not this repo's — no gate here
+# measured against it, so claude/workflows/build-level.mjs grew to 98.4% of it
+# in PR #2114 and over it in PR #2125, and every command that drives work
+# through the engine (/fix, /sweep, /build) stopped loading. The pipeline could
+# not repair itself, because the repair would have been driven by the engine
+# that no longer loaded.
+#
+# WORKFLOW_SCRIPT_BYTE_CEILING is the harness's hard limit, restated here ONLY
+# so the guard has something to measure against; raise it only if the harness
+# raises it. WORKFLOW_SCRIPT_BUDGET_PCT is the fraction of that ceiling a
+# workflow script may occupy before check-workflow-script-size.sh fails the
+# build — deliberately well under 100 so the gate fires while there is still
+# room to land the fix, rather than after the engine is already unloadable.
+: "${WORKFLOW_SCRIPT_BYTE_CEILING:=524288}"   # harness Workflow-tool scriptPath limit (bytes)
+: "${WORKFLOW_SCRIPT_BUDGET_PCT:=90}"         # % of the ceiling a workflow script may occupy
 # claude/workflows/build-level.mjs §3c worker return contract — WORD BOUNDS on
 # the two free-prose slots of the worker's structured verdict (temperloop#1080).
 #
@@ -1955,6 +1973,7 @@ export BUILD_QUOTA_PAUSE_PCT BUILD_QUOTA_CACHE BUILD_QUOTA_WAIT_BUFFER \
        BUILD_REVIEW_BLOCKING_MAX_ROUNDS BUILD_PR_BODY_MAX_BYTES \
        BUILD_MACHINERY_STEP_CEILING_SECS BUILD_MACHINERY_STEP_SLOW_SECS \
        BUILD_REVIEW_AGENT_CEILING_SECS BUILD_REVIEW_AGENT_SLOW_SECS \
+       WORKFLOW_SCRIPT_BYTE_CEILING WORKFLOW_SCRIPT_BUDGET_PCT \
        PIPELINE_OPERATOR PIPELINE_REQUIRED_CHECK \
        PIPELINE_DRIVE PIPELINE_DRIVE_CAP PIPELINE_DRIVE_MODEL PIPELINE_DRIVE_SETTINGS \
        PIPELINE_DRIVE_MERGE PIPELINE_DRIVE_MERGE_CAP PIPELINE_DRIVE_MERGE_MODEL PIPELINE_DRIVE_MERGE_SETTINGS \
