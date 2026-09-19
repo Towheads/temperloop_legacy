@@ -242,11 +242,26 @@ trap _count_prose_cleanup EXIT
 # Scrub every build.config.sh setting NAME from this process's own environment
 # before invoking the seam (see the header determinism note above — layer 2
 # outranks the layer-3/4 file-pinning below, so an inherited exported setting
-# must be unset here too). A missing/older helper prints nothing -> `unset`
-# with no args is a harmless no-op.
+# must be unset here too).
+#
+# The scrub is BEST-EFFORT hygiene, so its exit status must not reach this
+# script's own (temperloop#2142). The comment that used to sit here claimed "a
+# missing/older helper prints nothing -> `unset` with no args is a harmless
+# no-op"; that premise is FALSE in zsh, where a zero-argument `unset` errors
+# (rc=1), and ANY non-zero `unset` -- e.g. a printed name that collides with a
+# `readonly` parameter -- is non-zero in bash too, which this file's `set -e`
+# would turn into an abort. Not live today: this file carries a bash shebang and
+# the gate invokes it as `bash`. But the byte-identical form in
+# build-level.mjs's emitted gate command DID fabricate an `acceptance-gate-failed`
+# under zsh, so the form is fixed here as well rather than left as a loaded gun
+# for whoever re-hosts or `source`s this. The rule is enforced mechanically for
+# build-level.mjs only (the K2142 guard in test_workflow.sh); the repo-wide lint
+# that would cover this file too is temperloop#2157. `-v` restricts the scrub to
+# variables so bash cannot fall through to a same-named function; `__cp_noop`
+# keeps the argument list non-empty.
 settings_bin="$COUNT_PROSE_ROOT/workflows/scripts/build/build-config-settings.sh"
 # shellcheck disable=SC2046  # intentional word-splitting: unset takes N bare NAME args, one per line from build-config-settings.sh
-unset $(bash "$settings_bin" 2>/dev/null)
+unset -v __cp_noop $(bash "$settings_bin" 2>/dev/null) || :
 
 tier1_target="$scratch/kernel-only.md"
 # The overlay path is never read or existence-checked when

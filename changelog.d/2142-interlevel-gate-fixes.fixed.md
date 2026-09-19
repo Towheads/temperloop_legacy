@@ -8,9 +8,18 @@
   no-op in bash but an error in zsh, which is the shell the pipeline's command
   runner uses on macOS. That error aborted the rest of the chained command, so
   the gate never executed at all; the pipeline then read the missing result as
-  a failed gate and stopped the branch as broken. The command now always passes
-  one placeholder name, which is a no-op in both shells, so an absent or older
-  helper once again just means "nothing to clear".
+  a failed gate and stopped the branch as broken. Clearing that configuration is
+  best-effort tidying, so its failure should never have been able to stop the
+  gate at all — and an absent helper was only one of three ways it could fail.
+  The command now always passes a placeholder name so the list is never empty,
+  ignores anything the helper prints that is not a valid setting name, checks in
+  a throwaway shell whether the clearing would fail before doing it for real,
+  and finally disregards its result either way. Whatever goes wrong with the
+  tidying now, the gate still runs and reports what it actually found. The two
+  other places in this repo that clear configuration the same way
+  (`workflows/scripts/count-prose.sh` and the build-config settings test) were
+  carrying the same assumption in a comment that said it was safe; they now
+  carry the corrected form and the corrected comment.
 
 - **The log line for a passed acceptance gate now names a stable slice cap**
   (temperloop#2133). It printed a single `cap N` figure that was whatever
