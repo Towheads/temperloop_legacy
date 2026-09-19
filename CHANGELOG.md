@@ -14,6 +14,8 @@ reads that marker; a stranger greps for it before pulling.
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-09-19
+
 **New-work dual-build harness (epic #2065) — minor, additive.** `/build
 --dual-build <tier>=<candidate>` can now build every in-scope item of a
 level under two models at once, judge each item pairwise, and ship the
@@ -32,6 +34,848 @@ thread connecting them for a reader who was not following the epic item by
 item. See [`docs/features/model-comparison.md`](docs/features/model-comparison.md)
 for the full mechanism, and ADRs 0038–0041 for the architectural calls this
 harness made along the way.
+
+### Added
+
+- **`model-comparison/render.sh` — a decision-first Markdown rendering of the
+  comparison report** (#2058, epic #1225). The report producer's JSON was the
+  harness's only human surface: both validation runs (#1262, #1656) were read
+  by hand through `jq`. `render.sh` lays that same object out for a reader —
+  the verdict and the winner (or exactly why no winner is named: the sample
+  floor, an order-confounded quality comparison, or no significant difference)
+  in the first lines, one at-a-glance table across quality, cost, gates,
+  rework, compatibility and duration, the honesty block (floor, intervals,
+  minimum detectable effect, order effect, corpus window, gate versions, cost
+  basis, emit coverage), and a "what would change this verdict" list. It
+  derives no statistic and reads the `winner` key as minted, never inferring
+  one from a verdict string or an interval — proved by mutation in
+  `tests/test_render.sh`. A withheld figure renders `n/a` with its reason,
+  never 0. Fail-closed like its siblings: a `skipped --` producer line, an
+  absent/empty/unreadable/non-JSON input, or an unknown `schema_version` is
+  CANNOT EVALUATE (rc 2) with no Markdown written. `--summary-out` writes a
+  small `model-comparison-summary-v1` sidecar for the /telemetry surfacing
+  item (#2061). `batch.sh run` now ends by printing the render command for the
+  arms it just wrote. Inert per ADR 0027: nothing runs it for you.
+
+- **Four Proposed ADRs for the new-work dual-build harness** (#2065). The
+  harness scores a candidate model on work it has not seen, by building each
+  in-scope plan item twice and picking a winner — and four of its calls are
+  load-bearing enough to record before any of it is built. ADR 0038 fixes the
+  unit of judgement and the unit of choice at different levels: the judge runs
+  per item, but the pick is made per level behind a barrier, so a level never
+  ships a mixed-model set whose parts were never built against each other. ADR
+  0039 gives the ledger its own folder under
+  `.temperloop/model-comparison/dual-build/` with a versioned row schema and a
+  patch archive, rather than piggybacking the resume ledger, so a comparison's
+  records outlive the run that wrote them and stay joinable later. ADR 0040
+  adds `Model-comparison-arms:` as a **second** trailer line beside an
+  unchanged `Model-provenance:`, never a widened one, so the existing anchored
+  disclosure check keeps matching byte-for-byte. ADR 0041 admits only blind
+  pairs into judge calibration — an operator override is excluded from the
+  sample precisely because it is not blind — and holds the verdict at NEVER
+  CALIBRATED until the bar is met, rather than reporting a number the sample
+  cannot support. All four ship Proposed; the feature-doc item flips them to
+  Accepted when the harness lands.
+
+- **`model-comparison/judge.sh` gains a `pairwise` mode — a head-to-head
+  preference between two candidate diffs for the same item, instead of two
+  separate absolute scores** (#2065, epic #2065 "dual-build"). Given two
+  already-executed records for the same item, it sends ONE prompt — the
+  item's title, scope, acceptance criteria, and both diffs — to the judge
+  model TWICE, once with each candidate shown first, and reports
+  `{preference, margin, order_agreement}`: a preference the two orders agree
+  on (regardless of which candidate was shown first) is reported honestly,
+  including a genuine tie; a preference that only tracks which candidate was
+  shown FIRST resolves to a tie with `order_agreement:false` and `margin:0`,
+  rather than a confident-looking number driven by screen position. The
+  existing judge-equals-candidate guard now checks BOTH candidates — an exact
+  provider+model match with either one refuses the whole comparison before
+  any call is made. A same-item precondition (matching `issue`/`pr` ref plus
+  `title`/`scope`/`acceptance`) also refuses, before any spend, if the two
+  records describe different items — the two orders must differ ONLY in
+  candidate position. A `tie` reply is only accepted with `margin:0`; an
+  off-contract non-zero-margin tie UNAVAILABLEs that order rather than
+  averaging into a fabricated confidence figure. Inert per ADR 0027: nothing
+  calls this mode for you yet.
+
+- **`stats.sh` gained an `exact-binom` subcommand** — a two-sided exact
+  (Clopper-Pearson) confidence interval for a win proportion `k`/`n` against
+  a fixed null of 0.5 (a fair-coin sign test), computed by inverting the
+  binomial CDF directly rather than a normal approximation or a bootstrap
+  resample, so it stays valid at small sample sizes. It shares the same
+  minimum-sample floor as `bootstrap-ci`/`verdict`
+  (`MODEL_COMPARISON_MIN_SAMPLE_N`): below the floor it reports
+  `below_min_sample: true` with no interval, rather than a hard error.
+
+- **`/build`'s per-item worker now carries a cost ledger** — every parked
+  record (single-arm and dual-build alike) gains `tokens_in`, `tokens_out`,
+  `wall_clock_ms`, `retry_tokens`, `retry_count` and `recovery`, captured at a
+  new emitted-shell seam (`workflows/scripts/build/worker-usage.sh`). The seam
+  exists because `/build` spawns its workers through the coding harness's own
+  built-in subagent call rather than the `claude -p` command line, and that
+  call returns neither a timer nor a token-usage envelope to read. The same seam makes the `/build` (and `/sweep`/`/fix`, which share
+  the same worker code path) implementation worker a FOURTH emitting seat,
+  `build-worker`, in the model-usage attribution stream — joining the
+  `report-producers/model-comparison` coverage denominator
+  (`MODEL_COMPARISON_EMIT_FEASIBLE_SEATS`, now 4) as attribution-only (no captured
+  envelope exists for such a spawn, so its own records honestly read
+  `usage_source: "unavailable"` rather than carrying a fabricated token count) (#2065).
+
+- **`reconcile.sh` gains a `--claims` lens that clears a dead session's claim
+  stamp, so a stranded board item becomes claimable again** (#2069). When an
+  item is In Progress and its `fnd:host/session:*` stamp names a session on
+  the same host that is provably dead — its Claude Code transcript is absent,
+  or untouched for longer than `RECONCILE_STALE_AFTER_SECS` — that one label
+  is now the only thing removed. The `fnd:status:*` label is left
+  byte-identical, the issue is never closed, and its status is never moved
+  back to Ready, so an epic that is genuinely still in flight keeps reading
+  that way. Previously nothing cleared such a stamp while the item stayed
+  open and In Progress, and `workflows/scripts/board/claim.sh` refuses a claim
+  another session owns — so the item could not be picked up again by anyone.
+  `workflows/scripts/board/reconcile.sh --board <N> --claims` reports the
+  candidates with how long each has been stale and writes nothing; `--apply`
+  performs the strips; `--unattended` implies `--apply` and records what it
+  cleared to the pending-decisions note. A stamp on another host is never
+  stripped — that session's liveness cannot be checked from here — and a live
+  session's own claim is never touched. An item an **open PR** would close is
+  reported rather than stripped: its work is already delivered and its claim is
+  held until the merge cascade clears it, so clearing the stamp early would let
+  a later claim silently overwrite the owner. If the open-PR read errors, or
+  its result cannot be established, every candidate is reported and nothing is
+  stripped — and an `--unattended` run records how many candidates that
+  covered to the pending-decisions note, as its own number, separate from the
+  count it held back for an open PR, even when it cleared nothing. A failing
+  open-PR read is therefore visible at the next check-in as a count that keeps
+  recurring, instead of only in one night's output while the sweep quietly
+  stops clearing anything. `claude/commands/tidy.md` runs the sweep on its
+  nightly pass.
+
+- **Eight new `DUAL_BUILD_*` settings in `workflows/scripts/build/build.config.sh`**
+  (#2071, epic #2065 "new-work dual-build harness"), ahead of the
+  `--dual-build` flag itself: `DUAL_BUILD_BASELINE_MODEL` /
+  `DUAL_BUILD_CANDIDATE_MODEL` name the two models a dual-built level compares
+  (literal defaults, never inherited from `$HOME` or the invoking session, so
+  a run's disclosed models stay fixed regardless of environment);
+  `DUAL_BUILD_MIN_INSCOPE_ITEMS` floors how small a level may be before the
+  harness declines to double-build it; `DUAL_BUILD_ARCHIVE_RETENTION_DAYS`
+  bounds how long a dual-build ledger row and its patch archive are kept;
+  `DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT` sets the tied/unjudged/infra rate
+  above which the comparison report withholds a verdict;
+  `DUAL_BUILD_CALIBRATE_PAIRS_PER_LEVEL` sets how many pairs the blind
+  calibration mode samples per level; `DUAL_BUILD_CALIBRATION_BAR_PCT` /
+  `DUAL_BUILD_CALIBRATION_BAR_N` set the judge-human agreement bar a report
+  must clear before naming a winner. All eight are registered in
+  `workflows/scripts/config/setting-registry.tsv`. `/build`'s behavior is
+  unchanged by this entry alone — nothing reads these settings yet.
+- **`PROSE_BUDGET_TIER2_FILE_CAP` raised 1201 → 1261** (#2071, epic #2065),
+  ahead of two later items that add prose to `claude/commands/build.md` for
+  the dual-build harness — `build.md` was already at the cap with zero
+  headroom, so this raise ships as its own change rather than a mid-build
+  config edit.
+
+- **`model-comparison/dual-build-ledger.sh` — an append-only ledger and
+  per-arm patch archive for the dual-build harness** (#2072, epic #2065). The
+  harness runs the same work item under two models and needs a durable
+  record of what happened to each arm; this is that record. `append` writes
+  one JSON row per item per arm (model, base/head commit, gate result, cost,
+  judge verdict, the level pick, and a monotonic `seq`) to
+  `.temperloop/model-comparison/dual-build/rows.jsonl`, rejecting a row
+  missing a required field or carrying an unrecognised `arm`/`gate`/
+  `guard_armed`/`loss_reason` value rather than writing something a later
+  reader can't trust; `seq` and `schema_version` are always assigned by the
+  script itself, never taken from the caller. `read` reports "records
+  missing" and exits non-zero on a truncated or gapped ledger instead of
+  silently returning a partial result, and also accepts `--expect N` for a
+  caller's own count check. `archive` saves a `git format-patch` per
+  (item, arm) under `archives/<slug>@<arm>.patch`; `archive-check` proves a
+  saved patch would still apply — via a real `git am` against a disposable
+  clone of the repo, never the repo working copy itself — before anything
+  relying on it deletes the losing arm's branch. `purge` removes the whole
+  ledger folder (dry-run unless `--yes`); `prune` removes only archives
+  older than the configured retention window (dry-run unless `--apply`).
+  Both the ledger folder and the archives already live under the
+  git-ignored `.temperloop/model-comparison/` tree, so nothing here is
+  ever committed.
+
+- **`worktree.sh create` gained an optional `--arm <name>[:<sibling>]` flag** (temperloop#2076, epic #2065). Given an arm, `create` disambiguates the deterministic worktree/branch pair with `@<arm>` — `<repo-root>.wt/<slug>@<arm>` / `build/<slug>@<arm>` — so two arms of the same slug can be created, live and pruned side by side without colliding, and drops a `.dual-build-arm` marker (`{arm, sibling_worktree, sibling_branch}`) recording the declared sibling pair. Omitting `--arm` is unchanged: the plain `<repo-root>.wt/<slug>` / `build/<slug>` path, and the `CREATED` line's shape, are byte-identical to before this flag existed.
+
+- **New `PreToolUse` guard `claude/hooks/arm-read-guard.sh` enforces dual-build
+  arm read isolation** (#2077). When a worktree carries a `.dual-build-arm`
+  marker — written only while the dual-build harness is building one item under
+  two models — a `Read`, `Glob`, `Grep` or `Bash` call that reaches the sibling
+  arm's worktree path or branch is **denied**, and the attempt is recorded in
+  `.dual-build-cross-read-attempts.jsonl` beside the marker, so a blocked
+  attempt leaves a trace instead of looking like a clean run. (The harness that
+  writes the marker and reads that trace lands with epic #2065; until then the
+  file beside the marker is the whole record.) Without that marker the hook has
+  no effect at all, and any internal error fails open, so a session that is not
+  an arm of a dual build is never affected. Registering it is opt-in: add it to
+  your own Claude Code settings under the `Read|Glob|Grep|Bash` matcher. This is
+  the one hook the model-comparison module ships — see the amendment to
+  `docs/adr/0027-model-comparison-ships-as-an-inert-opt-in-module.md`.
+
+- **`model-comparison/tagging.sh` gains a `stamp-arms`/`parse-arms`
+  subcommand pair — the `Model-comparison-arms:` PR trailer for the
+  dual-build harness** (#2078, epic #2065). `tagging.sh stamp-arms
+  --baseline <model> --candidate <model> --pick <baseline|candidate>
+  --reason <text>` prints a line naming both models a winning dual-built PR
+  was built under, which one won, and a one-line pick reason; `tagging.sh
+  parse-arms --pr-body <file>` reads it back. The new line rides alongside —
+  never in place of — the existing `Model-provenance:` trailer, so every
+  existing single-model consumer keeps parsing exactly what it always has.
+  `stamp-arms` has no side effects of its own (no window record, no
+  telemetry tag); the dual-build ledger is a separate, later piece of the
+  harness.
+
+- **`workflows/scripts/build/dual-build-preflight.sh`** (#2079, epic #2065
+  "new-work dual-build harness"), the orchestrator-side spend gate a future
+  `/build --dual-build <tier>=<candidate>` will consult before a level ever
+  spawns a second arm. Resolves the level's items whose plan `model:` stamp
+  matches the named tier, projects 2x-worker + judge spend against the
+  replay harness's own shared `REPLAY_PREFLIGHT_CEILING_TOKENS` (never a
+  second, dual-build-specific ceiling), declines a level with fewer
+  in-scope items than `DUAL_BUILD_MIN_INSCOPE_ITEMS`, and refuses by name
+  when the candidate's provider has no usable credential per
+  `candidate-session.sh`'s own `preflight` (the one host-supply seam).
+  Emits the `dualBuild` workflow-input JSON (`{tier,baseline,candidate,
+  inScope}`) plus a cumulative-spend line only when none of that refuses.
+  Nothing invokes this script yet — `/build`'s own `--dual-build` flag
+  (#2081) is a later item in the same epic — so this entry ships inert,
+  dormant machinery with its own hermetic fixture suite
+  (`workflows/scripts/build/tests/test_dual_build_preflight.sh`).
+
+- **`/build` gained a `--dual-build <tier>=<candidate>` flag** (temperloop#2081,
+  epic #2065 "new-work dual-build harness"). Given the flag, every plan item
+  whose declared model tier matches `<tier>` is built **twice** inside its
+  dependency level — once on that tier's current baseline model, once on the
+  candidate model under test — so the two can be compared on work the repo was
+  going to do anyway, rather than on already-closed work. The flag is
+  **per-invocation and the only thing that arms the harness**: no setting,
+  environment variable, plan-note field or previous run can turn it on, so a
+  `/build` without it behaves exactly as it did before. Two settings supply
+  defaults only — the baseline arm's model, and the candidate's when the
+  `=<candidate>` half is left off — and both are fixed literals in the repo's
+  own tracked config rather than values inherited from the operator's home
+  directory or from whatever model the calling session happens to be running,
+  because each arm's model has to stay fixed and disclosed for a whole level.
+  Before anything is built, a new **Step 1.9** projects the spend for every
+  level through `dual-build-preflight.sh`, prints by name any level that
+  pre-flight declines (too few in-scope items, no usable credential for the
+  candidate's provider, or a projected spend over the shared ceiling) and
+  builds those single-arm, then asks the operator for consent **once** for the
+  whole run. That consent has no safe default and is never timed: with no
+  operator present the question is posted and the run parks rather than
+  doubling anyone's spend on a timeout. Step 1.9 also states the refusal for a
+  half-finished comparison — a `/build` resumed **without** the flag over a
+  level whose two arms were both left live stops and says so, instead of
+  finishing single-arm and thereby picking a side nobody chose. This entry is
+  the command specification only: the flag's consented output is handed to the
+  build engine as a `dualBuild` input, and the engine that actually builds two
+  arms, judges them and picks a winner lands with later items in the same epic
+  — so on today's engine the hand-off is inert and reports itself as such.
+
+- **`model-comparison/dual-build-ledger.sh` gains a blind judge-calibration
+  mode** (#2082, epic #2065, ADR 0041). `calibrate-sample` picks up to
+  `DUAL_BUILD_CALIBRATE_PAIRS_PER_LEVEL` already-judged, fully-archived item
+  pairs and prints each as `{slug, baseline_diff, candidate_diff}` — the
+  judge's own preference and margin are never included, so a human can
+  record a genuinely blind preference. `calibrate-record` looks up that
+  slug's real judge verdict itself (a caller can never fake agreement) and
+  appends a labelled pair; `--source override` records an operator-override
+  pair but excludes it from the agreement statistic, per ADR 0041's
+  "disagreement by construction" reasoning. `calibrate-status` (also run
+  automatically after every `calibrate-record`) writes the pinned
+  `calibration.json` — `{n, agreement_pct, status, bar_pct, bar_n}` — where
+  zero recorded pairs reads `"NEVER CALIBRATED"` and the bar values are
+  sourced from `DUAL_BUILD_CALIBRATION_BAR_PCT`/`_BAR_N`.
+
+- **A `/build` run comparing two models now picks a winner for the level and ships
+  it** (#2083). Until now a `--dual-build` level built every in-scope item twice,
+  judged the two results and stopped there — nothing decided which of the two
+  builds actually became a pull request. `/build` now scores the level by a rule
+  fixed before the run starts (an arm that produced no green branch loses that
+  item; a judged tie counts for neither; an overall tie goes to the arm that cost
+  less), opens pull requests from the winning side only, and archives the losing
+  branches — deleting one only after proving its saved patch still applies. Each
+  winning pull request gets the `Model-comparison-arms:` disclosure line, and a
+  pull request that could not be stamped with it is held back from merging rather
+  than shipped without the disclosure.
+- **The winner is not merged on your behalf until the judge has been checked
+  against a human** (#2083). While `.temperloop/model-comparison/dual-build/calibration.json`
+  reports anything other than `calibrated`, `/build` stops the level and asks
+  before any pull request is opened — with no default and no timeout, so an
+  unattended run parks instead of proceeding. Once the judge is calibrated the
+  same question becomes optional: you can still override the pick for the whole
+  level, or for one item at a time, and an item-level override is recorded as a
+  human preference the calibration record keeps.
+
+- **A cumulative dual-build report producer, wired into `temperloop report`
+  by default** (#2084, epic #2065, ADR 0038/0041). `workflows/scripts/
+  report-producers/dual-build` rolls the dual-build ledger's per-item,
+  per-arm rows into a per-tier block: a candidate item-win rate with an
+  exact binomial interval (never a bootstrap), the level-pick tally (which
+  arm's code actually shipped, override-inclusive — a distinct number from
+  the override-blind win rate), whole-job cost per arm, the override rate,
+  and the judge's own calibration status. Unresolved items (tied, unjudged,
+  infra, or both-gates-failed) are excluded from the win-rate numerator and
+  denominator and counted in an honesty block alongside the tier scope,
+  single-host scope, and a not-in-scope count (unavailable from the ledger
+  alone, reported as such rather than fabricated). A verdict is printed only
+  once the judge is `calibrated` *and* the sample clears
+  `MODEL_COMPARISON_MIN_SAMPLE_N` *and* the unresolved rate stays under
+  `DUAL_BUILD_UNRESOLVED_THRESHOLD_PCT` — otherwise it prints `"below floor
+  - keep accumulating"` or `"judge uncalibrated - verdict withheld"` rather
+  than a number it cannot support. Unlike the model-comparison module's own
+  inert shim (ADR 0027), this producer's `.temperloop/report.d/dual-build`
+  locator shim IS wired unconditionally by `temperloop init`, the same
+  treatment as the `tokens` shim — zero standing cost, since an empty ledger
+  degrades to one `skipped -- ` line.
+
+- **`docs-reviewer` now states what makes a finding HIGH, and register/
+  shorthand findings can no longer be graded HIGH** (#2136). The agent
+  previously carried zero severity criteria, so grading was effectively a
+  coin flip per review pass — the same shorthand/reference-token rule
+  landed as a blocking HIGH on some PRs and an advisory MEDIUM on others.
+  `claude/agents/docs-reviewer.md` now defines HIGH as a factual error a
+  stranger would act on (a wrong issue number, a claim the code
+  contradicts, a broken invariant statement), and fixes register/shorthand/
+  first-mention-hook/reference-token findings at MEDIUM by construction.
+- **A new mechanical lint catches the register defects `changelog.d/`
+  fragments kept losing to a one-round-late review finding** (#2136).
+  `workflows/scripts/config/check-changelog-fragment-register.sh`, wired
+  into `scripts/quality-gates.sh`, backing `checks` in
+  `.github/workflows/ci.yml`, fails a fragment whose first issue mention
+  has no bold title hook, that carries an unexpanded cross-repo issue
+  shorthand — a single letter plus a number standing in for a whole
+  repository, `K1451` for temperloop issue 1451 and `S658` for stageFind
+  issue 658, with the same shape for three sibling repositories; the family
+  is defined in `claude/CLAUDE.kernel.md` § Communication conventions — or
+  that names one of two internal-jargon phrases `docs-reviewer` itself
+  lists as unexplained-shorthand examples. Deliberately narrower than
+  `changelog.d/README.md`'s full register rule — see the checker's own
+  header for why its step-letter/section-index pattern (a numbered build
+  step, a section-symbol reference) stays a `docs-reviewer` judgment call
+  instead of a mechanical ban.
+
+### Changed
+
+- **The issue-touches raw-lake directory now has a single owner** (#1902). Both
+  writers of that stream — `workflows/scripts/board/capture.sh` and
+  `workflows/scripts/emit-issue-touch.sh` — used to derive
+  `<checkout>/meta/data/raw` independently (a git-toplevel resolution in one, a
+  fixed `../..` hop in the other), so a fix to one silently left the other
+  behind. Both now consume `raw_lake_dir()` from the new
+  `workflows/scripts/board/lib/raw_lake.sh`, which resolves the git toplevel of
+  its own resolved location; `claim.sh`'s `CLAIMS_RAW_DIR_DEFAULT` consumes it
+  too. The `ISSUE_TOUCHES_RAW_DIR` / `CLAIMS_RAW_DIR` override env vars and the
+  resolved default path are unchanged.
+- **`ISSUE_TOUCHES_RAW_DIR` is honored even where the shared resolver is
+  absent** (#1902). `emit-issue-touch.sh` now consults the override *before* it
+  looks for `board/lib/raw_lake.sh`, so a caller that names the sink outright no
+  longer needs the `board/lib/` subtree present; only the default path reaches
+  for the shared owner. Both symlink-resolution loops (the writer's and
+  `raw_lake_dir()`'s own) are bounded, so a symlink cycle cannot spin them.
+- **`raw_lake_dir()` now resolves its own symlink and reads no bare `$HOME`**
+  (#1902). A copy reached through a symlink reports its SOURCE checkout's lake
+  rather than the link's, and the outside-any-git-checkout fallback yields the
+  whole `${HOME:-}/dev/foundation/meta/data/raw` under a `set -euo pipefail`
+  caller with `HOME` unset, instead of a truncated `/meta/data/raw`.
+
+- **A gate-registration-only `scripts/quality-gates.sh` diff no longer escalates
+  a scoped run to the full gate suite** (#1933). That file sits on
+  `gate-paths.tsv`'s `ALL` row, so adding one gate line ran all ~110 suites.
+  When the diff removes nothing and its added lines are exclusively gate
+  registrations (comments and blanks may ride along), the selector now declines
+  the `ALL` escalation **for that one path** and selects the registry validators
+  a registration must satisfy — `check-gate-paths.sh` and its test, the
+  check-surface degenerate-coverage pair, the exec-bit pair,
+  `check-setting-registry.sh`, `validate-feature-docs.sh` and the kernel-manifest
+  check — plus the newly registered gate **by name**, so a new gate runs on the
+  PR that adds it. Both registration sites count: `<NAME>_GATES+=("<literal>")`
+  and a bare `"<literal>"` element of the `KERNEL_GATES=( … )` array literal. In
+  either shape the literal must name a gate the run's own list already carries,
+  which is what keeps a `SKIPPED_KERNEL_GATES` skip-disclosure line from reading
+  as a registration; the bare-element shape must additionally sit *positionally*
+  inside a `<NAME>_GATES=( … )` literal, so an addition to the serial-lane pin
+  list or the slow-dispatch hints — also bare quoted gate command lines that are
+  in the run set, but concurrency decisions rather than registrations — keeps the
+  full escalation and its parallel-scheduler gate. Every other edit to that
+  file keeps the full escalation, as does a diff the probe cannot read; the
+  run's reason line names the exception whenever it is taken. The probe
+  resolves its own diff base when the caller supplies none, so the exception
+  holds on every slice of a sliced `--scoped` run rather than only the first,
+  and it pins its own diff format so a
+  `diff.mnemonicPrefix` / `diff.noprefix` / `diff.external` / `textconv` git
+  config cannot silently disable it.
+
+- **The dual-build harness's feature doc, changelog narrative and ADRs now
+  describe what actually shipped** (#2065). `docs/features/model-comparison.md`'s
+  five required sections gained the harness's mechanism as merged on
+  `main` — the level barrier, arm worktree/branch naming and read isolation,
+  the pairwise judge, the dual-build ledger and patch archive, the level pick
+  and its two operator levers, blind judge calibration, the reviewer contract
+  for the `Model-comparison-arms:` trailer, and the per-engagement
+  resource/disclosure caveat — rather than the design brief's proposed shape.
+  `VERSIONING.md` gained a contract-surface row for the dual-build ledger's
+  versioned row schema, and ADRs 0038–0041 flipped from `Proposed` to
+  `Accepted` now that the harness they describe is live. Docs-only; no
+  behavior changed.
+
+- **`/build`'s pre-push review rules are now readable** (#2070). The pre-push
+  review step in `claude/commands/build.md` was a single 1,256-word paragraph on
+  one source line. It is now split into named sub-sections — which reviewers a
+  change routes to, how an unavailable reviewer is probed and reported, what a
+  finding has to be before it blocks the push, and where the step runs plus the
+  wall-clock ceiling it runs under — with the incident history behind those rules
+  collected into a section of its own, so the rule reads without the archaeology.
+  No rule changed: the behaviour the spec describes is identical.
+
+- **A dual-build pull request held back for a missing disclosure line now stays
+  held across a crash or a resume** (#2083). The hold lived only in the memory of
+  the run that worked out the level, so a `/build` that died — or was simply
+  re-run later against the same plan — saw an ordinary parked item with an
+  ordinary open pull request and merged it without the
+  `Model-comparison-arms:` line. The hold is now written onto the plan note
+  itself as a `merge_blocked:` field: `plan.sh writeback` gains
+  `--merge-blocked <value>` to record it and `--clear-merge-blocked` to lift it,
+  carries an existing hold through every later write that does not mention it,
+  and `plan.sh roster --stage gate` reports a held item as
+  `MERGE BLOCKED (<value>) — held out of the merge set` instead of counting it
+  among the pull requests up for merge.
+
+- **`/assess` Step 3's review-subagent pass is now bounded by a wall clock**
+  (#866). The pass spawned `requirements-auditor` and the conditional
+  `architecture-reviewer` with no time or cost bound: its graceful skip covered
+  an *unavailable* agent but never a *non-terminating* one, so a reviewer that
+  was probed `installed`, spawned, and kept working was invisible by
+  construction. Observed on `/assess --epic 856`, `architecture-reviewer`
+  returned in 336s while `requirements-auditor` ran past three hours before the
+  operator killed it by hand — and on an unattended run nobody is there to do
+  that, so `/assess` never reached Step 4 to write the plan note at all.
+  Reviewers now spawn concurrently in the background and the whole fanout waits
+  under one ceiling, `ASSESS_REVIEW_AGENT_CEILING_SECS`, with a progress notice
+  first at `ASSESS_REVIEW_AGENT_SLOW_SECS`. A reviewer still unreturned at the
+  ceiling is abandoned, the pass continues to Step 3.5 with whatever did return,
+  and each abandoned reviewer emits the kernel's ceiling-timeout degradation
+  notice (`skipped — <agent> timed out after <actual>s`) into the run and the
+  Step 5 summary — so an incomplete review can never read as a clean one. Both
+  settings are new, defaulted in `workflows/scripts/build/build.config.sh` and
+  registered in `workflows/scripts/config/setting-registry.tsv`; they are
+  deliberately separate from `/build` §3e's `BUILD_REVIEW_AGENT_*` pair, which
+  rides a `build-level.mjs` input seam `/assess` never touches and carries a
+  mandatory-reviewer escalation arm Step 3 has no analogue for.
+
+- **`/assess` now stamps `model: opus` on small and medium code items, not
+  `model: sonnet`**, and `claude/plan-schema.md` § Optional `model:` field
+  accepts `opus` as a value. The stamp rested on the premise that CI and the
+  acceptance gate would catch a cheaper worker's mistakes. A retrospective
+  over every workflow-driven item built between 2026-08-14 and 2026-09-16
+  measured the opposite: sonnet-built items needed about twice the
+  review-and-fix passes and twice the subagent tokens of opus-built items
+  before they merged, and the defects were caught by the advisory reviewers
+  rather than by any mechanical gate. Existing plan notes with `model: sonnet`
+  still run unchanged; only the default `/assess` writes has moved. Operators
+  who want the cheaper tier for a deliberate comparison can still set it per
+  item, or run `/build --dual-build` to measure both.
+
+### Fixed
+
+- **A hard-killed test run no longer strands its sandbox in `$TMPDIR`**
+  (#1667). `sandbox_up` now reaps orphaned sandbox roots itself — once per
+  shell, before it creates its own — instead of leaving that to an operator
+  who remembers to run `sandbox-sweep.sh`. SIGKILL runs no handler, so the
+  existing `trap cleanup EXIT` is structurally incapable of covering a killed
+  run: 97 orphans and 84GB accumulated in one week, each a full `file://`
+  clone plus a complete install tree. Reclaiming stays safe against a
+  concurrent peer — a root is removed only if it carries `sandbox_up`'s marker
+  or directory signature, is older than `SANDBOX_REAP_AGE_MIN` minutes
+  (default 120), and records no live pid; never by wildcard. `SANDBOX_REAP=0`
+  disables the automatic reap, and `SANDBOX_KEEP` suppresses it too.
+  `sandbox-sweep.sh` gains `--quiet` (no banner, no per-root lines, no `du`
+  accounting; one stderr line only when something was removed) and a `SCOPES`
+  header block naming what it covers — `$TMPDIR`, one level deep — and what it
+  does not: `~/.claude/jobs/*/tmp/` is a different location with a different
+  producer, tracked by #1111 (build worker scratch never reclaimed) and not
+  fixed here.
+
+- **Diff-scoped gate selection now sees both sides of a rename** (#1695).
+  `workflows/scripts/lib/gate-selection.sh` resolves every changed-set diff
+  with `--no-renames`, so a file moved *out* of a gated tree lists its source
+  path as well as its destination and that tree's gates are pulled back into
+  the run. Previously git's default rename detection reported only the
+  destination, and a scoped `pull_request` (or local `--scoped`) run was
+  narrower than its own diff — a latency gap rather than a hole in what gates
+  `main`, since the unscoped merge_group run still caught it.
+
+- **The acceptance gate's environment scrub now also covers settings that
+  `workflows/scripts/build/build.config.sh` exports without declaring**
+  (#1709). `workflows/scripts/build/build-config-settings.sh` prints the
+  setting names the build pipeline `unset`s before running
+  `scripts/quality-gates.sh` against a worker's worktree, so that suite runs
+  at tracked defaults rather than inheriting the driving session's exported
+  settings. It previously parsed only `: "${NAME:=default}"` declarations, so
+  a name the config file exports but deliberately never declares matched
+  nothing and survived the scrub, leaking the operator's live environment into
+  the gate — `KNOWLEDGE_STORE_ROOT`, which points at the operator's real
+  knowledge store, was the live instance. The helper now emits the union of
+  the declared names and the names in the config file's top-level `export`
+  statements, following multi-line backslash continuations, deduplicated and
+  sorted. Every name it emitted before is still emitted.
+
+- **The `/build` worker hand-off no longer fails silently toward a plausible
+  value.** Five defects in the workflow that drives one dependency level of a
+  build (`claude/workflows/build-level.mjs`), all one class: a hand-off point
+  that degrades to a believable answer instead of admitting it does not know.
+  - **A finished item is no longer discarded because its closing report could
+    not be read** (#1805, an unreadable worker report aborted the pull request).
+    When the report a worker returns at the end of its task was unparseable,
+    opening the pull request was refused and the whole item was recorded as a
+    failed build — even with a clean commit on the branch and a full
+    verification write-up already on disk. The pull request is now re-opened
+    from the commit's own title plus that write-up, and when even that cannot
+    land, the failure report states whether any work exists (the commit, the
+    uncommitted files, whether the write-up is present), so "nothing was built"
+    reads differently from "it was built and the reporting broke".
+  - **A worker that starts its quality-gate run in the background is now
+    visible** (#865, a backgrounded gate was indistinguishable from a slow one).
+    Each worker is handed one exact gate command that always leaves a small
+    result file behind — a status file it writes when the run starts and
+    rewrites with the exit code when the run ends — and is told to poll that
+    file rather than a process id, which a sub-task cannot wait on. The driver
+    reads that same file after the worker hands back, so a run still marked as
+    in progress produces a named notice instead of looking like a gate that is
+    merely taking a long time. That command now refuses outright rather than
+    starting the gate somewhere it should not: if the worker's own directory has
+    gone, if the shell running it has no `pipefail`, or if the repository has no
+    gate script at all, it stops before writing any result file and exits with a
+    named reason. Previously a directory that had gone missing was stepped over
+    and the gate ran wherever the shell happened to be — a failing suite in the
+    wrong repository, recorded as a pass; and a repository with no gate script
+    wrote a finished result with a non-zero code, which the worker was told to
+    report as a gate failure.
+  - **An item whose text contains a single quote no longer breaks the command
+    built from it** (#1806, the nested-quote idiom was refused at parse time).
+    Such a value is now wrapped in double quotes instead of the nested `'\''`
+    idiom, whose nesting the shell that runs the composed command rejected
+    before it ran anything at all.
+  - **A gate run's wall-clock time is reported honestly** (#1698, a passing gate
+    was logged as taking no time). Two spellings of the same duration field
+    meant a gate whose own log said it passed in 215s could be recorded as `0s`,
+    which silently blinded the one signal that exists to make a growing test
+    suite visible *before* it runs out of budget. The two spellings are now
+    reconciled once, where the result enters the workflow; a figure that is
+    genuinely unreadable renders as `?` and says so, rather than reporting a
+    plausible zero.
+  - **Plan items are accepted under the spellings `claude/plan-schema.md`
+    documents** (#1700, the documented `gh_issue:` key was dropped in silence).
+    `gh_issue:`, `also_closes:` and `depends-on:` used to be read by nothing, so
+    an item written the documented way lost its issue link without a word: no
+    `Closes` line in the pull request, which then merged green and left the
+    issue open. Any item field the workflow does not read is now named in the
+    run log, which catches the next such key rather than only these three.
+
+- **`doctor` no longer reports every managed symlink as `DRIFT` when `$HOME`
+  resolves through a symlink** (#1909). A clean install into a scratch home on
+  macOS — where `/var` and `/tmp` are themselves symlinks, so a `mktemp -d`
+  home always resolves — was followed by `workflows/scripts/install/doctor.sh`
+  calling all 24 links drifted, even though every link pointed at exactly the
+  right file. It was comparing the link's target as a *string* against the
+  expected source path, so two correct spellings of the same file disagreed. It
+  now compares whether the two paths are the same file on disk, which is the
+  question the `DRIFT` verdict was always asking. A link pointing at a
+  genuinely different file is still `DRIFT`, and a broken link is still
+  `DANGLING` — the check got more accurate, not more permissive.
+
+- **`project-agents.sh` now prunes the managed links whose source file is
+  gone, on every deploy** (#1943). Deleting a `claude/agents/` or
+  `claude/commands/` source file used to leave its deployed symlink behind in
+  the project-scoped `.claude/` tree, dangling — and invisible, because the
+  installer gitignores the very directory it writes into, so `git status`
+  never showed it and `doctor` looked only at `$HOME/.claude`. A dangling
+  entry under `.claude/agents/` is not inert: that tree is exactly where
+  Claude Code's capability probe looks, so a deleted reviewer kept reading as
+  available. Every run (bulk and `--only` alike) now removes them first — no
+  flag to remember, and `--dry-run` prints the plan without removing
+  anything. The prune is narrow by construction: only a dangling symlink
+  whose target string is one this installer itself writes, one directory
+  level deep, `.md` only. A regular file, a link to anything else, a link
+  that still resolves, and anything outside `.claude/{agents,commands}` are
+  left untouched. `make doctor` gains a matching **advisory** section that
+  reports any dangling managed link that survives; like the other advisory
+  checks it touches no tally and never changes doctor's exit code.
+
+- **`/assess` now documents the plan-schema `activation:` block and validates the
+  plan note it just wrote** (#1951). Step 2's `activation` optional field spells out
+  the product-source predicate, the three rule-14 exemptions (`kind: spike`,
+  docs-only, no product-source `files:`) and the wrap-immune absence-proof idiom
+  (temperloop#944); a new Step 4 sub-step runs `plan.sh validate` on the fresh note
+  and Step 5 carries its outcome on an always-present `validated:` notice line.
+  Previously the spec never mentioned the block and never invoked the validator, so
+  a first-write plan reached `/build` Step 1 to fail rule 14 there.
+
+- **`build-worktree-guard.sh` no longer false-denies two legitimate writes**
+  (#1975, #1974). A redirect target now has any trailing `;`/`&`/`|` stripped
+  before the character-device and containment checks, so `cmd 2>/dev/null; next`
+  — written with no space before the `;`, which the whitespace tokenizer glues
+  into one word — stops being judged as a write to `/dev/null;` outside the
+  worktree. And `$HOME/.claude/plans/` joins `/tmp` and `$TMPDIR` on the
+  allow-list: it is Claude Code's own plan-persistence directory, so a worker or
+  a nested review subagent that enters plan mode inside a guarded worktree could
+  not persist a plan at all (six reviewer sessions were blocked in one night).
+  The allow-list entry is scoped to `plans/`, never to `$HOME/.claude` as a
+  whole, and both reliefs ship with DENY twins in
+  `claude/hooks/tests/test_build_worktree_guard.sh` plus declared entries in the
+  differential coverage harness.
+
+- **`state-graph.sh`'s `pr_list` source no longer reports `ok` over a
+  fabricated `PR:null` node** (#2001). The `count` guard admitted any single
+  top-level JSON array, and the node transform then indexed `.number` on each
+  element — but `.number` does not error on `null` or on an object with no
+  `number` key, and `null | tostring` is the string `"null"`. So `[null]` and
+  `[{"a":1}]` projected cleanly into `{"id":"PR:null","number":null}`, every
+  guard passed, and `_sg_query_unlinked_prs` emitted that invention as a
+  confident finding — the invent-data twin of the wrong-empty class #1981
+  closed. The guard now also requires **every** element to be an object with a
+  numeric `number`, so those payloads report `error` instead.
+
+  **Behavior change:** an array with any malformed element — including one
+  mixing well-formed and malformed elements — now reports `error` rather than
+  `ok`. A genuinely empty `[]` still reports `absent` (`all` over `[]` is
+  `true`) and a well-formed payload still reports `ok` with its nodes and
+  `closes` edges intact. Reachability is low by construction: `gh pr list
+  --json number,title,body` cannot emit these payloads without violating its
+  own `--json` contract, and the realistic corruption modes yield invalid JSON
+  that the #1981 guard already caught.
+
+- **The §3e review ceiling now actually waits, so routed reviewers stop being
+  discarded as timeouts** (#2049). Its wall-clock tick was an inline
+  `sleep N; printf` Bash command, which a harness permission control refuses in
+  the machinery executor's seat — and the executor's prompt then told it to
+  report the interval elapsed anyway. Measured in run `wf_ebd4b5e0-3a8`, slices
+  asking 300s/540s/360s returned in 8s/9s/9s, so a nominal 1200s ceiling
+  realized in ~30s of wall clock and abandoned reviewers that were completing
+  normally at 177s and 257s; three consecutive items reported `ran: []` as a
+  result. The wait now runs inside the new
+  `workflows/scripts/build/review-wait.sh` helper, and `build-level.mjs` honours
+  an elapse only when it carries that script's own measured `realized_secs` —
+  so a tick that did not wait can no longer claim it did, and reports
+  `REVIEW_WAIT_UNAVAILABLE` instead, which fails open with a legible notice.
+  temperloop#2003's bound on a genuinely hung reviewer is unchanged.
+
+- **A §3e review reviewer that overran its ceiling is now reported `timed out
+  after <actual>s`, not `unavailable`** (#2064). `unavailable` is the kernel's
+  capability-probe verdict — the agent is not declared in `CLAUDE.md §
+  Subagents` or `.claude/agents/` — so using it for an agent that *was*
+  spawned and simply ran long pointed every investigator at the agent roster,
+  where nothing was wrong. The two senses now carry two wordings, and the
+  timeout wording reports the wall clock actually waited rather than the
+  ceiling budgeted; when those two numbers disagree, the gap is itself the
+  defect. `claude/message-schema.md` § Degradation notice records the new
+  shape as the second of the three sanctioned mode-2 skip forms.
+- **A wall-clock tick the harness *refused* can no longer be read as an
+  elapsed interval** (#2064). The §3e ceiling's timer reports through an
+  executor that cannot tell a permission block from a Bash-tool timeout kill —
+  both are "no output" — and one of those two arms was permissive. The
+  refusal is now recognised from the harness's own text before any outcome
+  label is trusted, and fails closed: the ceiling is simply not applied, and
+  the run says so. A genuine tool timeout is unchanged and still bounds the
+  fanout. Measured cost of the old behaviour: a 1200s review ceiling that
+  realized in ~41s, discarding completed reviews.
+
+- **The gate pool's own test no longer fails when the suite is launched in the
+  background** (#2094). `scripts/tests/test_quality_gates_parallel.sh` asserted
+  that a gate self-killing with `SIGINT` is observed as `130`. That is only true
+  when the *invoker* left the signal disposition alone: start
+  `scripts/quality-gates.sh` as an asynchronous child of a shell with job
+  control off — `( … ) &`, `nohup`, an agent harness's background Bash, any
+  `trap '' INT` ancestor — and bash hard-ignores `SIGINT` for the whole process
+  tree, which nothing inside the pool can reset. The suite then went red over a
+  property of its caller, turning the entire local gate run red on an otherwise
+  clean tree. The assertion is now **differential**: the suite measures the
+  serial-loop baseline itself and requires the pooled result to match it, so it
+  still catches the pool changing what a gate observes (its original purpose)
+  and no longer reports on how it was launched. The absolute `130` check still
+  runs whenever the invoker's disposition makes it observable, and reports
+  itself as a `SKIP` when it does not.
+- **A quality-gate slice that ran out of budget with a clean result is no
+  longer reported as a gate failure** (#2094). `/build`'s acceptance gate — the
+  scoped quality-gate run before a push — classified a slice as `GATE_SLICE`
+  only on exit code 75. `quality-gates.sh` prints its
+  `QUALITY_GATES_RESUME_AT=` trailer *before* it exits, so any other status
+  over the same clean partial was relabelled `GATE_FAIL` — where the failure
+  floor manufactured one failure out of a slice that had just reported zero. A
+  printed resume point now decides the classification on its own, the exit code
+  rides along as a recorded fact, and a run that stopped part-way through the
+  gate list is no longer recorded as having covered all of it. Slice trailers
+  are also read from that slice's own output rather than the accumulated log,
+  so a slice that reports nothing cannot inherit the previous one's resume
+  point — and a non-numeric trailer is read as absent rather than interpolated
+  raw into the outcome line. That per-slice file is written by `tee`, not
+  copied in after the gate finishes: `/tmp/qg-<slug>.log` is truncated before
+  the first slice starts and streams for the whole run, so a slice the executor
+  kills on a timeout still leaves its partial output — the only diagnostic a
+  timeout produces — in the log the escalation points the operator at, and a
+  timed-out first slice can no longer leave the previous run's log in place to
+  be read as this run's.
+
+- **A branch that was already pushed and then rebased now lands, and a parked
+  item no longer reports a worker's committed work lost when it was not**
+  (#2103). When a second round of work continued on a branch an earlier round
+  had already pushed, `/build` rebased that branch before opening the PR — and
+  a rewritten branch can no longer fast-forward, so the push failed outright.
+  The rescue step that exists to get a worker's commits onto the remote before
+  the item is parked then tried a plain push of its own, failed the same way,
+  and recorded the work as unpreserved while it sat in the worktree as the only
+  copy. Seen three times in one session, recovered by hand every time.
+  - **A push that has to rewrite a branch is now always leased, never a bare
+    force.** `workflows/scripts/build/pr.sh push` reads the remote branch's
+    current value first and forces only against that exact value
+    (`git push --force-with-lease=<ref>:<sha>`), so a push that would discard a
+    commit someone else added in the meantime is rejected rather than silently
+    overwriting it. If the remote value cannot be read at all, no force is
+    issued and the plain push is left to fail loudly.
+  - **New `--allow-rewrite` flag on `pr.sh push`** — the same request as
+    `--force`, without putting that word in the command line. An agent-driven
+    run can be halted by a safety classifier that sees a literal `--force`, so
+    the pushes `/build` issues itself now use the new spelling, and the recovery
+    command `pr.sh` prints after a push lands on the wrong branch does too.
+  - **Whether the work was preserved is now checked against the remote instead
+    of inferred from whether the push command succeeded.** A failed push whose
+    commits had in fact already landed no longer reports them lost, and an
+    outdated copy of the branch sitting on the remote no longer reports them
+    saved. The parked item's record carries both the commit in the worktree and
+    the commit on the remote, so whoever picks the item up can see the real
+    state rather than trust one flag.
+  - **No push overwrites work it cannot prove is superseded — neither the
+    rescue push nor the ordinary one.** A branch is rewritten only when this
+    worktree's history already contains every commit the remote branch has,
+    which is what a rebase leaves behind: an outdated copy of the very same
+    work. If the branch name has instead collided with something unrelated — a
+    leftover branch, a name reused by accident — the push refuses, leaves the
+    remote exactly as it was, and reports which branch and how many commits it
+    declined to overwrite, so a person decides rather than discovering later
+    that the content is gone. If that question cannot be answered at all,
+    because the remote copy never became available to compare against, it
+    refuses the same way and says so, rather than asserting a conflict it never
+    established. This matters most on the ordinary push, which now asks to
+    rewrite on every single item rather than only when rescuing a failing one.
+
+- **`differential-guard-vs-ref.sh` no longer fails on clean `main`** — the
+  write-jail differential harness is a `KERNEL_GATES` entry, and two of its
+  declared relaxations had gone stale, taking the gate (and so every `checks`
+  run on `main`) red: `2 REGRESSIONS` reported against a tree with no
+  regression in it. A `probe_ratified` entry asserts a DENY→allow *delta*
+  between the working copy and the ref; once that relaxation merges there is no
+  delta left to assert, and the harness correctly flags the entry as a stale
+  ratification. Both entries — the glued trailing `;` on a device sink
+  (temperloop#1974) and a write to the harness's own `$HOME/.claude/plans`
+  (temperloop#1975) — are retired to plain `probe` calls pinning the allow,
+  exactly as the foundation#1354 placeholder exemption was retired before them,
+  with each original rationale kept as a comment because the claim outlives the
+  delta. No coverage is lost: both behaviours stay pinned in both polarities by
+  the ALLOW/DENY corpus in `test_build_worktree_guard.sh`. The harness now
+  reports `100 same, 0 tightened, 0 ratified, 0 REGRESSIONS`, and carries no
+  live `probe_ratified` entries — a relaxation earns one only while it is a real
+  working-copy-vs-ref delta, and loses it the moment it lands.
+
+The build orchestrator is loadable again, and can no longer outgrow its own loader unnoticed.
+
+`claude/workflows/build-level.mjs` is executed by the Claude Code Workflow tool, which refuses to load a script file above a fixed byte limit. Nothing in this repo measured the file against that limit, because the limit belongs to the tool rather than to the project. The file crossed 98% of it in one change and went past it in the next, at which point `/fix`, `/sweep` and `/build` all stopped working at once — they each start by handing the tool this one file. Both changes had passed every check, because no check was looking.
+
+Two things changed:
+
+- 42 long explanatory comment blocks were moved out of the module into a new companion file, `claude/workflows/build-level.design-notes.md`, each one replaced in the code by a one-line summary and a pointer to its full text. The notes are unabridged — they record why each mechanism works the way it does, and several were quoted by reviewers while this change was being made. No line of code was touched: the module's 4,202 non-comment lines are byte-for-byte identical before and after. The file went from 554,776 bytes to 425,358, leaving roughly 46KB of room before the new guard objects.
+- A new check measures every workflow script against a configured share of the tool's limit and fails the build when one gets close, reporting how many bytes of room are left rather than a bare percentage. Its own test asserts both directions — that an oversized file is rejected and a normal one is not — so the check cannot quietly stop working.
+
+The order matters: this failure is not self-repairing. Fixing it needs the orchestrator, and the orchestrator is what stops loading, so recovery is a manual edit outside the usual pipeline.
+
+- **The acceptance gate could report a failure on a tree where it never ran**
+  (temperloop#2142). Before running `scripts/quality-gates.sh` against a
+  candidate branch, the build pipeline clears its own configuration out of the
+  gate's environment, using the setting names printed by
+  `workflows/scripts/build/build-config-settings.sh`. Where that helper is
+  missing or predates this feature — any repo on an older vendored copy of the
+  toolkit — it printed nothing, and an `unset` with no arguments is a harmless
+  no-op in bash but an error in zsh, which is the shell the pipeline's command
+  runner uses on macOS. That error aborted the rest of the chained command, so
+  the gate never executed at all; the pipeline then read the missing result as
+  a failed gate and stopped the branch as broken. Clearing that configuration is
+  best-effort tidying, so its failure should never have been able to stop the
+  gate at all — and an absent helper was only one of three ways it could fail.
+  The command now always passes a placeholder name so the list is never empty,
+  ignores anything the helper prints that is not a valid setting name, checks in
+  a throwaway shell whether the clearing would fail before doing it for real,
+  and finally disregards its result either way. Whatever goes wrong with the
+  tidying now, the gate still runs and reports what it actually found. The two
+  other places in this repo that clear configuration the same way
+  (`workflows/scripts/count-prose.sh` and the build-config settings test) were
+  carrying the same assumption in a comment that said it was safe; they now
+  carry the corrected form and the corrected comment.
+
+- **The log line for a passed acceptance gate now names a stable slice cap**
+  (temperloop#2133). It printed a single `cap N` figure that was whatever
+  allowance remained at that moment, so a run that had extended its budget
+  printed a different number for the same word. That figure is what you read to
+  decide whether to raise `BUILD_GATE_SLICE_SECS` or split the gate list, and a
+  number that means something different each run cannot be compared. The line
+  now names the configured base cap, how many extensions are allowed, the
+  resulting hard limit, how many were spent and this run's ceiling — each
+  derived from its setting rather than restated.
+
+- **A gate slice whose failure count cannot be read is no longer treated as a
+  clean slice** (temperloop#2133). When a long-running gate exhausts its time
+  budget, the pipeline grants it more only if every slice so far reported zero
+  failures. That check coerced any unreadable count to zero, so an unknown
+  result would have been indistinguishable from a clean one. It now requires a
+  real number. Nothing changes today — every count the pipeline currently
+  produces is already a plain number — this closes the path before an
+  unreadable-count case can take it.
+
+- **A `/build` worker's own quality-gate run is now time-bounded on the
+  `--no-workflow` path, so it can no longer stall the item it is working on**
+  (#2145, worker gate budget). The
+  worker instructions in `claude/commands/build.md` told every worker to verify
+  its change with `scripts/quality-gates.sh --scoped` and, in the same breath,
+  to keep each check to seconds. Those two instructions disagreed whenever the
+  change touched a path that widens the scoped gate set back to the whole suite:
+  the run took minutes, the harness auto-backgrounded it past its foreground
+  limit, the backgrounded process was discarded when the worker's turn ended,
+  and the item came back with no verdict and nothing committed — while the
+  abandoned gate kept running, so the next run in that checkout failed on
+  contention with its own predecessors rather than on the code. The worker now
+  runs that gate under the same per-invocation time budget the orchestrator's
+  own acceptance check already uses (`BUILD_GATE_SLICE_SECS`, defaulted in
+  `workflows/scripts/build/build.config.sh`), so the call is bounded instead of
+  open-ended. A budgeted run that stops early reports which gates it ran and
+  hands the remainder to the orchestrator's check; it is not treated as a
+  failure.
+
+  **Scope — read this before assuming the bug is closed.** The budget reaches
+  workers spawned by the conversational `--no-workflow` path, and any worker
+  prompt you write by hand. Runs that take `/build`'s default path, driven by
+  `claude/workflows/build-level.mjs`, still spawn their workers with an
+  unbudgeted gate and remain exposed to the stall described above. That
+  remaining half is tracked as #2147 (the same budget on the default path) and
+  ships separately, because it has to wait for an in-flight rewrite of that
+  file.
+
+- **`test_live_tagging.sh` no longer measures the host it runs on** — the suite
+  asserts what `tagging.sh resolve-model` prints when `SWEEP_WORKER_MODEL` is
+  unset, but `tagging.sh` sources `build.config.sh`, which sources precedence
+  layers 3 and 4: the machine conf under
+  `${XDG_CONFIG_HOME:-$HOME/.config}/temperloop/` and the untracked repo-local
+  conf. Both are legitimate and correctly use the `:=` idiom, and neither
+  exists on CI — so a developer box that has configured one failed the
+  unset-state assertions while `main` stayed green. Observed with a machine
+  conf setting `SWEEP_WORKER_MODEL:=opus`: `want [], got [opus]`, reproducible
+  on a clean `origin/main` checkout and unaffected by `env -i`, which is what
+  identified it as file-based rather than an exported variable. The suite now
+  exports `BUILD_CONFIG_MACHINE` and `BUILD_CONFIG_LOCAL` at nonexistent paths,
+  the seam the ladder's own comment documents as *"a test seam / explicit host
+  override"*, and the same idiom `test_worker_model_settings.sh` already uses.
+  This is the **file-based** half of the hermeticity problem that `/build`
+  §3e.5's env scrub explicitly cannot reach (*"a file-based machine-local leak
+  is a distinct mechanism (foundation#1055) an env scrub can't fix"*).
 
 ## [0.41.0] - 2026-09-15
 
