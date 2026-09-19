@@ -10,7 +10,7 @@
 # validate-capture-backstop.sh mold ("a registry that is not mechanically
 # reconciled against the tree is a registry that drifts").
 #
-# FOUR CHECKS, all against the CURRENT tree (no baseline — the map was authored
+# FIVE CHECKS, all against the CURRENT tree (no baseline — the map was authored
 # complete, so a red run is real drift, never debt to grandfather in):
 #
 #   1. WELL-FORMED   every non-comment row is TAB-separated with a non-empty
@@ -35,6 +35,12 @@
 #      row is otherwise reachable, because a wildcard may legitimately name an
 #      optional surface (`scripts/quality-gates.d/**` exists only in a tree
 #      that carries overlay drop-ins).
+#   5. GATE COMMAND SHAPE  every declared gate command begins `make ` or
+#      `bash `. build-level.mjs recovers a timed-out gate's NAME from its
+#      ordinal by filtering `--list-selected` through `grep -E '^(make|bash) '`
+#      (temperloop#1650); a gate spelled otherwise is silently dropped from that
+#      filter and shifts every later ordinal, so the escalation names the wrong
+#      gate. Asserted here so the coupling goes RED instead of drifting.
 #
 # Glob semantics are NOT reimplemented here: this script sources
 # workflows/scripts/lib/gate-selection.sh and calls its `_gs_path_matches_glob`,
@@ -299,6 +305,29 @@ while [[ $i -lt ${#KEY_BY_INDEX[@]} ]]; do
     _gp_issue "unreachable row — no glob matches any tracked path, so this gate can never be selected: $key"
   fi
 done
+
+# --- 5. gate command shape ---------------------------------------------------
+# Every gate command must begin `make ` or `bash ` (temperloop#1650).
+#
+# This is NOT a style rule. build-level.mjs recovers the ORDINAL->name mapping
+# for a timed-out gate by filtering `quality-gates.sh --list-selected` through
+# `grep -E '^(make|bash) '` and taking line idx+1 — the selection banner, the
+# pin notice and the trailing skipped-gate block are all dropped by that filter.
+# A gate spelled any other way (`npm run …`, `node …`, `./scripts/x.sh`,
+# `env FOO=1 bash …`) is dropped too, and then EVERY subsequent ordinal shifts
+# by one, so the escalation names the wrong gate — confidently, in a message an
+# operator acts on. The coupling is invisible from either side, so it is
+# asserted here, against the live `--list` output, rather than left to whoever
+# adds the next gate. Widening the vocabulary is fine; it just has to happen in
+# both places, and this check is what makes that simultaneous.
+while IFS= read -r _gp_gate; do
+  [[ -n "$_gp_gate" ]] || continue
+  case "$_gp_gate" in
+    'make '*|'bash '*) : ;;
+    *) _gp_issue "gate command does not begin \`make \` or \`bash \`, so build-level.mjs's ordinal->name filter drops it and shifts every later ordinal: $_gp_gate" ;;
+  esac
+done <<<"$ALL_GATE_LIST"
+unset _gp_gate
 
 # --- verdict -----------------------------------------------------------------
 n_rows=${#KEY_BY_INDEX[@]}

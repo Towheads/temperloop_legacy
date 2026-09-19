@@ -985,3 +985,235 @@ added by a branch not yet on main is invisible to that derivation.
  Both extra keys are OMITTED when their condition does not hold, so an
  ordinary level's return stays byte-identical to before #2006/#2004.
 ```
+
+## gateInFlightIndex(ledger) — WHICH gate the stopped run was ON (temperlo
+<a id="gateinflightindex-ledger-which-gate-the-stopped-run-was-on-t"></a>
+
+```text
+ gateInFlightIndex(ledger) — WHICH gate the stopped run was ON, read off the
+ LAST ledger entry (temperloop#1650).
+
+ Two shapes, two readings. A slice that REPORTED a resume point stopped
+ cleanly at a gate boundary, so the run's next gate IS that index. A slice
+ the Bash cap KILLED reported nothing at all, so the only index anyone has
+ is the `startAt` it was handed — the overrun is at that gate or after it
+ (the pooled executor runs a CHUNK at a time, so the killed window can be
+ wider than one gate; the payload's `sliceLog` is what narrows it further,
+ since every gate that FINISHED printed its own `[ok]`/`[FAIL]` line).
+
+ Ledger-derived, not loop-counter-derived, for the same reason gateVerdict()
+ is: the ledger is the authoritative record of what the slices reported, and
+ a second derivation path is a second thing that can disagree.
+```
+
+## gateSliceClampNote() — what raising BUILD_GATE_SLICE_SECS can ACTUALLY
+<a id="gatesliceclampnote-what-raising-build-gate-slice-secs-can-act"></a>
+
+```text
+ gateSliceClampNote() — what raising BUILD_GATE_SLICE_SECS can ACTUALLY buy
+ (temperloop#1650).
+
+ The pre-#1650 remedy said "raise BUILD_GATE_SLICE_SECS (bounded by the agent
+ Bash cap)" and stopped there, which reads as a lever with room in it. It is
+ not one. GATE_BASH_TIMEOUT_MS — the deadline that actually killed the slice —
+ is DERIVED from the slice budget (slice*1000 + GATE_SLICE_OVERRUN_MS, i.e.
+ 1.8x at the 300s default) and then clamped to AGENT_BASH_CAP_MS, the agent's
+ hard foreground-Bash ceiling. At the default that leaves the slice 300s ->
+ 360s (+20%) and the kill deadline 540000ms -> 600000ms (+11%). A reader sent
+ to a +11% lever to fix a gate that overran a 540s window has been sent on an
+ errand that cannot succeed.
+
+ So the note states the derivation and the arithmetic, and — at or within
+ GATE_SLICE_CLAMP_NEAR_RATIO of GATE_SLICE_SECS_MAX — says plainly that there
+ is no headroom left rather than naming the raise at all. Both figures are
+ COMPUTED from the constants they describe, never typed as literals, so a
+ retuned overrun or cap cannot leave the prose stating a stale percentage.
+```
+
+## gateUnknownRemedy(terminalOutcome, inFlight, slices) — the TWO failure
+<a id="gateunknownremedy-terminaloutcome-inflight-slices-the-two-fai"></a>
+
+```text
+ gateUnknownRemedy(terminalOutcome, inFlight, slices) — the TWO failure
+ shapes an UNKNOWN verdict can be in (temperloop#1650).
+
+ One message covered both before, and their remedies are OPPOSITES:
+
+   • GATE_TIMEOUT — the executor's Bash cap fired mid-slice. The slice budget
+     is honoured only BETWEEN gates, so this can only mean ONE gate ran past
+     the whole window. More slice budget cannot reach it (see the clamp note
+     above); only splitting or speeding up THAT gate can.
+   • GATE_SLICE — the slice CEILING was exhausted while every slice returned
+     cleanly. This is the aggregate-slow suite, and more gate wall time
+     genuinely does help: the slice budget, the slice ceiling, or a shorter
+     list.
+
+ A third arm covers the remaining UNKNOWN case (an unrecognized terminal
+ outcome, or a "finished"-named outcome over a final resume point): it names
+ NEITHER shape rather than guessing one, because a budget raise recommended
+ on an unestablished shape is exactly the errand this item removed.
+```
+
+## gateInFlightSelectCmd(idx) — the ONE builder the executed probe AND
+<a id="gateinflightselectcmd-idx-the-one-builder-the-executed-probe-a"></a>
+
+```text
+ gateInFlightSelectCmd(idx) — the ONE builder the executed probe AND the
+ operator-facing `resolve` line are both made from (temperloop#1650 round 2).
+
+ Round 1 emitted the ordinal->name pipeline TWICE: once inside the probe (with
+ `${gateScopeEnv}` and every operand `sq()`-quoted) and once as the `resolve`
+ string handed to the reader (with neither). That is not cosmetic drift. The
+ scope env is what puts quality-gates.sh on its SCOPED arm, and the script
+ consults `QUALITY_GATES_SELECTION_PIN` only inside `if (( SCOPED ))` — so
+ without it the pin is ignored and `--list-selected` prints the FULL set
+ (measured in this tree: 211 lines unscoped, 43 scoped). The escalation's
+ ordinal indexes the 43-line list; the pasted command indexed the 211-line one,
+ so for any index > 0 it named an unrelated gate with total confidence — the
+ plausible-looking-wrong-answer failure this item exists to remove, on the only
+ path `resolve` is ever rendered on (`BUILD_GATE_SCOPED` defaults to 1).
+
+ So the two are ONE function, and the probe wraps it rather than restating it.
+ Quoting follows for free: a checkout path with a space no longer breaks the
+ pasted line. A fixture case executes BOTH strings against a stub
+ quality-gates.sh whose selected and full lists differ, and asserts they name
+ the same gate — the test that fails against round 1's code.
+```
+
+## gateInFlightNameCmd(idx) — turn a stopped run's gate ORDINAL into
+<a id="gateinflightnamecmd-idx-turn-a-stopped-run-s-gate-ordinal-into"></a>
+
+```text
+ gateInFlightNameCmd(idx) — turn a stopped run's gate ORDINAL into its NAME
+ (temperloop#1650).
+
+ "Split the gate list" is only actionable if the reader knows WHICH gate to
+ split; an ordinal alone sends them searching. The ordinal space is the
+ PINNED selection (temperloop#1663), and `quality-gates.sh --list-selected`
+ prints exactly that list, in that order, as a dry run — so the name is one
+ filtered `sed -n` away. The gate lines are the ones starting `make ` or
+ `bash `, which is what separates them from the selection banner, the pin
+ notice and the trailing skipped-gate block.
+
+ It runs as ONE machinery call on the escalation path only — never on the hot
+ path, and never inside the slice loop, so the gate's own timing is untouched
+ — and it is FAIL-SOFT in both directions: an unresolved name (an absent
+ script, a refused command, a throw) leaves the payload carrying the ordinal
+ and the `resolve` command line, and the escalation itself is never at risk.
+```
+
+## temperloop#1650 — NAME the gate in flight and the CLAMP, so the
+<a id="temperloop-1650-name-the-gate-in-flight-and-the-clamp-so-the"></a>
+
+```text
+ temperloop#1650 — NAME the gate in flight and the CLAMP, so the remedy is a
+ move the reader can make.
+
+ `inFlightGate` rides the payload as a FACT the escalation carries, the same
+ shape `committed_work` uses: `index` (always, when the ledger establishes
+ one), `gate` (the resolved name, when the selection still resolves),
+ `resolve` (the one command that turns the ordinal into the name by hand) and
+ `sliceLog` (which gates had already finished). `null` when the ledger
+ establishes no index — an honest absence, never a guessed ordinal.
+
+ The GATE_TIMEOUT vs GATE_FAIL split (temperloop#1021) is untouched: this is
+ the UNKNOWN-verdict branch only, the kind stays `acceptance-gate-timeout`,
+ and a RED verdict still escalates `acceptance-gate-failed` exactly as before.
+```
+
+## A THROWAWAY COPY of the pin, so the dry run cannot WRITE the sh
+<a id="a-throwaway-copy-of-the-pin-so-the-dry-run-cannot-write-the-sh"></a>
+
+```text
+ A THROWAWAY COPY of the pin, so the dry run cannot WRITE the shared one
+ (temperloop#1650 round 3, review finding 3).
+
+ The probe and the operator-facing `resolve` line are described as READ-ONLY
+ enrichment, and that was true of the BRANCH but not of `/tmp`: when
+ `/tmp/qg-<slug>.selection-pin` is absent or empty, quality-gates.sh's scoped
+ path resolves the changed set and CREATES the caller-supplied pin — so a
+ dry run, or an operator pasting the line, could author the very file the
+ slice loop treats as slice 1's authoritative record, with nothing cleaning
+ it up afterwards.
+
+ So both forms copy the shared pin to `<pin>.probe` first and point
+ QUALITY_GATES_SELECTION_PIN at the copy. An absent or empty shared pin
+ leaves the copy REMOVED rather than stale, so the dry run resolves fresh
+ into the throwaway exactly as it used to — same answer, no shared-state
+ write. Slice 0's `rm -f` retires the copy along with the pin itself.
+
+ The copy is guarded by `[ -s ]` rather than silenced with a redirect, which
+ is finding 1's constraint: the operator-facing line carries NO `2>/dev/null`
+ at all (see the next note), so it must not need one.
+```
+
+## The `resolve` line is the one that must SPEAK — no stderr redirect
+<a id="the-resolve-line-is-the-one-that-must-speak-no-stderr-redirect"></a>
+
+```text
+ The `resolve` line is the one that must SPEAK (temperloop#1650 round 3,
+ review finding 1).
+
+ Round 2 folded the probe and the operator line into one builder and, with
+ them, the probe's `2>/dev/null`. That silencing is wrong on the operator's
+ half, and wrong precisely where it lands: `gateUnknownRemedy` renders
+ `resolve` ONLY on the branch where `inFlight.gate` is absent — i.e. exactly
+ when the automatic probe already came back empty — and the load-bearing
+ explanations for that emptiness are the two lines quality-gates.sh writes to
+ STDERR (`NOTE: --scoped could not resolve a local changed set — running the
+ FULL set.`, `NOTE: a scoped run was requested but QUALITY_GATES_SCOPE=full is
+ set`). Handing the reader a command whose whole job is to explain the
+ emptiness, pre-silenced, is the worst place in the message to hide output.
+
+ So the redirect moved to the PROBE'S CALL SITE (`$( <builder> 2>/dev/null )`)
+ and the builder itself carries none. The operands stay shared — the round-2
+ fix that matters — and only the machine path stays quiet. A fixture asserts
+ the rendered `resolve` string contains no `2>/dev/null`.
+
+ The builder is also a SUBSHELL (`( … )`, finding 4): the line starts with a
+ `cd`, and pasting it must not leave the operator's own shell somewhere else.
+```
+
+## The list identity the STOPPED RUN walked — the oracle the probe
+<a id="the-list-identity-the-stopped-run-walked-the-oracle-the-probe"></a>
+
+```text
+ The list identity the STOPPED RUN walked — the oracle the probe's own
+ answer is checked against (temperloop#1650 round 3, review finding 2).
+
+ An ordinal is only meaningful against the list it was measured in, and the
+ probe RE-DERIVES a list rather than reading the one the run walked. Those
+ can differ, and there is a live path that makes them differ: quality-gates.sh's
+ stale-resume guard sets QG_START_AT=0, SCOPED=0, QUALITY_GATES_SCOPE=full and
+ rebuilds GATES from the FULL set — and it does NOT remove the pin. The run
+ then walks the full list and reports ordinals into it, while the probe, which
+ exports QUALITY_GATES_SCOPED=1 and finds that still-populated pin, lists the
+ SCOPED subset. Two lists, one ordinal, and a confidently WRONG gate name with
+ nothing to distinguish it from a right one — kernel principle 5 (counter AI
+ failure modes structurally) in the exact field this issue exists to make
+ trustworthy.
+
+ The oracle already existed: every GATE_SLICE reports QUALITY_GATES_SELECTION
+ as `<count>:<digest>`, and that value now rides each ledger entry. The probe
+ asks `--list-selected` for the SAME fingerprint (one additive `printf` in
+ quality-gates.sh, changing no existing line and no exit code) and compares.
+
+ Degrade, never error, in all three unverifiable directions:
+   - fingerprints DISAGREE   -> GATE_NAME_UNKNOWN (the name is not trustworthy)
+   - no slice recorded one   -> no comparison, today's behaviour exactly
+   - the listing printed none (an older vendored quality-gates.sh) -> likewise
+ The escalation itself is never at risk; the name has always been enrichment.
+```
+
+## The LIST IDENTITY this slice walked (temperloop#1650 round 3)
+<a id="the-list-identity-this-slice-walked-temperloop-1650-round-3"></a>
+
+```text
+ The LIST IDENTITY this slice walked (temperloop#1650 round 3). Already
+ reported by every GATE_SLICE and already carried forward in `gateSelection`
+ for the NEXT slice's stale-resume check — but it was dropped on the floor
+ afterwards, so the ledger (and the payload built from it) could not say
+ which list an ordinal indexed. Recording it makes the escalation
+ self-describing AND gives the in-flight probe its oracle. Omitted, never
+ empty-stringed, when a slice reported none.
+```

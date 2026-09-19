@@ -37,6 +37,10 @@
 #  14. Vendoring-consumer resolution against the vendored subtree prefix (14b:
 #            the prefix is a seam; 14c: the kernel's own checkout never uses it).
 #  15. GREEN against the REAL tree — the live gate's own invocation.
+#  16. RED   on a gate command that begins neither `make ` nor `bash `
+#            (CHECK 5, temperloop#1650) — the shape build-level.mjs's
+#            ordinal->name filter silently drops, shifting every later ordinal.
+#            16b: the same list passes once the gate is respelled.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -305,5 +309,51 @@ $out"
   fi
 done
 echo "PASS: 15 the real tree's gate-paths.tsv is complete and reachable, deterministically (5 runs)"
+
+# --- 16. gate command shape (CHECK 5, temperloop#1650) -----------------------
+# build-level.mjs turns a timed-out gate's ORDINAL into its NAME by filtering
+# `--list-selected` through `grep -E '^(make|bash) '` and taking line idx+1. A
+# gate spelled any other way is dropped by that filter and every LATER ordinal
+# shifts by one, so the escalation names the wrong gate. Detection of that
+# coupling is proven here.
+cat >"$TMP/gates-badshape.txt" <<'EOF'
+[kernel]  make test-alpha
+[kernel]  npm run test-beta
+[kernel]  bash tools/gamma.sh
+[overlay] make test-overlay-only
+EOF
+cat >"$TMP/badshape.tsv" <<'EOF'
+ALL	Makefile
+make test-alpha	src/alpha.sh
+npm run test-beta	src/beta/**
+bash tools/gamma.sh	ALWAYS
+EOF
+if out="$(run_check "$TMP/badshape.tsv" GATE_PATHS_GATE_LIST_FILE="$TMP/gates-badshape.txt")"; then
+  fail "16: a gate command beginning neither 'make ' nor 'bash ' must FAIL, got:
+$out"
+fi
+case "$out" in *'npm run test-beta'*) : ;; *) fail "16: the failure must name the offending gate, got: $out" ;; esac
+case "$out" in *'ordinal'*) : ;; *) fail "16: the failure must say WHY (the ordinal filter), got: $out" ;; esac
+echo "PASS: 16 a gate command outside the make/bash vocabulary fails check 5, naming it"
+
+# 16b — the SAME map and list pass once the gate is respelled, so case 16 is
+# check 5 firing and not some other check tripping on the fixture.
+cat >"$TMP/gates-goodshape.txt" <<'EOF'
+[kernel]  make test-alpha
+[kernel]  bash scripts/test-beta.sh
+[kernel]  bash tools/gamma.sh
+[overlay] make test-overlay-only
+EOF
+cat >"$TMP/goodshape.tsv" <<'EOF'
+ALL	Makefile
+make test-alpha	src/alpha.sh
+bash scripts/test-beta.sh	src/beta/**
+bash tools/gamma.sh	ALWAYS
+EOF
+if ! out="$(run_check "$TMP/goodshape.tsv" GATE_PATHS_GATE_LIST_FILE="$TMP/gates-goodshape.txt")"; then
+  fail "16b: the respelled gate list must be green, got:
+$out"
+fi
+echo "PASS: 16b the same fixture passes once every gate begins make/bash"
 
 echo "OK — check-gate-paths.sh: all cases passed"

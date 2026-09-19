@@ -298,6 +298,20 @@ const freshnessMap = new Map();
 // case predating this item models a worktree holding the worker's commits,
 // which is exactly the case the push preserves, so none of them need changing.
 const preserveMap = new Map();
+// gateInFlightMap: slug → [outcome, ...] — temperloop#1650's ordinal→name
+// probe (`gate-inflight:<slug>`), which fires ONLY on the UNKNOWN-verdict
+// escalation path. Its OWN queue, for the same reason as preserveMap above:
+// it runs after every gate slice of an escalating item, so sharing the
+// per-slug machineryMap FIFO would consume whatever entry that test queued
+// next. Default (map miss): GATE_NAMED with a plausible gate command, so every
+// pre-#1650 GATE_TIMEOUT case keeps working unchanged.
+const gateInFlightMap = new Map();
+// gateInFlightExecMap: slug → true — temperloop#1650 round 2. A RESPONSE MOCK
+// agrees with any command string, correct or not, so the queue above can never
+// catch a defect IN the emitted shell. A slug listed here instead RUNS the
+// emitted probe for real (bash -c) and returns whatever it printed, so the
+// fixture's own stub quality-gates.sh is the oracle.
+const gateInFlightExecMap = new Map();
 // workerClockMap / workerUsageMap: slug → [outcome, ...] — temperloop#2065's
 // worker-cost-capture seam (`worker-clock:<slug>#<tag>` / `worker-usage:
 // <slug>#<tag>`), each its OWN queue, mirroring freshnessMap/preserveMap/
@@ -382,6 +396,8 @@ globalThis.mergeCheckMap = mergeCheckMap;
 globalThis.reviewMap = reviewMap;
 globalThis.freshnessMap = freshnessMap;
 globalThis.preserveMap = preserveMap;
+globalThis.gateInFlightMap = gateInFlightMap;
+globalThis.gateInFlightExecMap = gateInFlightExecMap;
 globalThis.workerClockMap = workerClockMap;
 globalThis.workerUsageMap = workerUsageMap;
 globalThis.setWorkerClock = (slug, ...outcomes) => { workerClockMap.set(slug, outcomes); };
@@ -405,6 +421,30 @@ globalThis.agent = async function agent(prompt, opts = {}) {
       // the machineryMap FIFO.
       if (/^preserve-push:/.test(String(opts.label || ''))) {
         return nextFromMap(preserveMap, slug, { outcome: 'WORK_PRESERVED', branch: 'build/' + slug, commits_ahead: 1, pushed: true });
+      }
+      // temperloop#1650: the in-flight gate ordinal→name probe, own queue (see
+      // gateInFlightMap). A queued { __throw: msg } models runMachinery() itself
+      // throwing — the case the caller's fail-soft try/catch exists for.
+      if (/^gate-inflight:/.test(String(opts.label || ''))) {
+        // EXECUTE the emitted command instead of answering it (see
+        // gateInFlightExecMap) — the only way a bad command string can fail.
+        if (gateInFlightExecMap.get(slug)) {
+          const { execFileSync } = await import('node:child_process');
+          // The machinery PROMPT wraps the emitted command in prose and in the
+          // shared __lb wall-clock watchdog. Run the STEP BODY only: __lb parks
+          // a `sleep $ceiling` watchdog whose bash subshell defers the SIGTERM
+          // that retires it until that sleep returns, so running the wrapper
+          // here would block the case for the full ceiling. The watchdog is
+          // shared machinery with its own coverage; the step body is the
+          // temperloop#1650 string under test.
+          const body = /\n__s0\(\) \{\n([\s\S]*?)\n\}\n/.exec(String(prompt));
+          if (!body) throw new Error('gate-inflight prompt carried no __s0 step body');
+          const raw = String(execFileSync('bash', ['-c', body[1]], { encoding: 'utf8' })).trim();
+          return JSON.parse(raw.split('\n').pop());
+        }
+        const v = nextFromMap(gateInFlightMap, slug, { outcome: 'GATE_NAMED', gate: 'bash workflows/scripts/build/tests/test_state_graph_soak.sh' });
+        if (v && v.__throw) throw new Error(v.__throw);
+        return v;
       }
       // temperloop#2065: the worker-cost-capture seam's OWN queues — see
       // workerClockMap/workerUsageMap's comment above for why they cannot
@@ -519,6 +559,8 @@ globalThis.setWorker = (slug, ...verdicts) => { workerMap.set(slug, verdicts); }
 globalThis.setMergeCheck = (slug, ...states) => { mergeCheckMap.set(slug, states); };
 globalThis.setFreshness = (slug, ...outcomes) => { freshnessMap.set(slug, outcomes); };
 globalThis.setPreserve = (slug, ...outcomes) => { preserveMap.set(slug, outcomes); };
+globalThis.setGateInFlight = (slug, ...outcomes) => { gateInFlightMap.set(slug, outcomes); };
+globalThis.setGateInFlightExec = (slug) => { gateInFlightExecMap.set(slug, true); };
 globalThis.setReview = (slug, ...responses) => { reviewMap.set(slug, responses); };
 // tsvRows(text) — temperloop#1976: the harness's OWN independent restatement
 // of reviewDiffCmd's row-count rule (non-blank, non-`#` lines — the same
@@ -1952,6 +1994,499 @@ if (!/BUDGET/.test(esc.payload?.reason ?? ''))
 // And it must NOT push a branch on an unknown verdict.
 if ((result.parked ?? []).length !== 0)
   { console.log(JSON.stringify({ ok: false, reason: 'expected 0 parked: ' + JSON.stringify(result) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-1 (temperloop#1650): the GATE_TIMEOUT remedy must be a move the
+#   reader can MAKE. Pre-#1650 it said 'raise BUILD_GATE_SLICE_SECS (bounded by
+#   the agent Bash cap) or split the gate list' — a lever clamped to ~+11% of
+#   the kill deadline, pointed at the one-slow-gate case it cannot fix, and a
+#   gate list with no gate named. This pins: the ONE-SLOW-GATE shape, the clamp
+#   stated with its derivation (GATE_BASH_TIMEOUT_MS from the slice budget,
+#   clamped to AGENT_BASH_CAP_MS), and the in-flight gate NAME in the payload.
+# ============================================================================
+run_node_case "1650 remedy: GATE_TIMEOUT names the one-slow-gate shape, the clamp and the in-flight gate" "
+$PREAMBLE
+
+setMachinery('item-rem1650',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/item-rem1650' },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 47, failed: 0, elapsedSecs: 301 },
+  { outcome: 'GATE_TIMEOUT' },
+);
+setGateInFlight('item-rem1650', { outcome: 'GATE_NAMED', gate: 'bash scripts/tests/test_very_slow_gate.sh' });
+happyWorker('item-rem1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-rem1650', branch: 'build/item-rem1650', title: 'Remedy', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+if (!esc || esc.kind !== 'acceptance-gate-timeout')
+  { console.log(JSON.stringify({ ok: false, reason: 'the #1021 GATE_TIMEOUT/GATE_FAIL split did not survive: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const remedy = String(esc.payload?.remedy ?? '');
+// SHAPE 1 — one slow gate, and it must NOT read as the aggregate-slow case.
+if (!/ONE SLOW GATE/.test(remedy) || /AGGREGATE-SLOW/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'remedy does not name the one-slow-gate shape: ' + remedy })); process.exit(0); }
+// THE CLAMP, with its derivation — not a bare 'bounded by the agent Bash cap'.
+for (const needle of ['GATE_BASH_TIMEOUT_MS', 'AGENT_BASH_CAP_MS', 'CLAMPED', 'DERIVED'])
+  if (!remedy.includes(needle))
+    { console.log(JSON.stringify({ ok: false, reason: 'remedy does not state the clamp (' + needle + ' missing): ' + remedy })); process.exit(0); }
+// …and it must NOT send the reader at the clamped lever to fix THIS shape.
+if (!/CANNOT fix this shape/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'remedy still points a one-slow-gate timeout at the slice budget: ' + remedy })); process.exit(0); }
+// THE IN-FLIGHT GATE — by ordinal AND by name, in the payload and the remedy.
+const inFlight = esc.payload?.inFlightGate;
+if (!inFlight || inFlight.index !== 47)
+  { console.log(JSON.stringify({ ok: false, reason: 'payload does not name the in-flight gate index: ' + JSON.stringify(inFlight) })); process.exit(0); }
+if (inFlight.gate !== 'bash scripts/tests/test_very_slow_gate.sh')
+  { console.log(JSON.stringify({ ok: false, reason: 'payload does not carry the in-flight gate NAME: ' + JSON.stringify(inFlight) })); process.exit(0); }
+if (!remedy.includes('bash scripts/tests/test_very_slow_gate.sh'))
+  { console.log(JSON.stringify({ ok: false, reason: 'remedy does not name the in-flight gate: ' + remedy })); process.exit(0); }
+// The probe is READ-ONLY enrichment: it must not have cost the branch a push.
+if ((result.parked ?? []).length !== 0)
+  { console.log(JSON.stringify({ ok: false, reason: 'expected 0 parked: ' + JSON.stringify(result) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-2 (temperloop#1650): the OTHER failure shape. A slice CEILING
+#   exhausted with every slice returning cleanly is an aggregate-slow suite —
+#   more gate wall time genuinely helps — and must read differently from the
+#   one-slow-gate timeout above. One message conflated them before #1650.
+# ============================================================================
+run_node_case "1650 remedy: slice-ceiling exhaustion reads as the AGGREGATE-slow shape" "
+$PREAMBLE
+
+// GATE_MAX_SLICES (8) x 1 + GATE_RESUME_EXTENSIONS (2) more allotments = 24
+// clean slices before the loop gives up with a terminal GATE_SLICE.
+const slices = Array.from({ length: 24 }, (_, i) => ({ outcome: 'GATE_SLICE', resumeAt: i + 1, failed: 0, elapsedSecs: 300 }));
+setMachinery('item-agg1650',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/item-agg1650' },
+  { outcome: 'REVIEW_DIFF' },
+  ...slices,
+);
+happyWorker('item-agg1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-agg1650', branch: 'build/item-agg1650', title: 'Aggregate', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+if (!esc || esc.kind !== 'acceptance-gate-timeout')
+  { console.log(JSON.stringify({ ok: false, reason: 'expected acceptance-gate-timeout: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const remedy = String(esc.payload?.remedy ?? '');
+if (!/AGGREGATE-SLOW SUITE/.test(remedy) || /ONE SLOW GATE/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'remedy does not distinguish the aggregate-slow shape: ' + remedy })); process.exit(0); }
+// This shape is the one where MORE budget actually helps — say so.
+if (!/MORE gate wall time genuinely helps/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'aggregate-slow remedy does not offer the budget lever: ' + remedy })); process.exit(0); }
+// …and it still states the clamp, so the raise it offers is a BOUNDED one.
+if (!remedy.includes('GATE_BASH_TIMEOUT_MS') || !remedy.includes('AGENT_BASH_CAP_MS'))
+  { console.log(JSON.stringify({ ok: false, reason: 'aggregate-slow remedy omits the clamp: ' + remedy })); process.exit(0); }
+// The gate the run stopped at is the LAST slice's resume point, named.
+if (esc.payload?.inFlightGate?.index !== 24)
+  { console.log(JSON.stringify({ ok: false, reason: 'aggregate-slow payload does not name where the run stopped: ' + JSON.stringify(esc.payload?.inFlightGate) })); process.exit(0); }
+if (!/test_state_graph_soak/.test(String(esc.payload?.inFlightGate?.gate ?? '')))
+  { console.log(JSON.stringify({ ok: false, reason: 'aggregate-slow payload carries no in-flight gate name: ' + JSON.stringify(esc.payload?.inFlightGate) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-3 (temperloop#1650): a slice budget ALREADY at its clamp must not be
+#   offered as a lever at all. GATE_SLICE_SECS_MAX is (AGENT_BASH_CAP_MS -
+#   GATE_SLICE_OVERRUN_MS)/1000 = 360s, so an operator who already raised
+#   BUILD_GATE_SLICE_SECS to it has nothing left to raise.
+# ============================================================================
+run_node_case "1650 remedy: a slice budget at the clamp is reported as such, not offered as a raise" "
+$PREAMBLE
+
+setMachinery('item-clamp1650',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/item-clamp1650' },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_TIMEOUT' },
+);
+happyWorker('item-clamp1650');
+
+globalThis.args = { ...baseArgs, gateSliceSecs: 360, items: [
+  { slug: 'item-clamp1650', branch: 'build/item-clamp1650', title: 'Clamped', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+const remedy = String(esc?.payload?.remedy ?? '');
+if (!/ALREADY AT its clamp/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'an at-clamp slice budget is not reported as clamped: ' + remedy })); process.exit(0); }
+if (/can rise only/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'an at-clamp slice budget is still offered as a raise: ' + remedy })); process.exit(0); }
+// The slice budget the payload reports is the CLAMPED one it just described.
+if (esc?.payload?.sliceBudgetSecs !== 360)
+  { console.log(JSON.stringify({ ok: false, reason: 'slice budget did not resolve to the clamp: ' + JSON.stringify(esc?.payload) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-4 (temperloop#1650 round 2): EXECUTE the emitted ordinal->name
+#   shell, and execute the `resolve` line the operator is handed, against a
+#   stub quality-gates.sh whose SCOPED and FULL lists differ. A response mock
+#   agrees with any command string, so only a real run can catch a defect IN
+#   the command. Round 1 built the two strings separately and the operator-
+#   facing one dropped $gateScopeEnv — quality-gates.sh reads
+#   QUALITY_GATES_SELECTION_PIN only inside `if (( SCOPED ))`, so the pasted
+#   line listed the FULL set and named an unrelated gate at the same ordinal.
+#   The worktree path carries a SPACE, so unquoted interpolation fails too.
+# ============================================================================
+run_node_case "1650 probe: the emitted probe AND the operator-facing resolve line both name the SCOPED gate" "
+$PREAMBLE
+
+const os = await import('node:os');
+const fs = await import('node:fs');
+const path = await import('node:path');
+const { execFileSync } = await import('node:child_process');
+
+// A worktree path with a SPACE in it — the case unquoted interpolation breaks.
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qg1650-'));
+const wt = path.join(root, 'wt with space');
+fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+const qg = path.join(wt, 'scripts', 'quality-gates.sh');
+// The stub is the ORACLE: its scoped list and its full list differ at every
+// ordinal, and the trailing indented skipped line must be filtered out.
+fs.writeFileSync(qg, [
+  '#!/usr/bin/env bash',
+  'if [ x\${QUALITY_GATES_SCOPED:-0} = x1 ]; then',
+  \"  echo 'selection: diff-scoped, 4 of 6'\",
+  \"  echo 'make scoped-zero'\",
+  \"  echo 'make scoped-one'\",
+  \"  echo 'bash scripts/tests/test_scoped_two.sh'\",
+  \"  echo 'make scoped-three'\",
+  \"  echo '  skipped: make full-two - no changed path reaches it'\",
+  'else',
+  \"  echo 'selection: full set'\",
+  \"  echo 'make full-zero'\",
+  \"  echo 'make full-one'\",
+  \"  echo 'make full-two'\",
+  \"  echo 'make full-three'\",
+  \"  echo 'bash scripts/tests/test_full_four.sh'\",
+  \"  echo 'make full-five'\",
+  'fi',
+].join('\n') + '\n');
+fs.chmodSync(qg, 0o755);
+
+setMachinery('item-exec1650',
+  { outcome: 'CREATED', path: wt },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 2, failed: 0, elapsedSecs: 301 },
+  { outcome: 'GATE_TIMEOUT' },
+);
+// RUN the emitted probe for real instead of answering it.
+setGateInFlightExec('item-exec1650');
+happyWorker('item-exec1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-exec1650', branch: 'build/item-exec1650', title: 'Probe', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+if (!esc || esc.kind !== 'acceptance-gate-timeout')
+  { console.log(JSON.stringify({ ok: false, reason: 'expected acceptance-gate-timeout: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const inFlight = esc.payload?.inFlightGate;
+const EXPECT = 'bash scripts/tests/test_scoped_two.sh';
+if (!inFlight || inFlight.index !== 2)
+  { console.log(JSON.stringify({ ok: false, reason: 'expected the run to stop at ordinal 2: ' + JSON.stringify(inFlight) })); process.exit(0); }
+// THE EXECUTED PROBE: line idx+1 of the SELECTED set, skipped lines filtered.
+if (inFlight.gate !== EXPECT)
+  { console.log(JSON.stringify({ ok: false, reason: 'the executed probe named ' + JSON.stringify(inFlight.gate) + ', expected ' + EXPECT })); process.exit(0); }
+// THE OPERATOR-FACING LINE: run it exactly as pasted. It must agree.
+let pasted = '';
+try { pasted = String(execFileSync('bash', ['-c', String(inFlight.resolve)], { encoding: 'utf8' })).trim(); }
+catch (e) { console.log(JSON.stringify({ ok: false, reason: 'the resolve line does not run: ' + String(e && e.message).slice(0, 300) })); process.exit(0); }
+if (pasted !== EXPECT)
+  { console.log(JSON.stringify({ ok: false, reason: 'the pasted resolve line named ' + JSON.stringify(pasted) + ', not the probe answer ' + EXPECT + ' — resolve: ' + inFlight.resolve })); process.exit(0); }
+// …and it must be the SAME builder, not a parallel string that happens to agree.
+if (!/QUALITY_GATES_SCOPED/.test(String(inFlight.resolve)))
+  { console.log(JSON.stringify({ ok: false, reason: 'the resolve line omits the scope env: ' + inFlight.resolve })); process.exit(0); }
+// ROUND 3, finding 1: sharing the builder must NOT have given the operator the
+// probe's stderr redirect. \`resolve\` renders ONLY when the probe came back
+// empty, and quality-gates.sh explains that emptiness on STDERR — silencing it
+// hides the one output the reader was sent there for.
+if (String(inFlight.resolve).includes('2>/dev/null'))
+  { console.log(JSON.stringify({ ok: false, reason: 'the resolve line silences the stderr that explains the empty probe: ' + inFlight.resolve })); process.exit(0); }
+// ROUND 3, finding 4: the line opens with a \`cd\`, so pasting it must not move
+// the operator's own shell. Assert the BEHAVIOUR, not the parenthesis.
+const here = process.cwd();
+const after = String(execFileSync('bash', ['-c', String(inFlight.resolve) + '; pwd'], { encoding: 'utf8', cwd: here })).trim().split('\n').pop();
+if (after !== here)
+  { console.log(JSON.stringify({ ok: false, reason: 'the resolve line left the shell in ' + after + ', not ' + here })); process.exit(0); }
+fs.rmSync(root, { recursive: true, force: true });
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-5 (temperloop#1650 round 2, LOW): the gate name is injected into a
+#   hand-rolled `printf '…"gate":"%s"…'`, so it is sanitized first. Round 1
+#   stripped `"` only; a BACKSLASH survived and emitted a JSON string with an
+#   unescaped escape — `--name "a\\b"` parsed back as a BACKSPACE, silently
+#   wrong rather than loudly broken. Executed, not mocked, for the same reason
+#   as 11d-4: only a real run can falsify the emitted shell.
+# ============================================================================
+run_node_case "1650 probe: a gate name carrying a quote and a backslash is sanitized before it reaches the JSON" "
+$PREAMBLE
+
+const os = await import('node:os');
+const fs = await import('node:fs');
+const path = await import('node:path');
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qg1650b-'));
+const wt = path.join(root, 'wt');
+fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+const qg = path.join(wt, 'scripts', 'quality-gates.sh');
+fs.writeFileSync(qg, [
+  '#!/usr/bin/env bash',
+  \"echo 'selection: diff-scoped'\",
+  \"echo 'make zero'\",
+  \"printf '%s\\\\n' 'bash scripts/x.sh --name \\\"a\\\\\\\\b\\\"'\",
+].join('\n') + '\n');
+fs.chmodSync(qg, 0o755);
+
+setMachinery('item-esc1650',
+  { outcome: 'CREATED', path: wt },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 1, failed: 0, elapsedSecs: 301 },
+  { outcome: 'GATE_TIMEOUT' },
+);
+setGateInFlightExec('item-esc1650');
+happyWorker('item-esc1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-esc1650', branch: 'build/item-esc1650', title: 'Escape', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const inFlight = (result.escalations ?? [])[0]?.payload?.inFlightGate;
+if (!inFlight || inFlight.index !== 1)
+  { console.log(JSON.stringify({ ok: false, reason: 'expected the run to stop at ordinal 1: ' + JSON.stringify(inFlight) })); process.exit(0); }
+// Both JSON-hostile characters are gone — no quote, no backslash, no control
+// character smuggled in by an unescaped escape sequence.
+if (inFlight.gate !== 'bash scripts/x.sh --name ab')
+  { console.log(JSON.stringify({ ok: false, reason: 'the gate name was not sanitized: ' + JSON.stringify(inFlight.gate) })); process.exit(0); }
+fs.rmSync(root, { recursive: true, force: true });
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-6 (temperloop#1650 round 3, MEDIUM): the probe RE-DERIVES a gate
+#   list; it must verify that list is the SAME one the stopped run walked
+#   before it trusts an ordinal into it. quality-gates.sh's stale-resume guard
+#   rebuilds GATES on the FULL set mid-run WITHOUT removing the pin, so a later
+#   `--list-selected` under that pin resolves the SCOPED subset — two lists,
+#   one ordinal, a confidently wrong name. The oracle is the
+#   QUALITY_GATES_SELECTION fingerprint every GATE_SLICE already reports.
+#   THIS arm: the fingerprints AGREE, so the name is trusted and reported.
+# ============================================================================
+run_node_case "1650 probe: a listing whose selection fingerprint MATCHES the stopped run names the gate" "
+$PREAMBLE
+
+const os = await import('node:os');
+const fs = await import('node:fs');
+const path = await import('node:path');
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qg1650c-'));
+const wt = path.join(root, 'wt');
+fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+const qg = path.join(wt, 'scripts', 'quality-gates.sh');
+fs.writeFileSync(qg, [
+  '#!/usr/bin/env bash',
+  \"echo 'selection: diff-scoped, 3 of 9'\",
+  \"echo 'QUALITY_GATES_SELECTION=3:deadbeefcafe'\",
+  \"echo 'make sel-zero'\",
+  \"echo 'make sel-one'\",
+  \"echo 'bash scripts/tests/test_sel_two.sh'\",
+].join('\n') + '\n');
+fs.chmodSync(qg, 0o755);
+
+setMachinery('item-sel1650',
+  { outcome: 'CREATED', path: wt },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 2, failed: 0, elapsedSecs: 301, selection: '3:deadbeefcafe' },
+  { outcome: 'GATE_TIMEOUT' },
+);
+setGateInFlightExec('item-sel1650');
+happyWorker('item-sel1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-sel1650', branch: 'build/item-sel1650', title: 'SelMatch', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+if (!esc || esc.kind !== 'acceptance-gate-timeout')
+  { console.log(JSON.stringify({ ok: false, reason: 'expected acceptance-gate-timeout: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const inFlight = esc.payload?.inFlightGate;
+if (inFlight?.gate !== 'bash scripts/tests/test_sel_two.sh')
+  { console.log(JSON.stringify({ ok: false, reason: 'a MATCHING selection lost the gate name: ' + JSON.stringify(inFlight) })); process.exit(0); }
+// The oracle itself must ride the payload — the ledger entry and the in-flight
+// block both carry the list identity the ordinal was measured against.
+if (inFlight.selection !== '3:deadbeefcafe')
+  { console.log(JSON.stringify({ ok: false, reason: 'payload does not carry the expected selection: ' + JSON.stringify(inFlight) })); process.exit(0); }
+if (!(esc.payload?.sliceLedger ?? []).some((s) => s.selection === '3:deadbeefcafe'))
+  { console.log(JSON.stringify({ ok: false, reason: 'no ledger entry carries its selection: ' + JSON.stringify(esc.payload?.sliceLedger) })); process.exit(0); }
+fs.rmSync(root, { recursive: true, force: true });
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-7 (temperloop#1650 round 3, MEDIUM): the other arm — the listing's
+#   fingerprint DISAGREES with the one the stopped run reported, so the ordinal
+#   does not identify a gate in this list. Degrade to GATE_NAME_UNKNOWN; never
+#   name a gate on the strength of a list the run never walked, and never let
+#   the degradation cost the escalation itself.
+# ============================================================================
+run_node_case "1650 probe: a listing whose selection fingerprint DISAGREES degrades to GATE_NAME_UNKNOWN" "
+$PREAMBLE
+
+const os = await import('node:os');
+const fs = await import('node:fs');
+const path = await import('node:path');
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qg1650d-'));
+const wt = path.join(root, 'wt');
+fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+const qg = path.join(wt, 'scripts', 'quality-gates.sh');
+fs.writeFileSync(qg, [
+  '#!/usr/bin/env bash',
+  \"echo 'selection: diff-scoped, 3 of 9'\",
+  \"echo 'QUALITY_GATES_SELECTION=3:deadbeefcafe'\",
+  \"echo 'make sel-zero'\",
+  \"echo 'make sel-one'\",
+  \"echo 'bash scripts/tests/test_sel_two.sh'\",
+].join('\n') + '\n');
+fs.chmodSync(qg, 0o755);
+
+// The run walked a 9-gate FULL set (the stale-resume guard's recovery); the
+// probe re-derives the 3-gate SCOPED subset. Ordinal 2 exists in both.
+setMachinery('item-mis1650',
+  { outcome: 'CREATED', path: wt },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 2, failed: 0, elapsedSecs: 301, selection: '9:0011223344ff' },
+  { outcome: 'GATE_TIMEOUT' },
+);
+setGateInFlightExec('item-mis1650');
+happyWorker('item-mis1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-mis1650', branch: 'build/item-mis1650', title: 'SelMismatch', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+// FAIL-SOFT: the escalation is the deliverable and still arrives, unchanged.
+if (!esc || esc.kind !== 'acceptance-gate-timeout')
+  { console.log(JSON.stringify({ ok: false, reason: 'a mismatched selection cost the escalation: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const inFlight = esc.payload?.inFlightGate;
+if (!inFlight || inFlight.index !== 2)
+  { console.log(JSON.stringify({ ok: false, reason: 'the ordinal itself must survive: ' + JSON.stringify(inFlight) })); process.exit(0); }
+if (inFlight.gate !== undefined)
+  { console.log(JSON.stringify({ ok: false, reason: 'named a gate from a list the run never walked: ' + JSON.stringify(inFlight) })); process.exit(0); }
+// …and the reader is handed the command instead of a wrong name.
+const remedy = String(esc.payload?.remedy ?? '');
+if (!/name it with:/.test(remedy) || /test_sel_two/.test(remedy))
+  { console.log(JSON.stringify({ ok: false, reason: 'remedy did not degrade to the resolve command: ' + remedy })); process.exit(0); }
+fs.rmSync(root, { recursive: true, force: true });
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-8 (temperloop#1650 round 3, LOW): the probe and the pasted resolve
+#   line are described as READ-ONLY enrichment. That was true of the branch but
+#   not of /tmp: quality-gates.sh CREATES a caller-supplied selection pin when
+#   it is absent or empty, so the dry run could author the very file the slice
+#   loop treats as slice 1's authoritative record. Both forms now point at a
+#   throwaway '<pin>.probe' copy; the shared pin must come out untouched.
+# ============================================================================
+run_node_case "1650 probe: neither the probe nor the pasted resolve line writes the SHARED selection pin" "
+$PREAMBLE
+
+const os = await import('node:os');
+const fs = await import('node:fs');
+const path = await import('node:path');
+const { execFileSync } = await import('node:child_process');
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qg1650e-'));
+const wt = path.join(root, 'wt');
+fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+const qg = path.join(wt, 'scripts', 'quality-gates.sh');
+// The stub WRITES its caller-supplied pin, exactly as the real scoped path does
+// when the pin is absent or empty — that write is the thing under test.
+fs.writeFileSync(qg, [
+  '#!/usr/bin/env bash',
+  'printf \"probe-wrote\\\\n\" >>\"\$QUALITY_GATES_SELECTION_PIN\"',
+  \"echo 'selection: diff-scoped'\",
+  \"echo 'make pin-zero'\",
+  \"echo 'make pin-one'\",
+].join('\n') + '\n');
+fs.chmodSync(qg, 0o755);
+
+const sharedPin = '/tmp/qg-item-pin1650.selection-pin';
+const probePin = sharedPin + '.probe';
+fs.writeFileSync(sharedPin, 'ORIGINAL\n');
+fs.rmSync(probePin, { force: true });
+
+setMachinery('item-pin1650',
+  { outcome: 'CREATED', path: wt },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 1, failed: 0, elapsedSecs: 301 },
+  { outcome: 'GATE_TIMEOUT' },
+);
+setGateInFlightExec('item-pin1650');
+happyWorker('item-pin1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-pin1650', branch: 'build/item-pin1650', title: 'PinIsolation', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const inFlight = (result.escalations ?? [])[0]?.payload?.inFlightGate;
+if (inFlight?.gate !== 'make pin-one')
+  { console.log(JSON.stringify({ ok: false, reason: 'the probe did not resolve through the throwaway pin: ' + JSON.stringify(inFlight) })); process.exit(0); }
+if (fs.readFileSync(sharedPin, 'utf8') !== 'ORIGINAL\n')
+  { console.log(JSON.stringify({ ok: false, reason: 'the PROBE wrote the shared pin: ' + JSON.stringify(fs.readFileSync(sharedPin, 'utf8')) })); process.exit(0); }
+if (!fs.existsSync(probePin) || !fs.readFileSync(probePin, 'utf8').includes('probe-wrote'))
+  { console.log(JSON.stringify({ ok: false, reason: 'the write did not land on the throwaway copy' })); process.exit(0); }
+// The pasted operator line is non-mutating for the same reason — same builder.
+execFileSync('bash', ['-c', String(inFlight.resolve)], { encoding: 'utf8' });
+if (fs.readFileSync(sharedPin, 'utf8') !== 'ORIGINAL\n')
+  { console.log(JSON.stringify({ ok: false, reason: 'the pasted resolve line wrote the shared pin' })); process.exit(0); }
+fs.rmSync(sharedPin, { force: true });
+fs.rmSync(probePin, { force: true });
+fs.rmSync(root, { recursive: true, force: true });
 
 console.log(JSON.stringify({ ok: true }));
 "

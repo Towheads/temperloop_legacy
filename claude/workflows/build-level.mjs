@@ -1076,6 +1076,12 @@ const GATE_MAX_SLICES = 8;
 const GATE_RESUME_EXTENSIONS = 2;
 // Warn when a completed run used at least this fraction of the slice bud — see build-level.design-notes.md#warn-when-a-completed-run-used-at-least-this-fraction-o
 const GATE_MARGIN_WARN_RATIO = 0.75;
+// GATE_SLICE_CLAMP_NEAR_RATIO (temperloop#1650) — at/above this fraction of
+// GATE_SLICE_SECS_MAX the slice budget is treated as AT its clamp, so the
+// UNKNOWN-verdict remedy stops naming a raise that cannot move.
+const GATE_SLICE_CLAMP_NEAR_RATIO = 0.9;
+// The ordinal->name probe below is a `--list-selected` dry run, seconds of work.
+const GATE_INFLIGHT_NAME_TIMEOUT_MS = 120_000;
 
 // 3c worker return-value output-shape bounds (temperloop#1080) — see build-level.design-notes.md#3c-worker-return-value-output-shape-bounds-temperloop-1080
 const WORKER_SUMMARY_MAX_WORDS_DEFAULT = 60;
@@ -2926,6 +2932,58 @@ function gateSliceResumeAt(out) {
   if (!out) return undefined;
   const n = Number(out.resumeAt);
   return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+// gateInFlightIndex(ledger) — WHICH gate the stopped run was ON (temperlo — see build-level.design-notes-6.md#gateinflightindex-ledger-which-gate-the-stopped-run-was-on-t
+function gateInFlightIndex(ledger) {
+  const last = Array.isArray(ledger) && ledger.length > 0 ? ledger[ledger.length - 1] : null;
+  if (!last) return undefined;
+  // A slice that REPORTED a resume point stopped cleanly BEFORE that index.
+  const resume = gateSliceResumeAt(last);
+  if (resume !== undefined) return resume;
+  // A KILLED slice never reported: it began at `startAt`, so the overrun is there or after it.
+  const startAt = Number(last.startAt);
+  return Number.isFinite(startAt) && startAt >= 0 ? startAt : undefined;
+}
+
+// gateSliceClampNote() — what raising BUILD_GATE_SLICE_SECS can ACTUALLY  — see build-level.design-notes-6.md#gatesliceclampnote-what-raising-build-gate-slice-secs-can-act
+function gateSliceClampNote() {
+  const derived =
+    `GATE_BASH_TIMEOUT_MS (${GATE_BASH_TIMEOUT_MS}ms, the deadline that killed the slice) is DERIVED from ` +
+    `BUILD_GATE_SLICE_SECS — slice*1000 + ${GATE_SLICE_OVERRUN_MS}ms of between-gate overrun, 1.8x the slice at the ` +
+    `${GATE_SLICE_SECS_DEFAULT}s default — and is itself clamped to AGENT_BASH_CAP_MS (${AGENT_BASH_CAP_MS}ms), the ` +
+    `agent's hard foreground-Bash ceiling`;
+  if (GATE_SLICE_SECS >= Math.floor(GATE_SLICE_SECS_MAX * GATE_SLICE_CLAMP_NEAR_RATIO)) {
+    return `${derived}. BUILD_GATE_SLICE_SECS is ALREADY AT its clamp (${GATE_SLICE_SECS}s of a ` +
+      `${GATE_SLICE_SECS_MAX}s maximum) — do NOT raise it, there is no headroom left to raise it into`;
+  }
+  return `${derived}. So BUILD_GATE_SLICE_SECS is CLAMPED: it can rise only ${GATE_SLICE_SECS}s -> ` +
+    `${GATE_SLICE_SECS_MAX}s (+${Math.round((GATE_SLICE_SECS_MAX / GATE_SLICE_SECS - 1) * 100)}%), moving the kill ` +
+    `deadline just ${GATE_BASH_TIMEOUT_MS}ms -> ${AGENT_BASH_CAP_MS}ms ` +
+    `(+${Math.round((AGENT_BASH_CAP_MS / GATE_BASH_TIMEOUT_MS - 1) * 100)}%) — a one-time bounded gain, not a lever that scales`;
+}
+
+// gateUnknownRemedy(terminalOutcome, inFlight, slices) — the TWO failure  — see build-level.design-notes-6.md#gateunknownremedy-terminaloutcome-inflight-slices-the-two-fai
+function gateUnknownRemedy(terminalOutcome, inFlight, slices) {
+  const where = inFlight
+    ? `The run stopped on gate ${inFlight.index} of the pinned selection` +
+      (inFlight.gate ? ` — \`${inFlight.gate}\`.` : ` (name it with: ${inFlight.resolve}).`)
+    : 'The gate in flight could not be identified from the slice ledger.';
+  const clamp = gateSliceClampNote();
+  if (terminalOutcome === 'GATE_TIMEOUT') {
+    return `ONE SLOW GATE, not an aggregate-slow suite: the slice budget is honoured only BETWEEN gates, so the cap ` +
+      `fired because a SINGLE gate ran past the whole ${GATE_BASH_TIMEOUT_MS}ms window. ${where} More slice budget ` +
+      `CANNOT fix this shape — ${clamp}. Fix that gate instead: split it, speed it up, or narrow what reaches it; ` +
+      `then re-run the gate to get a real verdict.`;
+  }
+  if (terminalOutcome === 'GATE_SLICE') {
+    return `AGGREGATE-SLOW SUITE, not one overrunning gate: every slice returned cleanly and the run simply ran out ` +
+      `of slices (${slices} x ${GATE_SLICE_SECS}s). ${where} MORE gate wall time genuinely helps this shape: raise ` +
+      `BUILD_GATE_SLICE_SECS (${clamp}), and/or the slice ceiling (GATE_MAX_SLICES ${GATE_MAX_SLICES}, ` +
+      `GATE_RESUME_EXTENSIONS ${GATE_RESUME_EXTENSIONS}), or split the gate list; then re-run the gate to get a real verdict.`;
+  }
+  return `NEITHER failure shape is established: the gate returned '${terminalOutcome}' and no verdict. ${where} Read ` +
+    `the gate log before tuning any budget — raising one from here would be a guess.`;
 }
 
 // gateVerdict(terminalOutcome, ledger) — the ONE reconciliation point be — see build-level.design-notes-3.md#gateverdict-terminaloutcome-ledger-the-one-reconciliation-po
@@ -6743,9 +6801,27 @@ async function driveItemBuildPhase(item, arm, box) {
     `QUALITY_GATES_SCOPED=$(. ${sq(configBin)} >/dev/null 2>&1; echo "\${BUILD_GATE_SCOPED:-1}")`;
   // SLICE-STABLE SELECTION (temperloop#1663). `QUALITY_GATES_START_AT` is — see build-level.design-notes-5.md#slice-stable-selection-temperloop-1663-quality-gates-start-a
   const gatePin = `/tmp/qg-${item.slug}.selection-pin`;
+  // A THROWAWAY COPY of the pin, so the dry run cannot WRITE the shared  — see build-level.design-notes-6.md#a-throwaway-copy-of-the-pin-so-the-dry-run-cannot-write-the-sh
+  const gateProbePin = `${gatePin}.probe`;
+  // gateInFlightSelectCmd(idx) — the ONE builder the executed probe AND the — see build-level.design-notes-6.md#gateinflightselectcmd-idx-the-one-builder-the-executed-probe-a
+  const gateInFlightSelectCmd = (idx) =>
+    `( if [ -s ${sq(gatePin)} ]; then cp -f ${sq(gatePin)} ${sq(gateProbePin)}; else rm -f ${sq(gateProbePin)}; fi; ` +
+    `cd ${sq(wt)} && ${gateScopeEnv} QUALITY_GATES_SELECTION_PIN=${sq(gateProbePin)} ` +
+    `${sq(qgBin)} --list-selected` +
+    (idx === null ? ' )' : ` | grep -E '^(make|bash) ' | sed -n '${idx + 1}p' )`);
+  // gateInFlightNameCmd(idx, expectSel) — turn a stopped run's gate ORDINA — see build-level.design-notes-6.md#gateinflightnamecmd-idx-turn-a-stopped-run-s-gate-ordinal-into
+  // The `2>/dev/null` lives HERE, on the machine path, never in the builder — see build-level.design-notes-6.md#the-resolve-line-is-the-one-that-must-speak-no-stderr-redirect
+  const gateInFlightNameCmd = (idx, expectSel) =>
+    `if [ ! -x ${sq(qgBin)} ]; then echo '{"outcome":"GATE_NAME_UNKNOWN"}'; else ` +
+    `__L=$( ${gateInFlightSelectCmd(null)} 2>/dev/null ); ` +
+    `__ls=$(printf '%s\\n' "$__L" | sed -n 's/^QUALITY_GATES_SELECTION=//p' | tail -1); ` +
+    `__g=$(printf '%s\\n' "$__L" | grep -E '^(make|bash) ' | sed -n '${idx + 1}p' | tr -d '"\\\\'); ` +
+    `if [ -n ${sq(expectSel ?? '')} ] && [ -n "$__ls" ] && [ "$__ls" != ${sq(expectSel ?? '')} ]; then __g=''; fi; ` +
+    `if [ -n "$__g" ]; then printf '{"outcome":"GATE_NAMED","gate":"%s"}\\n' "$__g"; ` +
+    `else echo '{"outcome":"GATE_NAME_UNKNOWN"}'; fi; fi`;
   const gateCmd = (startAt, expectSelection) =>
     `set -o pipefail; if [ ! -x ${sq(qgBin)} ]; then echo '{"outcome":"GATE_ABSENT"}'; ` +
-    `else ${startAt === 0 ? `rm -f ${sq(gatePin)} ${sq(gateSliceLog)}; : >${sq(gateLog)}; ` : ''}` +
+    `else ${startAt === 0 ? `rm -f ${sq(gatePin)} ${sq(gateProbePin)} ${sq(gateSliceLog)}; : >${sq(gateLog)}; ` : ''}` +
     `( cd ${sq(wt)} && ${gateScrub} && ` +
     `${gateScopeEnv} QUALITY_GATES_SELECTION_PIN=${sq(gatePin)} ` +
     `${expectSelection ? `QUALITY_GATES_EXPECT_SELECTION=${sq(expectSelection)} ` : ''}` +
@@ -6824,6 +6900,10 @@ async function driveItemBuildPhase(item, arm, box) {
       ...(gateSliceResumeAt(gateOut) === undefined ? {} : { resumeAt: gateSliceResumeAt(gateOut) }),
       // The slice's own exit status, when the executor reported one. 75 is the — see build-level.design-notes-5.md#the-slice-s-own-exit-status-when-the-executor-reported-
       ...(gateOut.rc === undefined ? {} : { rc: Number(gateOut.rc) }),
+      // The LIST IDENTITY this slice walked (temperloop#1650 round 3). Already — see build-level.design-notes-6.md#the-list-identity-this-slice-walked-temperloop-1650-round-3
+      ...(typeof gateOut.selection === 'string' && gateOut.selection !== ''
+        ? { selection: gateOut.selection }
+        : {}),
     });
     if (gateOut.outcome !== 'GATE_SLICE') break;
     gateStartAt = Number(gateOut.resumeAt) || 0;
@@ -6888,9 +6968,37 @@ async function driveItemBuildPhase(item, arm, box) {
   }
   // A TIMEOUT is NOT a gate failure — its own escalation kind, so an opera — see build-level.design-notes-5.md#a-timeout-is-not-a-gate-failure-its-own-escalation-kind-so-a
   if (gateReport.verdict === 'UNKNOWN') {
+    // temperloop#1650 — NAME the gate in flight and the CLAMP, so the remedy is — see build-level.design-notes-6.md#temperloop-1650-name-the-gate-in-flight-and-the-clamp-so-the
+    const inFlightIndex = gateInFlightIndex(gateSliceLedger);
+    let inFlightGate = null;
+    if (inFlightIndex !== undefined) {
+      // The list identity the STOPPED RUN walked — the oracle the probe's own — see build-level.design-notes-6.md#the-list-identity-the-stopped-run-walked-the-oracle-the-probe
+      let expectSelection = '';
+      for (const s of gateSliceLedger) {
+        if (typeof s.selection === 'string' && s.selection !== '') expectSelection = s.selection;
+      }
+      inFlightGate = {
+        index: inFlightIndex,
+        slice: gateSliceLedger.length,
+        resolve: gateInFlightSelectCmd(inFlightIndex),
+        sliceLog: gateSliceLog,
+        ...(expectSelection === '' ? {} : { selection: expectSelection }),
+      };
+      // Fail-SOFT: the escalation is the deliverable, the name is an enrichment.
+      try {
+        const named = await runMachinery(gateInFlightNameCmd(inFlightIndex, expectSelection), {
+          label: `gate-inflight:${item.slug}`,
+          slug: item.slug,
+          bashTimeoutMs: GATE_INFLIGHT_NAME_TIMEOUT_MS,
+        });
+        const gateName = named && named.outcome === 'GATE_NAMED' ? String(named.gate ?? '').trim() : '';
+        if (gateName !== '') inFlightGate.gate = gateName;
+      } catch { /* an unresolved name never costs the escalation */ }
+    }
     return escalate(item.slug, 'acceptance-gate-timeout', {
       ...gatePayload,
-      remedy: 'raise BUILD_GATE_SLICE_SECS (bounded by the agent Bash cap) or split the gate list; re-run the gate to get a real verdict',
+      inFlightGate,
+      remedy: gateUnknownRemedy(gateOut.outcome, inFlightGate, gateSliceLedger.length),
     });
   }
   // A genuinely RED suite still escalates exactly as before — including th — see build-level.design-notes-5.md#a-genuinely-red-suite-still-escalates-exactly-as-before
