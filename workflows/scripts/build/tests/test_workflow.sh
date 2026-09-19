@@ -389,6 +389,15 @@ const reviewWaitLog = [];
 globalThis.reviewWaitLog = reviewWaitLog;
 globalThis.reviewWaitMap = reviewWaitMap;
 globalThis.setReviewWait = (slug, ...outcomes) => { reviewWaitMap.set(slug, outcomes); };
+// reviewRoundLog / reviewRoundMap — temperloop#2131's §3e round-telemetry emit,
+// on its own queue (see the mock arm's comment for why it must not share
+// machineryMap's FIFO). The log keeps each spawn's full command text, which is
+// what lets a case assert the exact flags handed to emit-issue-touch.sh.
+const reviewRoundMap = new Map();
+const reviewRoundLog = [];
+globalThis.reviewRoundLog = reviewRoundLog;
+globalThis.reviewRoundMap = reviewRoundMap;
+globalThis.setReviewRoundEmit = (slug, ...outcomes) => { reviewRoundMap.set(slug, outcomes); };
 globalThis.callLog = callLog;
 globalThis.machineryMap = machineryMap;
 globalThis.workerMap = workerMap;
@@ -480,6 +489,22 @@ globalThis.agent = async function agent(prompt, opts = {}) {
       if (/^review-wait:/.test(String(opts.label || ''))) {
         reviewWaitLog.push({ slug, label: String(opts.label) });
         return nextFromMap(reviewWaitMap, slug, { outcome: 'REVIEW_WAIT_ELAPSED', realized_secs: 1e9 });
+      }
+      // temperloop#2131: the §3e round-telemetry emit, on its OWN queue for the
+      // same reason worker-clock/worker-usage/review-wait have theirs — it is a
+      // fire-and-forget telemetry call made at 3h, and letting it consume from
+      // the shared per-slug machineryMap FIFO would desync every case whose
+      // item carries a ghIssue. The log captures the emitted COMMAND TEXT so a
+      // case can assert what was actually handed to emit-issue-touch.sh.
+      if (/^review-round:/.test(String(opts.label || ''))) {
+        reviewRoundLog.push({ slug, label: String(opts.label), promptFull: String(prompt) });
+        // Default: the emit SUCCEEDED for every record the command actually
+        // carries — counted off the command text itself, the same way the real
+        // script counts what it printed, so the default can never claim more
+        // emits than the driver asked for. A case that wants the degraded arm
+        // wires a smaller count explicitly via setReviewRoundEmit.
+        const emitted = (String(prompt).match(/--kind review-round/g) || []).length;
+        return nextFromMap(reviewRoundMap, slug, { outcome: 'REVIEW_ROUNDS_EMITTED', records: emitted });
       }
       // Solo executor (gate / recover-probe / push-retry) — routed by slug.
       return nextFromMap(machineryMap, slug, { outcome: 'ERROR', error: 'unexpected machinery call for ' + slug });
@@ -5300,7 +5325,7 @@ echo "PASS: #939 throw guard — callWorker() normalizes a thrown lost return"
 # moving any branching decision out of the .mjs.
 # ============================================================================
 
-run_node_case "K942 spawn count: an L0-shaped 3-item level spends 6 machinery executors per item, not one per command" "
+run_node_case "K942 spawn count: an L0-shaped 3-item level spends a fixed handful of machinery executors per item, not one per command" "
 $PREAMBLE
 
 // Board ON + ghIssue → the full L0 shape: claim, worktree, gate, rebase, scan,
@@ -5344,23 +5369,26 @@ const soloCalls = machineryCalls.filter(c => !/^Steps: /m.test(c.promptFull)).le
 const unbatched = machineryStepLog.length + soloCalls;
 
 if (!reason && workerCalls.length !== 3) reason = 'expected 3 worker spawns, got ' + workerCalls.length;
-// 8 machinery executors per item: prelude, worker-clock + worker-usage
+// 9 machinery executors per item: prelude, worker-clock + worker-usage
 // (temperloop#2065 — bracketing the worker call excluded from this filtered
 // view), review-diff (temperloop#1430), gate-freshness (temperloop#1937),
-// gate, pr-batch, ci-batch.
-if (!reason && machineryCalls.length !== 24) reason = 'expected 24 machinery executors (8/item), got ' + machineryCalls.length + ': ' + JSON.stringify(machineryCalls.map(c => c.opts.label));
-if (!reason && callLog.length !== 27) reason = 'expected 27 total agent spawns for the level, got ' + callLog.length;
+// gate, pr-batch, ci-batch, review-round (temperloop#2131 — ONE emit per item
+// carrying every round, never one per round, and only for an item that has a
+// tracker issue to key the lake records on).
+if (!reason && machineryCalls.length !== 27) reason = 'expected 27 machinery executors (9/item), got ' + machineryCalls.length + ': ' + JSON.stringify(machineryCalls.map(c => c.opts.label));
+if (!reason && callLog.length !== 30) reason = 'expected 30 total agent spawns for the level, got ' + callLog.length;
 // …and that is a real reduction against the un-batched equivalent of this run.
-if (!reason && unbatched !== 45) reason = 'expected the un-batched equivalent to be 45 spawns, got ' + unbatched;
+if (!reason && unbatched !== 48) reason = 'expected the un-batched equivalent to be 48 spawns, got ' + unbatched;
 if (!reason && !(machineryCalls.length < unbatched)) reason = 'batching did not reduce machinery spawns: ' + machineryCalls.length + ' vs ' + unbatched;
 
-// Per item, the executors are exactly these eight, in this order — the
+// Per item, the executors are exactly these nine, in this order — the
 // temperloop#2065 clock/usage seam brackets the (filtered-out) worker call,
 // strictly between prelude and review; the temperloop#1937 freshness check
-// runs strictly between review and the gate.
+// runs strictly between review and the gate; and temperloop#2131's round
+// telemetry emits LAST, after the CI poll, when the round set is final.
 for (const slug of ['a1', 'a2', 'a3']) {
   const labels = machineryCalls.filter(c => (c.opts.label||'').includes(slug)).map(c => c.opts.label);
-  const want = ['prelude:' + slug, 'worker-clock:' + slug + '#worker:' + slug, 'worker-usage:' + slug + '#worker:' + slug, 'review-diff:' + slug, 'gate-freshness:' + slug, 'gate:' + slug, 'pr-batch:' + slug, 'ci-batch:' + slug + '#0'];
+  const want = ['prelude:' + slug, 'worker-clock:' + slug + '#worker:' + slug, 'worker-usage:' + slug + '#worker:' + slug, 'review-diff:' + slug, 'gate-freshness:' + slug, 'gate:' + slug, 'pr-batch:' + slug, 'ci-batch:' + slug + '#0', 'review-round:' + slug];
   if (!reason && JSON.stringify(labels) !== JSON.stringify(want))
     reason = slug + ' machinery executors wrong: ' + JSON.stringify(labels);
   // Every mechanical step still RAN — batching removed spawns, not work.
@@ -7508,6 +7536,11 @@ else {
     [/^pr-batch:/,     'PR'],
     [/^ci-batch:/,     'CI'],
     [/^worker-cifix:/, 'CI'],
+    // temperloop#2131 — the round-telemetry emit fires at 3h, AFTER the CI
+    // poll settles (that is when the round set is final), so it belongs to the
+    // CI group rather than to 'review'. Distinct prefix from review-diff:, so
+    // the two never collide.
+    [/^review-round:/, 'CI'],
   ];
   for (const c of callLog) {
     const label = String(c.opts.label || '');
@@ -15532,6 +15565,285 @@ K2083_14="$(grep -F 'revalidated before' "$K2083_BMDF" || true)"
 printf '%s' "$K2083_14" | grep -F 'merge_blocked' >/dev/null   || fail "#2083 r3: Step 1.4's resume revalidation says nothing about \`merge_blocked\` — a green, OPEN PR is exactly what a blocked item looks like, so a resume would roll it straight into the gate"
 printf '%s' "$K2083_SEL" | grep -F 'PLAN NOTE' >/dev/null   || fail "#2083 r3: Step 4's selected set still reads the in-memory level summary as its authority — the one source a resumed run does not have"
 echo "PASS: #2083 r3 — the barrier names its safe branch positively, every summary shape carries the held discriminant, and merge_blocked has a durable writer/parser/resume path"
+
+# ============================================================================
+# TESTS (K2131): §3e ROUND TELEMETRY — the round history into the parked
+#   record, the raw lake and the PR body, so rounds-to-merge is a QUERY.
+#
+#   Four surfaces, each verified by EXECUTION:
+#     1. park()'s review.rounds — one entry per round, with the round ordinal,
+#        its kind, the reviewers that ran (name + RESOLVED model + H/M/L) and
+#        the round's reviewed sha / wall-clock / tokens.
+#     2. emit-issue-touch.sh actually ACCEPTS --kind review-round and the
+#        record LANDS in the lake. The failure being closed is a silent drop on
+#        a ZERO exit (the pre-#2131 case arm WARNed and exited 0 on any kind
+#        outside {pr-open, merge}), so a source grep cannot discharge this —
+#        the fixture below reads the written file back.
+#     3. the PR body's §3e line renders the bucketed round count, grouped over
+#        escalationRoundKind()'s vocabulary (temperloop#2135): gate =
+#        gate-timeout + gate-fail, other = activation + ci + other.
+#     4. a rollup over a FIXTURE lake reproduces rounds-per-PR for a known
+#        week with no GitHub call — the query the whole item exists to enable,
+#        run here as the exact recipe meta/data/raw/README.md documents.
+# ============================================================================
+run_node_case "K2131 round record: one entry per round, with the RESOLVED (self-reported) reviewer model and per-round H/M/L counts" "
+$PREAMBLE
+const TAB = String.fromCharCode(9);
+const tsv = '.sh' + TAB + 'shell-reviewer' + TAB + 'claude/agents/reviewers/shell-reviewer.md\\n';
+
+// Item 1 — the reviewer SELF-REPORTS its resolved model.
+setMachinery('rr-model',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/rr-model' },
+  { outcome: 'REVIEW_DIFF', files: ['workflows/scripts/thing.sh'], tsv, tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv),
+    review_rounds: 0, review_prior_sha: '', review_head_sha: 'abcdef1234567' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'a5c' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'a5c', branch: 'build/rr-model' },
+  { outcome: 'PR_OPENED', pr_number: 2131 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('rr-model');
+setReview('rr-model',
+  '## Findings\\n### [MEDIUM] one\\ntext\\n### [MEDIUM] two\\ntext\\n### [LOW] three\\ntext\\n<!-- 3e-model: claude-opus-5-test -->\\n');
+
+// Item 2 — the CONTROL: a reviewer that emits no marker. Same route, same
+// shape; only the self-report differs, so the model field is proven to DISCRIMINATE
+// rather than always carrying one constant.
+setMachinery('rr-nomodel',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/rr-nomodel' },
+  { outcome: 'REVIEW_DIFF', files: ['workflows/scripts/other.sh'], tsv, tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv),
+    review_rounds: 2, review_prior_sha: '', review_head_sha: 'not-a-sha' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'a4d' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'a4d', branch: 'build/rr-nomodel' },
+  { outcome: 'PR_OPENED', pr_number: 2132 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('rr-nomodel');
+setReview('rr-nomodel', '## Findings\\n(none)\\n');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'rr-model', branch: 'build/rr-model', title: 'Self-reporting reviewer', kind: 'impl', acceptance: ['c'], ghIssue: 2131 },
+  { slug: 'rr-nomodel', branch: 'build/rr-nomodel', title: 'Silent reviewer', kind: 'impl', acceptance: ['c'], ghIssue: 2132 },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+const byslug = (s) => (result.parked ?? []).find(p => p.slug === s);
+let reason = null;
+if ((result.parked ?? []).length !== 2) reason = 'expected 2 parked: ' + JSON.stringify(result);
+const a = byslug('rr-model');
+const b = byslug('rr-nomodel');
+if (!reason && (!a || !a.review || !Array.isArray(a.review.rounds)))
+  reason = 'park().review must carry a rounds ARRAY: ' + JSON.stringify(a && a.review);
+else if (!reason && a.review.rounds.length !== 1)
+  reason = 'a 1-round item must list exactly one round entry: ' + JSON.stringify(a.review.rounds);
+const r0 = !reason ? a.review.rounds[0] : null;
+if (!reason && r0.round !== 1)
+  reason = 'round ordinal must come from the durable counter (0 prior -> 1): ' + JSON.stringify(r0);
+else if (!reason && r0.kind !== 'review')
+  reason = 'the 3e pass is a REVIEW round in escalationRoundKind() vocabulary: ' + JSON.stringify(r0);
+else if (!reason && r0.sha !== 'abcdef1234567')
+  reason = 'round.sha must be the commit the round reviewed (review_head_sha): ' + JSON.stringify(r0);
+else if (!reason && !('wall_ms' in r0 && 'tokens' in r0))
+  reason = 'every round entry carries wall_ms and tokens, present even at their null baseline: ' + JSON.stringify(r0);
+else if (!reason && r0.tokens !== null)
+  reason = 'tokens is the honest null degrade (agent() reports no usage envelope), never a fabricated number: ' + JSON.stringify(r0);
+else if (!reason && r0.reviewers.length !== 1)
+  reason = 'one reviewers entry per reviewer that RAN: ' + JSON.stringify(r0);
+else if (!reason && r0.reviewers[0].name !== 'shell-reviewer')
+  reason = 'reviewers[].name must be the reviewer that ran: ' + JSON.stringify(r0.reviewers);
+else if (!reason && r0.reviewers[0].model !== 'claude-opus-5-test')
+  reason = 'reviewers[].model must be the RESOLVED, self-reported model — not the seat file inherit/declared value: ' + JSON.stringify(r0.reviewers);
+else if (!reason && !(r0.reviewers[0].highs === 0 && r0.reviewers[0].mediums === 2 && r0.reviewers[0].lows === 1))
+  reason = 'per-round H/M/L counts must come off this round findings: ' + JSON.stringify(r0.reviewers);
+// The marker is telemetry ONLY: it must never reach the rendered PR body.
+const prBatch = callLog.find(c => (c.opts.label||'').startsWith('pr-batch:rr-model'));
+if (!reason && !prBatch) reason = 'no pr-batch call for rr-model';
+if (!reason && prBatch.promptFull.includes('3e-model:'))
+  reason = 'the self-reported-model telemetry line must be STRIPPED before the body is rendered: ' + prBatch.promptFull.slice(0, 400);
+if (!reason && !prBatch.promptFull.includes('rounds: 1 (review 1, gate 0, other 0)'))
+  reason = 'the 3e ran-line must carry the bucketed round count: ' + prBatch.promptFull.slice(0, 600);
+// CONTROL — same pipeline, no marker, inflated prior counter, garbled sha.
+if (!reason && (!b || !b.review || b.review.rounds.length !== 1))
+  reason = 'control must also carry exactly one round entry: ' + JSON.stringify(b && b.review);
+else if (!reason && b.review.rounds[0].round !== 3)
+  reason = 'a CONTINUATION round must report the DURABLE ordinal (2 prior -> 3), never 1: ' + JSON.stringify(b.review.rounds[0]);
+else if (!reason && b.review.rounds[0].reviewers[0].model !== null)
+  reason = 'an unreported model must read null, never a declared/guessed value: ' + JSON.stringify(b.review.rounds[0]);
+else if (!reason && b.review.rounds[0].sha !== null)
+  reason = 'a garbled review_head_sha must degrade to null, never to plausible residue: ' + JSON.stringify(b.review.rounds[0]);
+// The lake emit fired for both, carrying the flags emit-issue-touch.sh parses.
+const emitA = reviewRoundLog.find(e => e.slug === 'rr-model');
+if (!reason && !emitA)
+  reason = 'no review-round emit spawned for an item with a ghIssue — the lake half never ran';
+else if (!reason && !emitA.promptFull.includes('--kind review-round'))
+  reason = 'the emit command must invoke emit-issue-touch.sh with --kind review-round: ' + emitA.promptFull.slice(0, 600);
+else if (!reason && !emitA.promptFull.includes('--round-kind ' + String.fromCharCode(39) + 'review' + String.fromCharCode(39)))
+  reason = 'the emit command must carry the round kind: ' + emitA.promptFull.slice(0, 600);
+else if (!reason && !emitA.promptFull.includes('claude-opus-5-test'))
+  reason = 'the emit command must carry the resolved model in its reviewers payload: ' + emitA.promptFull.slice(0, 900);
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+run_node_case "K2131 multi-round: a CI-fix re-review adds a SECOND round entry, classified ci by escalationRoundKind(), and the body count follows" "
+$PREAMBLE
+const TAB = String.fromCharCode(9);
+const tsv = '.sh' + TAB + 'shell-reviewer' + TAB + 'claude/agents/reviewers/shell-reviewer.md\\n';
+
+setMachinery('rr-two',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/rr-two' },
+  { outcome: 'REVIEW_DIFF', files: ['workflows/scripts/thing.sh'], tsv, tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv),
+    review_rounds: 0, review_prior_sha: '', review_head_sha: 'aaaaaaa1111' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'a15e' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'a15e', branch: 'build/rr-two' },
+  { outcome: 'PR_OPENED', pr_number: 2133 },
+  { outcome: 'CI_FAILED', failed_run_ids: [1] },
+  { outcome: 'REVIEW_DIFF', files: ['workflows/scripts/thing.sh'], tsv, tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv),
+    review_rounds: 1, review_prior_sha: 'aaaaaaa1111', review_head_sha: 'bbbbbbb2222' },
+  { outcome: 'PUSHED', sha: 'bbbb', branch: 'build/rr-two' },
+  { outcome: 'CI_GREEN' },
+  { outcome: 'BODY_UPDATED', pr_number: 2133 },
+);
+setWorker('rr-two',
+  { status: 'done', summary: 'initial', acceptance_results: [{ criterion: 'c', passed: true, evidence: 'e' }], commits: [] },
+  { status: 'done', summary: 'ci fixed', acceptance_results: [], commits: [] },
+);
+setReview('rr-two',
+  '## r1\\n### [LOW] nit\\ntext\\n<!-- 3e-model: model-round-one -->\\n',
+  '## r2\\n### [MEDIUM] fix-round finding\\ntext\\n<!-- 3e-model: model-round-two -->\\n',
+);
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'rr-two', branch: 'build/rr-two', title: 'Two rounds', kind: 'impl', acceptance: ['c'], ghIssue: 2133 },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+let reason = null;
+if ((result.parked ?? []).length !== 1) reason = 'expected 1 parked: ' + JSON.stringify(result);
+const rec = (result.parked ?? [])[0];
+const rounds = (rec && rec.review && rec.review.rounds) || [];
+if (!reason && rounds.length !== 2)
+  reason = 'a 2-round item must list TWO round entries (the flattened ran[] cannot say this): ' + JSON.stringify(rec && rec.review);
+else if (!reason && !(rounds[0].kind === 'review' && rounds[1].kind === 'ci'))
+  reason = 'the 3e pass is review; a CI-fix re-review classifies as ci through escalationRoundKind(): ' + JSON.stringify(rounds);
+else if (!reason && !(rounds[0].round === 1 && rounds[1].round === 2))
+  reason = 'round ordinals must advance with the durable counter: ' + JSON.stringify(rounds);
+else if (!reason && !(rounds[0].sha === 'aaaaaaa1111' && rounds[1].sha === 'bbbbbbb2222'))
+  reason = 'each round must record the commit IT reviewed, not one shared sha: ' + JSON.stringify(rounds);
+else if (!reason && !(rounds[0].reviewers[0].model === 'model-round-one' && rounds[1].reviewers[0].model === 'model-round-two'))
+  reason = 'the resolved model is recorded PER ROUND (inherit resolves per session, so it can differ): ' + JSON.stringify(rounds);
+else if (!reason && !(rounds[0].reviewers[0].lows === 1 && rounds[1].reviewers[0].mediums === 1))
+  reason = 'severity counts must be scoped to their own round: ' + JSON.stringify(rounds);
+const upd = callLog.find(c => (c.opts.label||'') === 'pr-body-update:rr-two');
+if (!reason && !upd) reason = 'no pr-body-update call — the merged round render never happened';
+if (!reason && upd.promptFull.includes('rounds: 2 (review 2, gate 0, other 0)'))
+  reason = 'a ci round must NOT be counted in the review bucket: ' + upd.promptFull.slice(0, 600);
+if (!reason && !upd.promptFull.includes('rounds: 2 (review 1, gate 0, other 1)'))
+  reason = 'the re-rendered 3e line must bucket the ci round under other (activation+ci+other): ' + upd.promptFull.slice(0, 600);
+const emit = reviewRoundLog.find(e => e.slug === 'rr-two');
+if (!reason && !emit) reason = 'no review-round emit for rr-two';
+else if (!reason && (emit.promptFull.match(/--kind review-round/g) || []).length !== 2)
+  reason = 'ONE lake record per round — expected 2 invocations in the emit command: ' + emit.promptFull.slice(0, 900);
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+# --- K2131 lockstep guards --------------------------------------------------
+# The behavioural cases above prove the fields DISCRIMINATE; these pin the
+# names in the .mjs so a rename or revert fails loudly here rather than
+# silently un-covering them (the convention every feature in this suite
+# follows, e.g. the K1984 block above).
+grep -F 'review-round' "$MJS" >/dev/null \
+  || fail "#2131: build-level.mjs must wire emit-issue-touch.sh --kind review-round — the lake half of the round history (workflows/scripts/validate-issue-touch-emit.sh is the CI-side owner of this same fact)"
+grep -F 'reviewRoundRecord' "$MJS" >/dev/null \
+  || fail "#2131: reviewTally() must build its rounds[] from reviewRoundRecord() — one producer for the parked record, the lake and the PR body, so the three cannot drift"
+grep -F 'escalationRoundKind(' "$MJS" >/dev/null \
+  || fail "#2131/#2135: the round-kind mapping must stay owned by escalationRoundKind() — a second mapping is exactly what this cites rather than re-derives"
+
+# --- K2131 lake fixture: the record actually LANDS (acceptance 2 + 3) --------
+# The failure being closed is a SILENT DROP ON A ZERO EXIT, so this reads the
+# written file back rather than grepping the script source: before #2131 the
+# kind case arm matched pr-open|merge and WARNed-then-exited-0 on anything
+# else, which is indistinguishable from success at an `emit-… || true` call
+# site and surfaces only as an ABSENT record.
+K2131_EMIT="$REPO_ROOT/workflows/scripts/emit-issue-touch.sh"
+[ -x "$K2131_EMIT" ] || fail "#2131: emit-issue-touch.sh missing or not executable at $K2131_EMIT"
+K2131_LAKE="$WF_TEST_TMPDIR/k2131-lake"
+mkdir -p "$K2131_LAKE"
+K2131_MONTH="$(date -u +%Y-%m)"
+K2131_OUT="$(ISSUE_TOUCHES_RAW_DIR="$K2131_LAKE" "$K2131_EMIT" \
+  --repo owner/repo --issue 2131 --kind review-round \
+  --round 3 --round-kind ci --pr 1207 --sha deadbeefcafe --wall-ms 12000 --tokens '' \
+  --reviewers '[{"name":"shell-reviewer","model":"claude-opus-5","highs":1,"mediums":2,"lows":0}]' 2>&1)"
+K2131_FILE="$K2131_LAKE/issue-touches-${K2131_MONTH}.jsonl"
+[ -f "$K2131_FILE" ] \
+  || fail "#2131: --kind review-round wrote NO lake file — the record was dropped silently on a zero exit (stdout/stderr: $K2131_OUT)"
+K2131_LINE="$(grep -F '"kind":"review-round"' "$K2131_FILE" | head -1 || true)"
+[ -n "$K2131_LINE" ] \
+  || fail "#2131: no review-round record in $K2131_FILE — the kind case arm accepted the flag but nothing landed"
+printf '%s' "$K2131_LINE" | jq -e '.round == 3 and .round_kind == "ci" and .pr == 1207 and .sha == "deadbeefcafe" and .wall_ms == 12000 and .tokens == null' >/dev/null \
+  || fail "#2131: the landed record lost or mangled its per-round fields: $K2131_LINE"
+printf '%s' "$K2131_LINE" | jq -e '.reviewers | length == 1 and (.[0].name == "shell-reviewer") and (.[0].model == "claude-opus-5") and (.[0].highs == 1) and (.[0].mediums == 2) and (.[0].lows == 0)' >/dev/null \
+  || fail "#2131: the landed record lost its reviewers payload (name/model/H-M-L): $K2131_LINE"
+# CONTROL 1 — an unknown kind STILL drops (the guard was widened, not removed).
+K2131_BOGUS_LAKE="$WF_TEST_TMPDIR/k2131-bogus"
+mkdir -p "$K2131_BOGUS_LAKE"
+ISSUE_TOUCHES_RAW_DIR="$K2131_BOGUS_LAKE" "$K2131_EMIT" --repo owner/repo --issue 2131 --kind not-a-kind >/dev/null 2>&1 \
+  || fail "#2131: an unknown kind must still WARN-and-exit-0, never fail the calling step"
+[ -z "$(ls -A "$K2131_BOGUS_LAKE" 2>/dev/null)" ] \
+  || fail "#2131: an unknown kind must still emit NOTHING — the closed enum was widened by exactly one member, not opened"
+# CONTROL 2 — a pr-open record is byte-identical in SHAPE to before this item:
+# it carries none of the seven review-round fields.
+K2131_LEGACY_LAKE="$WF_TEST_TMPDIR/k2131-legacy"
+mkdir -p "$K2131_LEGACY_LAKE"
+ISSUE_TOUCHES_RAW_DIR="$K2131_LEGACY_LAKE" "$K2131_EMIT" --repo owner/repo --issue 2131 --kind pr-open >/dev/null 2>&1
+grep -F '"kind":"pr-open"' "$K2131_LEGACY_LAKE/issue-touches-${K2131_MONTH}.jsonl" | head -1 \
+  | jq -e 'has("round") == false and has("round_kind") == false and has("reviewers") == false' >/dev/null \
+  || fail "#2131: a pr-open record must keep its pre-#2131 shape — no review-round detail leaked onto it"
+echo "PASS: #2131 lake fixture — --kind review-round is ACCEPTED and its record LANDS with every per-round field, while an unknown kind still drops and pr-open keeps its old shape"
+
+# --- K2131 rollup: rounds-per-PR for a known week, no GitHub call ------------
+# Acceptance 7, run as the EXACT recipe meta/data/raw/README.md documents. The
+# fixture deliberately carries out-of-week records, a non-review-round kind and
+# two PRs, so the rollup is proven to FILTER and GROUP rather than to count
+# every line in the file.
+K2131_ROLL="$WF_TEST_TMPDIR/k2131-rollup"
+mkdir -p "$K2131_ROLL"
+cat > "$K2131_ROLL/issue-touches-2026-09.jsonl" <<'K2131_FIXTURE_EOF'
+{"schema_version":"1","ts":"2026-09-14T10:00:00Z","repo":"acme/w","issue":42,"session_id":null,"host":"h","kind":"review-round","round":1,"round_kind":"review","pr":1207,"sha":"aaaaaaa","wall_ms":1000,"tokens":null,"reviewers":[]}
+{"schema_version":"1","ts":"2026-09-15T10:00:00Z","repo":"acme/w","issue":42,"session_id":null,"host":"h","kind":"review-round","round":2,"round_kind":"ci","pr":1207,"sha":"bbbbbbb","wall_ms":2000,"tokens":null,"reviewers":[]}
+{"schema_version":"1","ts":"2026-09-16T10:00:00Z","repo":"acme/w","issue":42,"session_id":null,"host":"h","kind":"review-round","round":3,"round_kind":"review","pr":1207,"sha":"ccccccc","wall_ms":3000,"tokens":null,"reviewers":[]}
+{"schema_version":"1","ts":"2026-09-16T11:00:00Z","repo":"acme/w","issue":43,"session_id":null,"host":"h","kind":"review-round","round":1,"round_kind":"review","pr":1208,"sha":"ddddddd","wall_ms":4000,"tokens":null,"reviewers":[]}
+{"schema_version":"1","ts":"2026-09-16T12:00:00Z","repo":"acme/w","issue":43,"session_id":null,"host":"h","kind":"pr-open"}
+{"schema_version":"1","ts":"2026-09-09T10:00:00Z","repo":"acme/w","issue":42,"session_id":null,"host":"h","kind":"review-round","round":9,"round_kind":"review","pr":1207,"sha":"eeeeeee","wall_ms":5000,"tokens":null,"reviewers":[]}
+{"schema_version":"1","ts":"2026-09-22T10:00:00Z","repo":"acme/w","issue":43,"session_id":null,"host":"h","kind":"review-round","round":9,"round_kind":"review","pr":1208,"sha":"fffffff","wall_ms":6000,"tokens":null,"reviewers":[]}
+K2131_FIXTURE_EOF
+K2131_ROLLUP="$(jq -s -c '
+    map(select(.kind == "review-round"
+               and .ts >= "2026-09-14T00:00:00Z"
+               and .ts <  "2026-09-21T00:00:00Z"))
+    | group_by(.pr)
+    | map({pr: .[0].pr, issue: .[0].issue, rounds: length,
+           kinds: (group_by(.round_kind) | map({(.[0].round_kind): length}) | add)})
+    | sort_by(.pr)' "$K2131_ROLL/issue-touches-2026-09.jsonl")"
+K2131_WANT='[{"pr":1207,"issue":42,"rounds":3,"kinds":{"ci":1,"review":2}},{"pr":1208,"issue":43,"rounds":1,"kinds":{"review":1}}]'
+[ "$K2131_ROLLUP" = "$K2131_WANT" ] \
+  || fail "#2131 rollup: rounds-per-PR for the week of 2026-09-14 must read straight off the lake. want $K2131_WANT got $K2131_ROLLUP"
+# Lockstep: the recipe run above is the one the sink spec publishes. If the
+# README drifts, this fails rather than letting the documented query rot.
+K2131_README="$REPO_ROOT/meta/data/raw/README.md"
+grep -F 'kind == "review-round"' "$K2131_README" >/dev/null \
+  || fail "#2131: meta/data/raw/README.md must publish the rounds-per-PR rollup recipe this suite executes"
+grep -F 'group_by(.pr)' "$K2131_README" >/dev/null \
+  || fail "#2131: the published rollup recipe must still group by PR — the documented query drifted from the tested one"
+grep -F '"review-round"' "$K2131_README" >/dev/null \
+  || fail "#2131: meta/data/raw/README.md must document review-round in the issue-touches kind column"
+echo "PASS: #2131 rollup — rounds-per-PR for a known week is a jq query over the fixture lake alone (no GitHub call), and the README publishes the exact recipe"
 
 # --- K2142 §3e.5 emitted-gate-command guards (structural + behavioural) ------
 # temperloop#2142. The emitted gate command scrubs the pipeline's own
