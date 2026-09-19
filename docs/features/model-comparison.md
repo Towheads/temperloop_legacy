@@ -40,6 +40,21 @@ verdict from statistically indistinguishable numbers. Every report this
 module produces is required to say plainly when it can't tell winner from
 noise, rather than pick one anyway.
 
+**A second harness measures the opposite case: new work, not closed work.**
+Everything above compares models on this repo's *already-merged* history —
+work whose outcome is already known before either arm even runs. That
+structurally cannot answer the question an operator actually faces
+day-to-day: is a candidate model good enough to build *the work still on the
+board*, decided before any of it ships? Waiting for enough of today's items
+to become tomorrow's closed history would also inherit the replay corpus's
+own yield problem (as low as 25% on a recent window, above) — much of that
+history turns out to be unusable as a replay anyway. The **dual-build
+harness** (`/build --dual-build`, epic temperloop#2065) answers it directly
+instead: build each in-scope item of a level under two models at the moment
+the work actually happens, judge the two results against each other, and
+ship the winner — so the comparison runs on work the repo was already going
+to do, never on a synthetic or backward-looking sample.
+
 ## How it works
 
 The module has five moving parts: an always-on attribution stream, a
@@ -462,6 +477,107 @@ adds no autonomous or cron arm of its own. Which candidate models and
 vendors an operator actually tests, and their API keys, are overlay/operator
 configuration, never a kernel default.
 
+### Dual-build harness (temperloop#2065)
+
+Given `/build --dual-build <tier>=<candidate>`, every plan item in a level
+whose `model:` field equals `<tier>` is built **twice** in that level: once
+on `DUAL_BUILD_BASELINE_MODEL` (that tier's current model), once on
+`<candidate>` (or `DUAL_BUILD_CANDIDATE_MODEL` when `=<candidate>` is
+omitted). Both settings are literal, tracked-config defaults — never
+inherited from `$HOME` or the invoking session — because each arm's model
+has to stay fixed and disclosed for the whole level. The flag is
+**per-invocation and the only thing that arms the harness**: no setting,
+environment variable, plan-note field, or prior run turns it on, so a
+`/build` with no flag is byte-identical to before the harness existed.
+Items outside the tested tier build once, exactly as today.
+
+**Pre-flight and consent.** Before anything is built, `/build`'s Step 1.9
+projects every level's cost via `dual-build-preflight.sh` against the
+model-comparison module's own shared `REPLAY_PREFLIGHT_CEILING_TOKENS`
+ceiling (never a second, dual-build-specific one) and **declines** — building
+that level single-arm instead — a level with fewer than
+`DUAL_BUILD_MIN_INSCOPE_ITEMS` in-scope items, a candidate provider with no
+usable credential, or a projected spend over the ceiling. Every other level
+is put to the operator in **one** consent ask for the whole run, not one per
+level: the in-scope slugs, every decline and why, both arm names, and the
+cumulative spend line. Doubling a run's spend carries no safe default, so
+this ask is never timed — on an operator-absent run the question is posted
+and the run **parks** rather than proceeding on a timeout.
+
+**The level barrier.** A dual-built level cannot interleave build → gate → PR
+per item the way a single-arm level does: both arms build, locally gate, and
+get pairwise-judged on **every** in-scope item before a single PR opens for
+the level (ADR 0038). This is what stops `main` from ever accumulating a
+level authored by an unchosen mix of two models. A `/build` resumed
+**without** the flag over a level that was interrupted mid-barrier — arm rows
+recorded, no level pick yet — refuses outright, naming the level and how to
+finish or clear it, rather than completing single-arm and picking a side by
+omission.
+
+**Arm isolation.** Each arm gets its own worktree and branch, disambiguated
+with an `@<arm>` suffix — `<repo>.wt/<slug>@baseline` / `build/<slug>@baseline`
+and the same for `candidate` — a namespace lexically disjoint from a plain
+slug's path, so an ordinary single-arm build is untouched by the convention's
+existence. A `.dual-build-arm` marker dropped in each arm's worktree root
+names its sibling's worktree path and branch, and a `PreToolUse` hook,
+`claude/hooks/arm-read-guard.sh`, **denies** any `Read`/`Glob`/`Grep`/`Bash`
+call that reaches into the sibling's path or branch — the comparison is only
+evidence if the two arms never see each other's work. The hook is inert
+outside a marked worktree, fails open on its own internal error, and records
+every denied attempt to `.dual-build-cross-read-attempts.jsonl` beside the
+marker, which the ledger folds in as `cross_read_attempted`.
+
+**The pairwise judge.** `judge.sh pairwise` asks one question — which of
+these two diffs is better for this item — never two independent absolute
+scores, since scale noise between two separate calls would be
+indistinguishable from a genuine preference. It sends the SAME prompt twice,
+with the two diffs' screen position swapped, and reports a preference only
+when both orders agree on it (`order_agreement: true`); when the orders
+disagree, the reported preference is `tie` with `order_agreement: false` and
+`margin: 0` — a screen-position artifact is reported as exactly that, never
+as a confident-looking number. The existing judge-is-never-the-candidate
+guard checks **both** arms: a judge equal to either one refuses the whole
+comparison before either order is spawned.
+
+**The ledger.** Every arm's row for an item — model, base/head SHA, gate
+result, cost (worker tokens, wall-clock, retry tokens, retry count), the
+judge verdict, the level's pick, an override if one happened, and a
+`loss_reason` when it lost — is appended to
+`.temperloop/model-comparison/dual-build/rows.jsonl` (ADR 0039), a folder of
+its own rather than a piggyback on any resume/retry ledger, so the record
+survives past the run that wrote it and is never invalidated by an unrelated
+machinery-version bump. A `git format-patch` archive per (item, arm) sits
+beside it, so a losing arm's full diff is preserved — unshipped, never lost —
+until `dual-build purge`/`prune` reclaims it.
+
+**Level pick and the two operator levers.** Once every in-scope item is
+judged, the arm with more item wins ships the level: a gate failure counts
+as a loss for that arm on that item, a judged tie counts for neither arm, and
+an overall tie goes to the cheaper arm by whole-job cost. Only the winning
+arm's branches proceed through `/build`'s existing PR → CI → merge flow; the
+losing arm's branches are archived, then deleted only once their saved patch
+is proven to still apply. Two levers sit on this decision, both riding
+`/build`'s existing escalation seam rather than a new prompt (ADR 0038): an
+operator may **override a single item** — merges the losing arm's branch for
+that item, records a reason, and marks the level `mixed` — and, while the
+judge's calibration reads anything other than `calibrated`, every level pick
+requires an explicit, no-default, never-timed operator confirmation before
+any PR opens; once calibrated, that same confirmation becomes an *optional*
+override with the identical grammar (confirm the tally, override the whole
+level, or override named items).
+
+**Calibrate mode.** The pairwise judge's preference has never been checked
+against a human, so a `calibrate` mode (ADR 0041) samples archived item pairs
+**blind** — both diffs shown, the judge's own preference and margin withheld —
+and records a human preference. Only these blind pairs count toward the
+agreement statistic; an operator's own overrides are recorded in the same
+shape but excluded by construction, since an override is a disagreement every
+time and would bias the statistic toward looking worse than the judge really
+is. The report may name a winning arm only once judge–human agreement reaches
+**≥70% over ≥20 blind pairs**; below that bar — including the starting `NEVER
+CALIBRATED` state — every report states the calibration status plainly
+instead of naming a winner.
+
 ### Dual-build cumulative report (temperloop#2084, epic #2065)
 
 A sibling to the comparison report above, over a different corpus: rather
@@ -528,6 +644,39 @@ absent `tokens` producer would.
   the scored-only quality/compatibility split — the report derives neither
   itself, so a bound in the report and a bound from the library can never
   disagree.
+- The dual-build harness additionally **consumes** `/build`'s own worktree,
+  branch-naming, PR and merge machinery (`worktree.sh --arm`, `pr.sh`, the
+  Step 4 merge gate) and `judge.sh`'s single-judge rubric lineage (the
+  pairwise mode reuses the same rubric.md content, never a second rubric);
+  it **produces** the `.temperloop/model-comparison/dual-build/` ledger and
+  patch archives (ADR 0039), the `Model-comparison-arms:` PR trailer (ADR
+  0040), and the blind-calibration record (`calibration-pairs.jsonl` /
+  `calibration.json`, ADR 0041).
+
+**`/build --dual-build`'s own entry points.** `claude/commands/build.md` Step
+1.9 owns flag resolution, the pre-flight/consent gate, and the
+partial-dual-build resume refusal; `claude/workflows/build-level.mjs` owns
+the level-barrier build, the level pick, and the two operator levers. Nothing
+about `/sweep`, `/fix`, or a flag-less `/build` changes by this harness
+existing — the same inert-until-invoked standing the rest of this module
+holds (ADR 0027).
+
+**Reviewer contract for `Model-comparison-arms:`.** A PR reviewer who sees
+this trailer on a merged PR should read it as an instruction, not a
+footnote: the PR was authored under a **recorded** model comparison, so
+authorship should never be silently attributed to whichever single arm's
+model happens to show in the (unchanged) `Model-provenance:` line alone. If
+the reviewer wants to inspect what did *not* ship, the losing arm's full
+diff lives only in the local, gitignored patch archive
+(`.temperloop/model-comparison/dual-build/archives/`) — never in the PR
+itself. The trailer is **always-on** while the harness runs; there is no
+per-repo opt-out, because disclosure of which models authored merged code is
+the entire point of the mechanism (ADR 0040), the same standing
+`Model-provenance:` already holds under live-tagging. A winning PR whose
+trailer could not be stamped is held out of the merge set
+(`merge_blocked: arms-trailer-unstamped`) rather than merged undisclosed —
+land the trailer by hand with `tagging.sh stamp-arms`, confirm it with the
+owned inverse `parse-arms`, then clear the hold before merging.
 
 **Produces:**
 
@@ -662,6 +811,40 @@ anchor when a run changes it; `pa_disclose` says so on stderr each time
 ([ADR 0028](../adr/0028-provider-exposure-rides-a-committed-allowlist-and-disclosure-log.md),
 amendment).
 
+**Dual-build pays a straightforward multiplier, not a hidden one.** For
+every item in scope for the tier under test, a level pays for a **full
+second attempt-through-retry build** (worker tokens and wall-clock, every
+retry included — not just a first attempt) on top of today's single build,
+plus two pairwise-judge calls. Items outside the tested tier build once,
+exactly as today, so the multiplier applies only to the in-scope subset, not
+the whole level. This is gated, not assumed: Step 1.9's pre-flight projects
+the extra cost against the SAME `REPLAY_PREFLIGHT_CEILING_TOKENS` ceiling the
+replay harness above already shares, and requires consent before a single
+dual-built worker spawns. Read plainly: 2× worker spend plus two judge calls
+per in-scope item is spend that directly competes with shipping work, which
+is why a level below `DUAL_BUILD_MIN_INSCOPE_ITEMS` is not dual-built at
+all — the break-even is the honest frame, not a quota-share aside. While the
+judge remains uncalibrated, each dual-built level also adds one more operator
+answer (the mandatory level-pick confirmation above) — an attention cost, not
+an additional spend line, and it goes away once the calibration bar is met.
+Board round-trips are unchanged: one item still produces one PR (the
+winner's) and one `Closes #N`; the loser leaves no board residue.
+
+**Per-engagement disclosure caveat.** The spend lands on whichever account
+or org invoked `/build` — a consultant running this across client repos pays
+it on the client's own account, never a shared pool. Disclosure of the
+compared models is **always-on**, never a per-repo preference: a repo that
+cannot or will not disclose which models authored its merged code should not
+run `--dual-build` there at all — the same standing already applied to
+`Model-provenance:` under live-tagging (ADR 0040). The ledger and patch
+archives are themselves per-repo and per-engagement: nothing pools verdicts
+across repos, and a consultant winding down an engagement runs
+`dual-build purge` to remove the ledger and every archived diff — including
+the losing arm's full code — from the client's machine, rather than leaving
+either behind. This is disclosable **per engagement**, not a standing fact
+about the harness in the abstract: what a given client's PRs disclose is
+scoped to what ran against that client's own repo.
+
 ## Telemetry
 
 **Emit coverage is structurally partial — by design, not by omission.**
@@ -787,3 +970,18 @@ significant difference. A run that cannot be evaluated at all renders one
 `skipped -- model-comparison: <reason>` line at exit 0 and no report object —
 so "could not evaluate", "inconclusive" and "the candidate is better" stay
 three visibly different statements rather than collapsing into one.
+
+**The dual-build harness's first live run is an instrument check, not a
+model verdict.** The harness and its pairwise judge had never been exercised
+on a real level before this epic shipped, so the first live
+`--dual-build` run (temperloop#2086) deliberately runs **both arms on the
+same model** (`sonnet`) with the pairwise judge on a third, different model
+(Fable 5.1) — an A/A design. The expected item win rate is therefore ~50%,
+and the run's own report claims **no verdict about any candidate model**: a
+confident arm pick would itself be recorded as a position-effect or
+judge-bias defect, not a result. Same-model A/A is also the one
+configuration where cross-arm contamination — the read-isolation guard above
+failing to catch a leak — becomes *visible* rather than merely possible,
+since under two genuinely different models a leak is indistinguishable from
+a real quality difference. A real candidate-vs-baseline comparison is
+separate, later work, run once this instrument is trusted.

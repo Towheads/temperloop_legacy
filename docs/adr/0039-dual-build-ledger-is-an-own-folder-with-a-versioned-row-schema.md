@@ -4,7 +4,7 @@ title: "0039: The dual-build ledger is its own folder, not a piggyback on the re
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 

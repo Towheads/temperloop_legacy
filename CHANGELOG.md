@@ -14,6 +14,25 @@ reads that marker; a stranger greps for it before pulling.
 
 ## [Unreleased]
 
+**New-work dual-build harness (epic #2065) — minor, additive.** `/build
+--dual-build <tier>=<candidate>` can now build every in-scope item of a
+level under two models at once, judge each item pairwise, and ship the
+winning arm's work — a comparison run on work the repo was already going
+to do, rather than on a replayed corpus of already-closed history. The flag
+is per-invocation and the only thing that arms it: a `/build` with no flag
+is byte-identical to before this epic shipped, and every new setting,
+script and trailer below is inert until an operator opts in. The
+individual pieces (settings, worktree/branch arm naming, the read-isolation
+guard, the ledger and patch archive, the pairwise judge mode, the
+`Model-comparison-arms:` PR trailer, the spend pre-flight and consent gate,
+the `--dual-build` flag itself, blind judge calibration, the level-pick tally
+plus its two operator levers, and the cumulative report) each shipped as
+their own entries below and in `changelog.d/`; this entry is the narrative
+thread connecting them for a reader who was not following the epic item by
+item. See [`docs/features/model-comparison.md`](docs/features/model-comparison.md)
+for the full mechanism, and ADRs 0038–0041 for the architectural calls this
+harness made along the way.
+
 ## [0.41.0] - 2026-09-15
 
 ### Added
