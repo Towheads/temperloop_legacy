@@ -9,7 +9,7 @@ Canonical schema for plan notes consumed by `/build` and produced by `/assess`. 
 1. **File location** · **Frontmatter** — where a plan note lives and its required YAML (`status:` gates planning → execution).
 2. **Body structure** — the note template (`## Problem` / `## Summary` / `## Items`), then each item field in detail:
    - Problem & Summary · Item fields at a glance (the scannable field index) · Item identifier · Branch field · `repo:` (optional) · Acceptance
-   - Optional item fields: `gh_issue:` · `also_closes:` · `kind:` · `keystone:` · `model:` · Edges (`depends-on:` / `after:`) · `epic:` · `split_from:` · `gate_check:` · `activation:` · `cost:` · orchestrator-written `pr:` / `pushed_sha:`
+   - Optional item fields: `gh_issue:` · `also_closes:` · `kind:` · `keystone:` · `model:` · Edges (`depends-on:` / `after:`) · `epic:` · `split_from:` · `gate_check:` · `activation:` · `cost:` · orchestrator-written `pr:` / `pushed_sha:` / `merge_blocked:`
 3. **Orchestrator-written sections** — `## Questions` (ask-at-gate deferrals) · `## Merge gate log` (merge consent) · `## Run scope` (keystone-spike halt)
 4. **Status sentinels** — the seven in-band `[ ]` / `[~]` / `[m]` / `[>]` / `[x]` / `[v]` / `[-]` states (alphabet: `workflows/scripts/config/ontology-registry.tsv`)
 5. **Validation rules** — the 16 checks `/build` enforces before execution
@@ -134,6 +134,7 @@ Every `## Items` entry is one checkbox line — `- [ ] **<title>** \`slug: <keba
 | `split_from:` | optional (rule 10) | `#N` this item was split from; mutually exclusive with `gh_issue:`. |
 | `epic:` (frontmatter) | optional | Parent epic issue # on board-enabled projects. |
 | `pr:`, `pushed_sha:` | orchestrator-written | Set by `/build` at PR-create time; authors don't set them. |
+| `merge_blocked:` | orchestrator-written | Set by `/build` at park time (3h step 1) for a dual-built item whose winning PR is unstamped; excludes it from Step 4's merge gate across a resume. |
 
 ### Item identifier — slug, not position
 
@@ -356,6 +357,8 @@ An **inline shorthand** is accepted for a hand-authored one-liner: `- cost: agen
 ### Orchestrator-written fields (`pr:`, `pushed_sha:`)
 
 `/build` writes these onto an item as it works — authors don't set them. `pr:` (the open PR number) and `pushed_sha:` (the worker commit pushed to the branch) are recorded at PR-create time (3f), *before* the CI watch, so a crash leaves a recoverable pointer: Step 1 resume re-attaches to `pr:` instead of re-spawning a worker, and Step 0.5 reconciles open PRs against it.
+
+**`merge_blocked:` — the same shape, for a hold rather than a pointer** (temperloop#2083). `/build` stamps `  - merge_blocked: <value>` on a parked `[m]` item at 3h step 1 when that item's winning dual-build PR carries no *verified* `Model-comparison-arms:` trailer (today the single literal `arms-trailer-unstamped`). Step 4 subtracts every item carrying it from the merge gate's selected set, reading **this sub-line** rather than the run's in-memory level summary — that is the whole point of persisting it: a crash or a `/build <plan>` resume between Step 3 and Step 4 would otherwise see an ordinary `[m]` item with an ordinary `pr:` line and merge it unstamped (ADR 0040). A green, `OPEN` PR is exactly what a blocked item looks like, so Step 1.4's resume revalidation carries the flag forward unchanged; only landing and confirming the trailer clears it.
 
 ## Orchestrator-written `## Questions` section (ask-at-gate deferred decisions)
 

@@ -14557,6 +14557,10 @@ if (!/bad3-typo/.test(String(esc.payload.reason)) || !/in scope/.test(String(esc
   { console.log(JSON.stringify({ ok: false, reason: 'the refusal must name the unknown slug AND what IS in scope: ' + JSON.stringify(esc.payload) })); process.exit(0); }
 if (callLog.some(c => /^(pr-batch|stamp-arms):/.test(String(c.opts.label))))
   { console.log(JSON.stringify({ ok: false, reason: 'a refused pick must route nothing: ' + JSON.stringify(callLog.map(c => c.opts.label)) })); process.exit(0); }
+// ROUND 3 HIGH 1 — see the sibling refusal case below for the full rationale.
+const db1 = result.dualBuild ?? {};
+if (db1.barrier !== 'held' || db1.awaiting !== 'level-pick' || (db1.pick ?? {}).held !== true)
+  { console.log(JSON.stringify({ ok: false, reason: 'a level refused over an unknown slug must report itself held: ' + JSON.stringify({ barrier: db1.barrier, awaiting: db1.awaiting, held: (db1.pick ?? {}).held }) })); process.exit(0); }
 
 console.log(JSON.stringify({ ok: true }));
 "
@@ -14584,6 +14588,17 @@ if (!/arm/.test(String(esc.payload.reason)))
   { console.log(JSON.stringify({ ok: false, reason: 'the refusal must name what is missing: ' + JSON.stringify(esc.payload) })); process.exit(0); }
 if (callLog.some(c => /^(pr-batch|stamp-arms):/.test(String(c.opts.label))))
   { console.log(JSON.stringify({ ok: false, reason: 'a refused pick must route nothing: ' + JSON.stringify(callLog.map(c => c.opts.label)) })); process.exit(0); }
+// ROUND 3 HIGH 1. Routing nothing is only half the contract — the LEVEL must
+// also REPORT itself held. The refusal summary once omitted the held field
+// entirely and the caller negated it (not-undefined is true), so a level where
+// every item refused reported barrier cleared + awaiting null — a dashboard or
+// a later build step reading that field sees nothing-pending for a level with
+// zero routed items. Assert the fail-closed reading directly.
+const db2 = result.dualBuild ?? {};
+if (db2.barrier !== 'held' || db2.awaiting !== 'level-pick')
+  { console.log(JSON.stringify({ ok: false, reason: 'a REFUSED level must report itself held, not cleared: ' + JSON.stringify({ barrier: db2.barrier, awaiting: db2.awaiting, held: (db2.pick ?? {}).held }) })); process.exit(0); }
+if ((db2.pick ?? {}).held !== true)
+  { console.log(JSON.stringify({ ok: false, reason: 'the refusal summary must carry the SAME held discriminant the other shapes do — a missing field is what let the caller coerce it to cleared: ' + JSON.stringify(db2.pick) })); process.exit(0); }
 
 console.log(JSON.stringify({ ok: true }));
 "
@@ -14707,6 +14722,38 @@ printf '%s' "$K2083_ADR_DEC" | grep -F 'override-level' >/dev/null \
 printf '%s' "$K2083_ADR_DEC" | grep -F 'override-item' >/dev/null \
   || fail "#2083 r2: ADR 0038's Decision section never names \`override-item\` — same reason"
 echo "PASS: #2083 r2 — merge_blocked is enforced at Step 4, level-pick's operator-absent issue is keyed by level on the epic issue, and both MEDIUM surfaces name what ships"
+
+# --- temperloop#2083 round 3: the second pre-push review's two BLOCKING ------
+# HIGH 1 — the CALLER must name the safe branch POSITIVELY. The behavioural
+# cases above assert today's three summary shapes all report held correctly; this
+# pins the shape of the TEST itself, because a fourth summary shape added later
+# would sail past them. `!pick.held` reads a missing field as "cleared"; only
+# `=== false` makes an omission fall to the conservative reading. Same
+# falsy-coercion class as `!inScope` on an empty array, third in this epic.
+K2083_BAR="$(grep -n "barrier: pick" "$MJS" || true)"
+[ -n "$K2083_BAR" ]   || fail "#2083 r3: could not locate the level summary's barrier field — the guard below would be vacuous"
+printf '%s' "$K2083_BAR" | grep -F 'pick.held === false' >/dev/null   || fail "#2083 r3: the level summary's barrier NEGATES an optional field instead of testing \`held === false\` — a summary shape that omits \`held\` would report a level with zero routed items as \`cleared\`"
+printf '%s' "$K2083_BAR" | grep -F '!pick.held' >/dev/null   && fail "#2083 r3: the level summary still negates \`pick.held\` — \`!undefined === true\` is the permissive default this fix replaced"
+# And the refusal summary must CARRY the discriminant, not rely on the caller.
+K2083_REF="$(grep -F 'refused: lp.invalid' "$MJS" || true)"
+[ -n "$K2083_REF" ]   || fail "#2083 r3: could not locate driveLevelPick's invalid-input summary"
+printf '%s' "$K2083_REF" | grep -F 'held: true' >/dev/null   || fail "#2083 r3: the invalid-input summary omits the \`held\` discriminant the other two shapes carry — a refusal IS a held state (nothing routed), and an inconsistently-shaped result is what let the caller coerce it to cleared"
+
+# HIGH 2 — `merge_blocked` must have a DURABLE carrier. Round 2 put the
+# exclusion in Step 4, but only over the current invocation's in-memory return:
+# a crash or a `/build <plan>` resume between Step 3 and Step 4 dropped it and
+# merged an unstamped dual-build PR (ADR 0040). Guard all three legs of the
+# persistence path — the writer, the reader, and the resume carry-forward.
+grep -q -- '--merge-blocked' "$REPO_ROOT/workflows/scripts/build/plan.sh"   || fail "#2083 r3: plan.sh writeback has no --merge-blocked flag — the hold has no deterministic writer and lives only in memory"
+grep -q 'merge_blocked=' "$REPO_ROOT/workflows/scripts/build/plan.sh"   || fail "#2083 r3: plan.sh does not PARSE merge_blocked back out — a resumed gate could write the sub-line and still never read it"
+K2083_3H="$(grep -F 'Record success first' "$K2083_BMDF" || true)"
+[ -n "$K2083_3H" ] || fail "#2083 r3: could not locate 3h step 1 — the park-time stamp site"
+printf '%s' "$K2083_3H" | grep -F 'merge_blocked' >/dev/null   || fail "#2083 r3: 3h step 1 stamps no \`merge_blocked:\` sub-line — the flag dies with the invocation that computed it"
+K2083_14="$(grep -F 'revalidated before' "$K2083_BMDF" || true)"
+[ -n "$K2083_14" ] || fail "#2083 r3: could not locate Step 1.4's [m] resume revalidation"
+printf '%s' "$K2083_14" | grep -F 'merge_blocked' >/dev/null   || fail "#2083 r3: Step 1.4's resume revalidation says nothing about \`merge_blocked\` — a green, OPEN PR is exactly what a blocked item looks like, so a resume would roll it straight into the gate"
+printf '%s' "$K2083_SEL" | grep -F 'PLAN NOTE' >/dev/null   || fail "#2083 r3: Step 4's selected set still reads the in-memory level summary as its authority — the one source a resumed run does not have"
+echo "PASS: #2083 r3 — the barrier names its safe branch positively, every summary shape carries the held discriminant, and merge_blocked has a durable writer/parser/resume path"
 
 echo ""
 echo "All test_workflow.sh cases passed."

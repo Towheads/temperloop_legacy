@@ -5633,7 +5633,14 @@ async function driveLevelPick(pickables, dual) {
           remedy: `pass levelPick as { verdict: ${LEVEL_PICK_VERDICTS.join(' | ')}, arm?, items? } — see claude/commands/build.md 3d-esc's level-pick handler`,
         }),
       ),
-      summary: { level: null, confirm_required: true, confirmed: false, refused: lp.invalid, tally: tally.tally, winner: tally.winner },
+      // `held: true` is NOT decoration — it is the discriminant every summary
+      // shape this function returns must carry. A refusal IS a held state:
+      // nothing routed, no PR opened, the level still owes a corrected
+      // `levelPick`. Omitting it let the caller's `!pick.held` read
+      // `!undefined === true` and report the level `cleared` (temperloop#2083
+      // round-3 review), which is the permissive default in the one place the
+      // design demands the conservative one.
+      summary: { level: null, confirm_required: true, confirmed: false, refused: lp.invalid, held: true, tally: tally.tally, winner: tally.winner },
     };
   }
 
@@ -5941,8 +5948,13 @@ async function driveLevelDualBuild(activeItems, dual) {
       // The barrier is CLEARED once phase 4 has routed the level's pick; it
       // stays `held` when the calibration gate held the level for a confirm, or
       // when there was nothing to pick between at all.
-      barrier: pick && !pick.held ? 'cleared' : 'held',
-      awaiting: pick && !pick.held ? null : 'level-pick',
+      // Name the SAFE branch positively (`=== false`), never negate an optional
+      // field. `driveLevelPick` returns several summary shapes and a future one
+      // that again omits `held` must fall to the CONSERVATIVE `'held'` reading,
+      // not slip through on `!undefined`. Same falsy-coercion class as the
+      // empty-`inScope` trap the dual-build validator already closed.
+      barrier: pick && pick.held === false ? 'cleared' : 'held',
+      awaiting: pick && pick.held === false ? null : 'level-pick',
       pick,
       rows_appended: ledger.appended,
       rows_rejected: ledger.rejected,
