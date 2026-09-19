@@ -12352,8 +12352,8 @@ globalThis.itemBarrier = (slug, judgeOut, rows) => setMachinery(slug,
 // itself fills — see the row writer's own comment). A plain index scan rather
 // than a regex: the row is JSON with braces and quotes in it, which a lazy
 // regex gets wrong the moment a row grows a nested object.
-globalThis.dualRows = (slug) => {
-  const call = callLog.find(c => c.opts.label === 'dual-build-rows:' + slug);
+globalThis.dualRows = (slug, hint) => {
+  const call = callLog.find(c => c.opts.label === 'dual-build-rows' + (hint ? '-' + hint : '') + ':' + slug);
   if (!call) return [];
   const text = call.promptFull;
   const open = "printf %s '";
@@ -12372,8 +12372,58 @@ globalThis.dualRows = (slug) => {
   }
   return out;
 };
-globalThis.rowFor = (slug, arm) => dualRows(slug).find(r => r.arm === arm && r.in_scope !== false) ?? null;
+globalThis.rowFor = (slug, arm) => dualRows(slug).find(r => r.arm === arm && r.in_scope !== false && r.pick == null) ?? null;
 globalThis.notInScopeRow = (slug) => dualRows(slug).find(r => r.in_scope === false) ?? null;
+// temperloop#2083 — phase 4 (the LEVEL PICK) runs after the barrier. With no
+// calibration seam in a fixture, readCalibrationStatus() fails CLOSED, so the
+// gate HOLDS the level and every in-scope item comes back as a `level-pick`
+// escalation carrying the same `dual_build` record it used to park with. These
+// two read through either disposition, so a K2080 case keeps asserting the
+// BARRIER's own claims rather than accidentally asserting the pick's.
+globalThis.dualRecordOf = (result, slug) => {
+  const p = (result.parked ?? []).find(x => x.slug === slug);
+  if (p && p.dual_build) return p.dual_build;
+  const e = (result.escalations ?? []).find(x => x.slug === slug);
+  return (e && e.payload && e.payload.dual_build) || null;
+};
+globalThis.disposedSlugs = (result) =>
+  [...(result.parked ?? []).map(p => p.slug), ...(result.escalations ?? []).map(e => e.slug)].sort().join(',');
+globalThis.heldForPick = (result) => (result.escalations ?? []).filter(e => e.kind === 'level-pick').map(e => e.slug).sort().join(',');
+// Queue the level-pick phase's own machinery for a level that should ROUTE:
+// one calibration read (level-wide), then per item the override pair (optional),
+// the stamp, the loser archive and the pick row. Registered on the fixture's
+// label-derived slug queues, same convention as itemBarrier above.
+globalThis.calibrated = (over) => setMachinery('_level',
+  { outcome: 'CALIBRATION', calibration: { n: 12, agreement_pct: 90, status: 'calibrated', bar_pct: 70, bar_n: 5, ...(over ?? {}) } });
+globalThis.uncalibrated = (over) => setMachinery('_level',
+  { outcome: 'CALIBRATION', calibration: { n: 1, agreement_pct: 0, status: 'uncalibrated', bar_pct: 70, bar_n: 5, ...(over ?? {}) } });
+globalThis.pickRow = (slug) => dualRows(slug, 'pick').find(r => r.pick != null) ?? null;
+// addMachinery — APPEND to a slug's queue (setMachinery replaces it). The pick
+// phase's own steps (stamp-arms, archive-loser, the pick row) ride the ITEM's
+// queue, after the barrier's judge + row appends, so a case composes them.
+globalThis.addMachinery = (slug, ...o) => { machineryMap.set(slug, [...(machineryMap.get(slug) ?? []), ...o]); };
+// winningArm — greenArm PLUS the PR-phase queue the level pick routes it
+// through (3f rebase/scan/push/pr-open, then 3g CI). An arm queued with
+// greenArm alone stops at its gate, which is exactly what a LOSING arm does.
+globalThis.winningArm = (slug, arm, prNum, sha, over) => {
+  const created = { outcome: 'CREATED', path: '/tmp/repo.wt/' + slug + '@' + arm, base: 'base-' + slug, guard: 'ARMED', ...(over?.created ?? {}) };
+  const head = arm === 'candidate' ? [{ outcome: 'CANDIDATE_READY' }] : [];
+  setMachinery(slug + '@' + arm, ...head, created, { outcome: 'REVIEW_DIFF' }, over?.gate ?? { outcome: 'GATE_PASS' },
+    { outcome: 'REBASED', base: 'b', tip: 't', sha }, { outcome: 'SCAN_CLEAN' },
+    { outcome: 'PUSHED', sha, branch: 'build/' + slug + '@' + arm }, { outcome: 'PR_OPENED', pr_number: prNum },
+    ...(over?.ci ?? [{ outcome: 'CI_GREEN' }]));
+  happyWorker(slug + '@' + arm);
+};
+// pickPhase — the per-item machinery the pick runs AFTER the barrier, in the
+// order routePickedItem runs it: [calibrate-pair] → stamp-arms → archive-loser
+// → the pick row.
+globalThis.pickPhase = (slug, over) => addMachinery(slug,
+  ...(over?.pair ? [over.pair] : []),
+  over?.stamp ?? { outcome: 'ARMS_STAMPED', already: false },
+  over?.loser ?? { outcome: 'LOSER_ARCHIVED', worktree_removed: true, branch_deleted: true },
+  over?.pickRow ?? { outcome: 'ROW_APPENDED', arm: 'baseline' },
+);
+globalThis.pickOf = (result, slug) => (dualRecordOf(result, slug) || {}).pick ?? null;
 DUAL_FIXTURE_END
 
 # ---------------------------------------------------------------------------
@@ -12433,19 +12483,22 @@ if (lastGate < 0 || firstJudge < 0)
 if (firstJudge < lastGate)
   { console.log(JSON.stringify({ ok: false, reason: 'a judge ran BEFORE the level finished gating — that is a per-item barrier, not the level barrier: ' + JSON.stringify(order) })); process.exit(0); }
 
-// Start order recorded, per arm, baseline first.
-const d1 = result.parked.find(p => p.slug === 'd1');
-if (!d1 || !d1.dual_build)
-  { console.log(JSON.stringify({ ok: false, reason: 'd1 did not park with a dual_build record: ' + JSON.stringify(result) })); process.exit(0); }
-if (d1.pr !== null || d1.pushed_sha !== null || d1.awaiting_pick !== true)
-  { console.log(JSON.stringify({ ok: false, reason: 'a barriered item must park with no PR and awaiting_pick: ' + JSON.stringify(d1) })); process.exit(0); }
-const orders = d1.dual_build.arms.map(a => a.arm + ':' + a.start_order).join(',');
+// Start order recorded, per arm, baseline first. (temperloop#2083: with no
+// calibration seam the level-pick gate fails closed and HOLDS, so the item's
+// record rides the level-pick escalation rather than a parked record — the
+// barrier's own claims below are identical either way.)
+const d1 = dualRecordOf(result, 'd1');
+if (!d1)
+  { console.log(JSON.stringify({ ok: false, reason: 'd1 produced no dual_build record: ' + JSON.stringify(result) })); process.exit(0); }
+if (heldForPick(result) !== 'd1,d2')
+  { console.log(JSON.stringify({ ok: false, reason: 'an uncalibrated level must HOLD every in-scope item for the pick: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const orders = d1.arms.map(a => a.arm + ':' + a.start_order).join(',');
 if (orders !== 'baseline:1,candidate:2')
   { console.log(JSON.stringify({ ok: false, reason: 'start order not recorded per arm: ' + orders })); process.exit(0); }
-if (d1.dual_build.barrier !== 'held' || d1.dual_build.awaiting !== 'level-pick')
-  { console.log(JSON.stringify({ ok: false, reason: 'barrier state missing: ' + JSON.stringify(d1.dual_build) })); process.exit(0); }
-if (!d1.dual_build.judge || d1.dual_build.judge.order_agreement !== true)
-  { console.log(JSON.stringify({ ok: false, reason: 'judge result missing from the item record: ' + JSON.stringify(d1.dual_build) })); process.exit(0); }
+if (d1.barrier !== 'held' || d1.awaiting !== 'level-pick')
+  { console.log(JSON.stringify({ ok: false, reason: 'barrier state missing: ' + JSON.stringify(d1) })); process.exit(0); }
+if (!d1.judge || d1.judge.order_agreement !== true)
+  { console.log(JSON.stringify({ ok: false, reason: 'judge result missing from the item record: ' + JSON.stringify(d1) })); process.exit(0); }
 if (result.dualBuild.in_scope.join(',') !== 'd1,d2' || result.dualBuild.barrier !== 'held')
   { console.log(JSON.stringify({ ok: false, reason: 'level summary wrong: ' + JSON.stringify(result.dualBuild) })); process.exit(0); }
 
@@ -12638,23 +12691,24 @@ globalThis.args = { ...dualArgs(['g1','f1']), items: [
 const mod = await loadLevel();
 const result = await mod.default();
 
-// A per-arm failure is a ROW, never an escalation.
-if ((result.escalations ?? []).length !== 0)
-  { console.log(JSON.stringify({ ok: false, reason: 'a per-arm failure escalated across the driveItem boundary: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+// A per-arm failure is a ROW, never an escalation OF ITS OWN. (The level-pick
+// hold is a different, level-scoped escalation — filtered out here so this case
+// keeps asserting the driveItem-boundary property it was written for.)
+const armEsc = (result.escalations ?? []).filter(e => e.kind !== 'level-pick');
+if (armEsc.length !== 0)
+  { console.log(JSON.stringify({ ok: false, reason: 'a per-arm failure escalated across the driveItem boundary: ' + JSON.stringify(armEsc) })); process.exit(0); }
 
-const g1 = result.parked.find(p => p.slug === 'g1');
-const gcand = g1.dual_build.arms.find(a => a.arm === 'candidate');
+const gcand = dualRecordOf(result, 'g1').arms.find(a => a.arm === 'candidate');
 if (gcand.gate !== 'fail' || gcand.loss_reason !== 'gate')
   { console.log(JSON.stringify({ ok: false, reason: 'a gate-failed arm must be a gate loss: ' + JSON.stringify(gcand) })); process.exit(0); }
 if (rowFor('g1', 'candidate').loss_reason !== 'gate')
   { console.log(JSON.stringify({ ok: false, reason: 'the gate loss never reached the row: ' + JSON.stringify(rowFor('g1','candidate')) })); process.exit(0); }
-if (g1.dual_build.judge !== null || g1.dual_build.judge_unavailable_reason !== 'one-arm-only')
-  { console.log(JSON.stringify({ ok: false, reason: 'with one arm down the judge must report one-arm-only, never a verdict: ' + JSON.stringify(g1.dual_build) })); process.exit(0); }
+if (dualRecordOf(result, 'g1').judge !== null || dualRecordOf(result, 'g1').judge_unavailable_reason !== 'one-arm-only')
+  { console.log(JSON.stringify({ ok: false, reason: 'with one arm down the judge must report one-arm-only, never a verdict: ' + JSON.stringify(dualRecordOf(result, 'g1')) })); process.exit(0); }
 if (callLog.some(c => String(c.opts.label) === 'judge:g1'))
   { console.log(JSON.stringify({ ok: false, reason: 'the judge was spent on a pair that cannot be compared' })); process.exit(0); }
 
-const f1 = result.parked.find(p => p.slug === 'f1');
-const fcand = f1.dual_build.arms.find(a => a.arm === 'candidate');
+const fcand = dualRecordOf(result, 'f1').arms.find(a => a.arm === 'candidate');
 if (fcand.loss_reason !== 'infra')
   { console.log(JSON.stringify({ ok: false, reason: 'a machinery failure must be an infra loss, never gate: ' + JSON.stringify(fcand) })); process.exit(0); }
 if (rowFor('f1', 'candidate').loss_reason !== 'infra')
@@ -12720,14 +12774,14 @@ const result = await mod.default();
 
 if ((result.escalations ?? []).length !== 0)
   { console.log(JSON.stringify({ ok: false, reason: 'two completed spike arms must not escalate: ' + JSON.stringify(result.escalations) })); process.exit(0); }
-const sp = (result.parked ?? []).find(p => p.slug === 'sp1');
-if (!sp || !sp.dual_build)
-  { console.log(JSON.stringify({ ok: false, reason: 'the spike item never parked with a dual_build record: ' + JSON.stringify(result) })); process.exit(0); }
-const bad = sp.dual_build.arms.filter(a => a.gate !== 'pass' || a.loss_reason !== null);
+const sp = dualRecordOf(result, 'sp1');
+if (!sp)
+  { console.log(JSON.stringify({ ok: false, reason: 'the spike item produced no dual_build record: ' + JSON.stringify(result) })); process.exit(0); }
+const bad = sp.arms.filter(a => a.gate !== 'pass' || a.loss_reason !== null);
 if (bad.length !== 0)
   { console.log(JSON.stringify({ ok: false, reason: \"a spike's successful park was recorded as an arm loss: \" + JSON.stringify(bad) })); process.exit(0); }
-if (sp.dual_build.judge !== null || sp.dual_build.judge_unavailable_reason !== 'spike-arm')
-  { console.log(JSON.stringify({ ok: false, reason: 'a spike pair must get the named spike-arm disposition, never a verdict: ' + JSON.stringify(sp.dual_build) })); process.exit(0); }
+if (sp.judge !== null || sp.judge_unavailable_reason !== 'spike-arm')
+  { console.log(JSON.stringify({ ok: false, reason: 'a spike pair must get the named spike-arm disposition, never a verdict: ' + JSON.stringify(sp) })); process.exit(0); }
 if (callLog.some(c => String(c.opts.label ?? '').indexOf('judge:') === 0))
   { console.log(JSON.stringify({ ok: false, reason: 'the pairwise judge was spent on a pair that produces no diffs' })); process.exit(0); }
 const rb = rowFor('sp1', 'baseline');
@@ -12778,9 +12832,9 @@ const result = await mod.default();
 const esc = (result.escalations ?? []).find(e => e.slug === 't1');
 if (!esc || esc.kind !== 'worker-error')
   { console.log(JSON.stringify({ ok: false, reason: 'a thrown in-scope item must surface as a worker-error escalation: ' + JSON.stringify(result) })); process.exit(0); }
-if (!(result.parked ?? []).some(p => p.slug === 't2'))
+if (!dualRecordOf(result, 't2'))
   { console.log(JSON.stringify({ ok: false, reason: 'one item throwing took its healthy sibling down with it: ' + JSON.stringify(result) })); process.exit(0); }
-const seen = [...(result.parked ?? []).map(p => p.slug), ...(result.escalations ?? []).map(e => e.slug)].sort().join(',');
+const seen = disposedSlugs(result);
 if (seen !== 't1,t2')
   { console.log(JSON.stringify({ ok: false, reason: 'an item was silently lost — disposed set was: ' + seen })); process.exit(0); }
 if (result.zeroDisposition)
@@ -12819,9 +12873,9 @@ const result = await mod.default();
 const esc = (result.escalations ?? []).find(e => e.slug === 'j1');
 if (!esc || esc.kind !== 'worker-error')
   { console.log(JSON.stringify({ ok: false, reason: 'a throw past the barrier must surface as a worker-error escalation: ' + JSON.stringify(result) })); process.exit(0); }
-if (!(result.parked ?? []).some(p => p.slug === 'j2'))
-  { console.log(JSON.stringify({ ok: false, reason: 'the healthy sibling never parked: ' + JSON.stringify(result) })); process.exit(0); }
-const seen2 = [...(result.parked ?? []).map(p => p.slug), ...(result.escalations ?? []).map(e => e.slug)].sort().join(',');
+if (!dualRecordOf(result, 'j2'))
+  { console.log(JSON.stringify({ ok: false, reason: 'the healthy sibling was lost: ' + JSON.stringify(result) })); process.exit(0); }
+const seen2 = disposedSlugs(result);
 if (seen2 !== 'j1,j2')
   { console.log(JSON.stringify({ ok: false, reason: 'an item was silently lost past the barrier — disposed set was: ' + seen2 })); process.exit(0); }
 
@@ -12855,9 +12909,9 @@ if (sl[0].path !== '/tmp/repo.wt/s2@baseline.unpreserved-aaa' || sl[1].path !== 
   { console.log(JSON.stringify({ ok: false, reason: 'the two notices collapsed onto one path: ' + JSON.stringify(sl) })); process.exit(0); }
 if (!sl[0].recovery || !sl[1].recovery)
   { console.log(JSON.stringify({ ok: false, reason: 'each notice must carry its own recovery command: ' + JSON.stringify(sl) })); process.exit(0); }
-const armNotices = result.parked[0].dual_build.arms.map(a => (a.sidelined ? a.arm : null)).filter(Boolean).join(',');
+const armNotices = dualRecordOf(result, 's2').arms.map(a => (a.sidelined ? a.arm : null)).filter(Boolean).join(',');
 if (armNotices !== 'baseline,candidate')
-  { console.log(JSON.stringify({ ok: false, reason: \"each arm's own summary must carry its notice: \" + JSON.stringify(result.parked[0].dual_build.arms) })); process.exit(0); }
+  { console.log(JSON.stringify({ ok: false, reason: \"each arm's own summary must carry its notice: \" + JSON.stringify(dualRecordOf(result, 's2').arms) })); process.exit(0); }
 
 console.log(JSON.stringify({ ok: true }));
 "
@@ -12950,7 +13004,7 @@ if (byLabel['worker:m1@candidate#retry'] !== 'model-cand')
   { console.log(JSON.stringify({ ok: false, reason: \"the retry left the arm's own model: \" + JSON.stringify(byLabel) })); process.exit(0); }
 if (workerCalls.some(c => c.opts.model === 'plan-item-model'))
   { console.log(JSON.stringify({ ok: false, reason: \"an arm inherited the plan item's model instead of its arm model\" })); process.exit(0); }
-if ((result.parked ?? []).length !== 1)
+if (disposedSlugs(result) !== 'm1' || !dualRecordOf(result, 'm1'))
   { console.log(JSON.stringify({ ok: false, reason: 'the retried arm did not complete: ' + JSON.stringify(result) })); process.exit(0); }
 
 console.log(JSON.stringify({ ok: true }));
@@ -12982,7 +13036,7 @@ if (!gateCall.promptFull.includes('candidate-session.sh') || !gateCall.promptFul
 // A refused candidate never builds.
 if (callLog.some(c => String(c.opts.label) === 'worker:c1@candidate'))
   { console.log(JSON.stringify({ ok: false, reason: 'a refused candidate arm spawned a worker anyway' })); process.exit(0); }
-const cand = result.parked[0].dual_build.arms.find(a => a.arm === 'candidate');
+const cand = dualRecordOf(result, 'c1').arms.find(a => a.arm === 'candidate');
 if (cand.loss_reason !== 'infra' || !/candidate-session/.test(String(cand.failure.kind)))
   { console.log(JSON.stringify({ ok: false, reason: 'a seam refusal must be a named infra loss: ' + JSON.stringify(cand) })); process.exit(0); }
 
@@ -14083,6 +14137,623 @@ else
     || fail "#2145: build.md §3c's known-gap disclosure must name temperloop#2147 as the discharging issue — a gap with no tracked owner is the debt that ages silently"
   echo "PASS: #2145 worker gate budget debt row — conversational-path budget shipped and pinned; Workflow-path gap is OPEN, disclosed in build.md §3c, and tracked to temperloop#2147 (this row flips red the moment workerPrompt() closes it without retiring the disclosure)"
 fi
+
+# temperloop#2083 — the LEVEL PICK and the two operator levers
+#
+# Phase 4 turns the barrier's comparison into a merge decision. Every case below
+# is one acceptance bullet: the pre-registered tally, the winner's route to
+# PR/CI, the calibration-gated confirm, the per-item override, the arms trailer
+# (and the merge block when it is missing), the archive-then-delete ordering,
+# the winning-arm-lost re-drive, and the post-pick CI record.
+# ============================================================================
+
+run_node_case "K2083 tally 2-1: the pre-registered tally makes the judge-preferred arm the level winner, and ONLY that arm's branches reach push/PR" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+// p1 and p2 go to arm A (baseline); p3 goes to arm B (candidate) → 2-1.
+for (const [s, pref, pr] of [['p1','A',301],['p2','A',302],['p3','B',303]]) {
+  winningArm(s, 'baseline', pr, 'abc' + pr);
+  greenArm(s, 'candidate');
+  itemBarrier(s, { outcome: 'JUDGED', judge: { preference: pref, margin: 20, order_agreement: true } });
+  pickPhase(s);
+}
+
+globalThis.args = { ...dualArgs(['p1','p2','p3']), items: [
+  { slug: 'p1', branch: 'build/p1', title: 'P1', kind: 'impl', acceptance: ['c'] },
+  { slug: 'p2', branch: 'build/p2', title: 'P2', kind: 'impl', acceptance: ['c'] },
+  { slug: 'p3', branch: 'build/p3', title: 'P3', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const pick = result.dualBuild.pick;
+if (!pick)
+  { console.log(JSON.stringify({ ok: false, reason: 'the level returned no pick: ' + JSON.stringify(result.dualBuild) })); process.exit(0); }
+if (pick.tally.baseline !== 2 || pick.tally.candidate !== 1 || pick.tally.unresolved !== 0)
+  { console.log(JSON.stringify({ ok: false, reason: 'tally wrong: ' + JSON.stringify(pick.tally) })); process.exit(0); }
+if (pick.winner !== 'baseline' || pick.level !== 'baseline' || pick.reason !== 'tally')
+  { console.log(JSON.stringify({ ok: false, reason: 'a 2-1 tally must elect the majority arm: ' + JSON.stringify(pick) })); process.exit(0); }
+
+// ONLY the winning arm's branches are pushed / PR'd — including p3's, whose own
+// judge preferred the other arm. The unit of CHOICE is the LEVEL (ADR 0038).
+const prArms = callLog.filter(c => /^pr-batch:/.test(String(c.opts.label))).map(c => String(c.opts.label).split(':')[1]).sort();
+if (prArms.join(',') !== 'p1@baseline,p2@baseline,p3@baseline')
+  { console.log(JSON.stringify({ ok: false, reason: 'the wrong arms reached the PR phase: ' + JSON.stringify(prArms) })); process.exit(0); }
+if ((result.parked ?? []).map(p => p.slug).sort().join(',') !== 'p1,p2,p3')
+  { console.log(JSON.stringify({ ok: false, reason: 'routed items must park under the ITEM slug, never the arm slug: ' + JSON.stringify(result) })); process.exit(0); }
+const p1 = (result.parked ?? []).find(p => p.slug === 'p1');
+if (p1.pr !== 301 || p1.pushed_sha !== 'abc301')
+  { console.log(JSON.stringify({ ok: false, reason: 'the winning arm did not go through the ordinary PR path: ' + JSON.stringify(p1) })); process.exit(0); }
+if (p1.dual_build.barrier !== 'cleared' || p1.dual_build.awaiting !== null || p1.dual_build.pick.arm !== 'baseline')
+  { console.log(JSON.stringify({ ok: false, reason: 'the routed record must record the cleared barrier and its pick: ' + JSON.stringify(p1.dual_build) })); process.exit(0); }
+if (result.dualBuild.barrier !== 'cleared' || result.dualBuild.awaiting !== null)
+  { console.log(JSON.stringify({ ok: false, reason: 'the level summary still reports a held barrier: ' + JSON.stringify(result.dualBuild) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2083 tally tie: a 1-1-with-a-judged-tie level goes to the CHEAPER arm by whole-job cost, and a judged tie counts for neither arm" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+// q1 → baseline, q2 → candidate, q3 → a judged TIE (counts for neither).
+// Tally is therefore 1-1 with one unresolved, and the tie-break is cost.
+// The CANDIDATE arm is made cheaper on every item, so it must win.
+for (const [s, pref, pr] of [['q1','A',401],['q2','B',402],['q3','tie',403]]) {
+  winningArm(s, 'baseline', pr, 'abc' + pr);
+  winningArm(s, 'candidate', pr, 'abc' + pr);
+  itemBarrier(s, { outcome: 'JUDGED', judge: { preference: pref, margin: 5, order_agreement: pref !== 'tie' } });
+  pickPhase(s);
+  setWorkerUsage(s + '@baseline', { outcome: 'WORKER_USAGE', epoch_s: 1000, usage_source: 'envelope', input_tokens: 900, output_tokens: 900 });
+  setWorkerUsage(s + '@candidate', { outcome: 'WORKER_USAGE', epoch_s: 1000, usage_source: 'envelope', input_tokens: 100, output_tokens: 100 });
+}
+
+globalThis.args = { ...dualArgs(['q1','q2','q3']), items: [
+  { slug: 'q1', branch: 'build/q1', title: 'Q1', kind: 'impl', acceptance: ['c'] },
+  { slug: 'q2', branch: 'build/q2', title: 'Q2', kind: 'impl', acceptance: ['c'] },
+  { slug: 'q3', branch: 'build/q3', title: 'Q3', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const pick = result.dualBuild.pick;
+if (pick.tally.baseline !== 1 || pick.tally.candidate !== 1 || pick.tally.unresolved !== 1)
+  { console.log(JSON.stringify({ ok: false, reason: 'a judged tie must count for NEITHER arm: ' + JSON.stringify(pick.tally) })); process.exit(0); }
+if ((pick.items.find(i => i.slug === 'q3') || {}).reason !== 'judged-tie')
+  { console.log(JSON.stringify({ ok: false, reason: 'the tie item must be named as unresolved-by-tie: ' + JSON.stringify(pick.items) })); process.exit(0); }
+if (pick.winner !== 'candidate' || pick.reason !== 'tally-tie-cheaper')
+  { console.log(JSON.stringify({ ok: false, reason: 'a tally tie must go to the cheaper arm: ' + JSON.stringify(pick) })); process.exit(0); }
+if (pick.cost.candidate.tokens !== 600 || pick.cost.baseline.tokens !== 5400)
+  { console.log(JSON.stringify({ ok: false, reason: 'the tie-break must read WHOLE-JOB cost across the level: ' + JSON.stringify(pick.cost) })); process.exit(0); }
+const prArms = callLog.filter(c => /^pr-batch:/.test(String(c.opts.label))).map(c => String(c.opts.label).split(':')[1]).sort();
+if (prArms.join(',') !== 'q1@candidate,q2@candidate,q3@candidate')
+  { console.log(JSON.stringify({ ok: false, reason: 'the cheaper arm was not the one routed: ' + JSON.stringify(prArms) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2083 calibration gate: an UNCALIBRATED judge HOLDS the level — a level-pick escalation with NO default, and not one PR opens" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+uncalibrated();
+winningArm('u1', 'baseline', 501, 'abc501');
+greenArm('u1', 'candidate');
+itemBarrier('u1');
+pickPhase('u1');
+
+globalThis.args = { ...dualArgs(['u1']), items: [
+  { slug: 'u1', branch: 'build/u1', title: 'U1', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? []).find(e => e.slug === 'u1');
+if (!esc || esc.kind !== 'level-pick')
+  { console.log(JSON.stringify({ ok: false, reason: 'an uncalibrated level must raise a level-pick escalation: ' + JSON.stringify(result) })); process.exit(0); }
+if (esc.payload.confirm_required !== true || esc.payload.default !== null)
+  { console.log(JSON.stringify({ ok: false, reason: 'the confirm must be explicit, with NO default: ' + JSON.stringify(esc.payload) })); process.exit(0); }
+if (!/confirm \\| override-level <arm> \\| override-item <slug> <arm>/.test(String(esc.payload.verdict_grammar)))
+  { console.log(JSON.stringify({ ok: false, reason: 'the escalation must carry the verdict grammar: ' + JSON.stringify(esc.payload.verdict_grammar) })); process.exit(0); }
+if (esc.payload.calibration.status !== 'uncalibrated')
+  { console.log(JSON.stringify({ ok: false, reason: 'the escalation must name the calibration state it is gating on: ' + JSON.stringify(esc.payload.calibration) })); process.exit(0); }
+// NOT ONE PR — asserted on the spawn, not just the steps.
+if (callLog.some(c => /^(pr-batch|ci-batch|stamp-arms|archive-loser):/.test(String(c.opts.label))))
+  { console.log(JSON.stringify({ ok: false, reason: 'the held level opened a PR anyway: ' + JSON.stringify(callLog.map(c => c.opts.label)) })); process.exit(0); }
+if (result.dualBuild.pick.held !== true || result.dualBuild.barrier !== 'held')
+  { console.log(JSON.stringify({ ok: false, reason: 'a held level must say so on its summary: ' + JSON.stringify(result.dualBuild) })); process.exit(0); }
+// The worktrees are intact — that is what makes the confirm answerable.
+if ((esc.payload.worktrees_intact ?? []).length !== 2)
+  { console.log(JSON.stringify({ ok: false, reason: 'the escalation must name both arms\\' worktrees: ' + JSON.stringify(esc.payload.worktrees_intact) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2083 confirm: the same UNCALIBRATED level routes once input.levelPick carries an explicit confirm — the gate discriminates on the answer, not on the calibration alone" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+uncalibrated();
+winningArm('v1', 'baseline', 601, 'abc601');
+greenArm('v1', 'candidate');
+itemBarrier('v1');
+pickPhase('v1');
+
+globalThis.args = { ...dualArgs(['v1']), levelPick: { verdict: 'confirm' }, items: [
+  { slug: 'v1', branch: 'build/v1', title: 'V1', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+if ((result.escalations ?? []).some(e => e.kind === 'level-pick'))
+  { console.log(JSON.stringify({ ok: false, reason: 'an answered level must not re-ask: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const v1 = (result.parked ?? []).find(p => p.slug === 'v1');
+if (!v1 || v1.pr !== 601)
+  { console.log(JSON.stringify({ ok: false, reason: 'the confirmed pick did not route: ' + JSON.stringify(result) })); process.exit(0); }
+if (result.dualBuild.pick.confirmed !== true || result.dualBuild.pick.confirm_required !== true)
+  { console.log(JSON.stringify({ ok: false, reason: 'the summary must record BOTH that a confirm was required and that it was given: ' + JSON.stringify(result.dualBuild.pick) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2083 per-item override: the level records mixed, the item's row records override scope item, a calibration pair is written from the override, and that item ships the OTHER arm" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+// Both items' judges prefer arm A; the operator overrides w2 to the candidate.
+for (const [s, pr] of [['w1',701],['w2',702]]) {
+  winningArm(s, 'baseline', pr, 'abc' + pr);
+  winningArm(s, 'candidate', pr, 'abc' + pr);
+  itemBarrier(s, { outcome: 'JUDGED', judge: { preference: 'A', margin: 30, order_agreement: true } });
+}
+pickPhase('w1');
+pickPhase('w2', { pair: { outcome: 'CALIBRATION_PAIR_RECORDED' } });
+
+globalThis.args = { ...dualArgs(['w1','w2']),
+  levelPick: { verdict: 'override-item', items: [{ slug: 'w2', arm: 'candidate', reason: 'the candidate diff is the one I want' }] },
+  items: [
+    { slug: 'w1', branch: 'build/w1', title: 'W1', kind: 'impl', acceptance: ['c'] },
+    { slug: 'w2', branch: 'build/w2', title: 'W2', kind: 'impl', acceptance: ['c'] },
+  ]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+if (result.dualBuild.pick.level !== 'mixed')
+  { console.log(JSON.stringify({ ok: false, reason: 'a per-item override must make the LEVEL pick mixed: ' + JSON.stringify(result.dualBuild.pick) })); process.exit(0); }
+// w1 keeps the tally winner, w2 takes the override.
+const prArms = callLog.filter(c => /^pr-batch:/.test(String(c.opts.label))).map(c => String(c.opts.label).split(':')[1]).sort();
+if (prArms.join(',') !== 'w1@baseline,w2@candidate')
+  { console.log(JSON.stringify({ ok: false, reason: 'the override did not move exactly the named item: ' + JSON.stringify(prArms) })); process.exit(0); }
+// The ROW records it.
+const row = pickRow('w2');
+if (!row || !row.override || row.override.applied !== true || row.override.scope !== 'item')
+  { console.log(JSON.stringify({ ok: false, reason: \"the overridden item's row must carry override scope item: \" + JSON.stringify(row) })); process.exit(0); }
+if (!row.pick || row.pick.arm !== 'candidate' || row.pick.level !== 'mixed')
+  { console.log(JSON.stringify({ ok: false, reason: 'the pick row must carry the arm AND the mixed level: ' + JSON.stringify(row) })); process.exit(0); }
+const un = pickRow('w1');
+if (!un || un.override.applied !== false || un.pick.arm !== 'baseline')
+  { console.log(JSON.stringify({ ok: false, reason: 'an un-overridden item must record no override: ' + JSON.stringify(un) })); process.exit(0); }
+// The CALIBRATION PAIR — written from the override, sourced as such.
+const pair = callLog.find(c => String(c.opts.label) === 'level-pick-calibrate:w2');
+if (!pair)
+  { console.log(JSON.stringify({ ok: false, reason: 'a per-item override must write a calibration pair' })); process.exit(0); }
+if (!/calibrate-record/.test(pair.promptFull) || !/--source override/.test(pair.promptFull) || !/--preference 'candidate'/.test(pair.promptFull))
+  { console.log(JSON.stringify({ ok: false, reason: 'the pair must be recorded as an OVERRIDE-sourced human preference: ' + pair.promptFull.slice(0, 400) })); process.exit(0); }
+if (callLog.some(c => String(c.opts.label) === 'level-pick-calibrate:w1'))
+  { console.log(JSON.stringify({ ok: false, reason: 'an un-overridden item must not write a calibration pair' })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2083 arms trailer: the winning PR is stamped via stamp-arms, and a stamp that cannot be verified BLOCKS the merge rather than shipping an undisclosed comparison" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+winningArm('x1', 'baseline', 801, 'abc801');
+greenArm('x1', 'candidate');
+itemBarrier('x1');
+pickPhase('x1');
+winningArm('x2', 'baseline', 802, 'abc802');
+greenArm('x2', 'candidate');
+itemBarrier('x2');
+pickPhase('x2', { stamp: { outcome: 'ARMS_STAMP_FAILED', reason: 'parse-arms could not verify the appended trailer' } });
+
+globalThis.args = { ...dualArgs(['x1','x2']), items: [
+  { slug: 'x1', branch: 'build/x1', title: 'X1', kind: 'impl', acceptance: ['c'] },
+  { slug: 'x2', branch: 'build/x2', title: 'X2', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const stampCall = callLog.find(c => String(c.opts.label) === 'stamp-arms:x1');
+if (!stampCall)
+  { console.log(JSON.stringify({ ok: false, reason: 'the winning PR was never stamped' })); process.exit(0); }
+if (!/tagging\\.sh/.test(stampCall.promptFull) || !/stamp-arms --baseline 'model-base' --candidate 'model-cand' --pick 'baseline'/.test(stampCall.promptFull))
+  { console.log(JSON.stringify({ ok: false, reason: 'the stamp must go through tagging.sh stamp-arms with both arms and the pick: ' + stampCall.promptFull.slice(0, 500) })); process.exit(0); }
+if (!/parse-arms/.test(stampCall.promptFull))
+  { console.log(JSON.stringify({ ok: false, reason: \"the stamp must be VERIFIED with the emitter's own inverse: \" + stampCall.promptFull.slice(0, 500) })); process.exit(0); }
+
+const x1 = (result.parked ?? []).find(p => p.slug === 'x1');
+if ('merge_blocked' in x1 || x1.dual_build.pick.stamped !== true)
+  { console.log(JSON.stringify({ ok: false, reason: 'a successfully stamped PR must NOT be merge-blocked: ' + JSON.stringify(x1) })); process.exit(0); }
+const x2 = (result.parked ?? []).find(p => p.slug === 'x2');
+if (x2.merge_blocked !== 'arms-trailer-unstamped' || x2.dual_build.pick.stamped !== false)
+  { console.log(JSON.stringify({ ok: false, reason: 'an unstamped PR must block its own merge: ' + JSON.stringify(x2) })); process.exit(0); }
+if ((result.dualBuild.pick.merge_blocked ?? []).join(',') !== 'x2')
+  { console.log(JSON.stringify({ ok: false, reason: 'the level summary must name every merge-blocked item: ' + JSON.stringify(result.dualBuild.pick) })); process.exit(0); }
+if (pickRow('x1').arms_trailer_stamped !== true || pickRow('x2').arms_trailer_stamped !== false)
+  { console.log(JSON.stringify({ ok: false, reason: 'the pick row must record whether the trailer landed: ' + JSON.stringify([pickRow('x1'), pickRow('x2')]) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2083 losing arm: the branch is deleted ONLY after archive-check succeeds — a failed check keeps the branch, and the emitted shell orders archive → archive-check → delete" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+winningArm('y1', 'baseline', 901, 'abc901');
+greenArm('y1', 'candidate');
+itemBarrier('y1');
+pickPhase('y1');
+winningArm('y2', 'baseline', 902, 'abc902');
+greenArm('y2', 'candidate');
+itemBarrier('y2');
+pickPhase('y2', { loser: { outcome: 'LOSER_KEPT', reason: 'archive-check-failed' } });
+
+globalThis.args = { ...dualArgs(['y1','y2']), items: [
+  { slug: 'y1', branch: 'build/y1', title: 'Y1', kind: 'impl', acceptance: ['c'] },
+  { slug: 'y2', branch: 'build/y2', title: 'Y2', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const cmd = (callLog.find(c => String(c.opts.label) === 'archive-loser:y1') || {}).promptFull ?? '';
+if (!cmd)
+  { console.log(JSON.stringify({ ok: false, reason: 'the losing arm was never archived' })); process.exit(0); }
+const iArchive = cmd.indexOf(\"archive 'y1' 'candidate'\");
+const iCheck = cmd.indexOf(\"archive-check 'y1' 'candidate'\");
+const iDelete = cmd.indexOf('branch -D');
+if (iArchive < 0 || iCheck < 0 || iDelete < 0)
+  { console.log(JSON.stringify({ ok: false, reason: 'archive / archive-check / delete are not all present: ' + cmd.slice(0, 800) })); process.exit(0); }
+if (!(iArchive < iCheck && iCheck < iDelete))
+  { console.log(JSON.stringify({ ok: false, reason: 'the ordering is not archive → archive-check → delete: ' + JSON.stringify({ iArchive, iCheck, iDelete }) })); process.exit(0); }
+if (!/--force|-f\\b/.test(cmd.slice(iDelete - 120, iDelete)) === false)
+  { console.log(JSON.stringify({ ok: false, reason: 'the removal must not force past git\\'s own refusal' })); process.exit(0); }
+
+const y1 = (result.parked ?? []).find(p => p.slug === 'y1');
+if (y1.dual_build.pick.loser.archived !== true || y1.dual_build.pick.loser.deleted !== true)
+  { console.log(JSON.stringify({ ok: false, reason: 'a verified archive must let the branch go: ' + JSON.stringify(y1.dual_build.pick.loser) })); process.exit(0); }
+const y2 = (result.parked ?? []).find(p => p.slug === 'y2');
+if (y2.dual_build.pick.loser.archived !== false || y2.dual_build.pick.loser.deleted !== false || y2.dual_build.pick.loser.reason !== 'archive-check-failed')
+  { console.log(JSON.stringify({ ok: false, reason: 'a FAILED archive-check must KEEP the branch, named: ' + JSON.stringify(y2.dual_build.pick.loser) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2083 winning-arm-lost: the item is re-driven ONCE on the winning arm's OWN model and parks incomplete when that still fails — the losing arm is never shipped in its place" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+// z1 elects the level winner (baseline) on its own judge verdict.
+winningArm('z1', 'baseline', 1001, 'abc1001');
+greenArm('z1', 'candidate');
+itemBarrier('z1', { outcome: 'JUDGED', judge: { preference: 'A', margin: 50, order_agreement: true } });
+pickPhase('z1');
+// z2's BASELINE arm gate-failed, so the level's winning arm lost this item. Its
+// candidate arm is green — and must NOT be what ships. The re-drive gets ONE
+// more queued attempt, which fails too.
+greenArm('z2', 'baseline', { gate: { outcome: 'GATE_FAIL', failed: 1 } });
+greenArm('z2', 'candidate');
+addMachinery('z2@baseline',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/z2@baseline', base: 'base-z2', guard: 'ARMED' },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_FAIL', failed: 1 },
+);
+itemBarrier('z2', { outcome: 'JUDGE_UNAVAILABLE', reason: 'never-called' });
+
+globalThis.args = { ...dualArgs(['z1','z2']), items: [
+  { slug: 'z1', branch: 'build/z1', title: 'Z1', kind: 'impl', acceptance: ['c'] },
+  { slug: 'z2', branch: 'build/z2', title: 'Z2', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+if (result.dualBuild.pick.level !== 'baseline')
+  { console.log(JSON.stringify({ ok: false, reason: 'the level winner is not what this fixture sets up: ' + JSON.stringify(result.dualBuild.pick) })); process.exit(0); }
+// Re-driven ONCE: exactly two baseline-arm worker spawns for z2 across the run.
+const z2Workers = callLog.filter(c => isWorkerCall(c.opts) && String(c.opts.label) === 'worker:z2@baseline');
+if (z2Workers.length !== 2)
+  { console.log(JSON.stringify({ ok: false, reason: 'the winning-arm-lost item must be re-driven exactly ONCE: ' + z2Workers.length + ' spawn(s)' })); process.exit(0); }
+if (z2Workers.some(c => c.opts.model !== 'model-base'))
+  { console.log(JSON.stringify({ ok: false, reason: \"the re-drive must stay on the WINNING arm's own model: \" + JSON.stringify(z2Workers.map(c => c.opts.model)) })); process.exit(0); }
+// It parks INCOMPLETE, with no PR, and the losing arm is not shipped.
+const z2 = (result.parked ?? []).find(p => p.slug === 'z2');
+if (!z2 || z2.incomplete !== true || z2.pr !== null)
+  { console.log(JSON.stringify({ ok: false, reason: 'a twice-failed winning arm must park incomplete with no PR: ' + JSON.stringify(z2) })); process.exit(0); }
+if (z2.dual_build.pick.outcome !== 'incomplete' || z2.dual_build.pick.re_driven !== true)
+  { console.log(JSON.stringify({ ok: false, reason: 'the incomplete park must name the re-drive it already spent: ' + JSON.stringify(z2.dual_build.pick) })); process.exit(0); }
+if (callLog.some(c => String(c.opts.label) === 'pr-batch:z2@candidate'))
+  { console.log(JSON.stringify({ ok: false, reason: \"the LOSING arm was shipped in the winner's place — that silently reverses the level's own pick\" })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2083 post-pick CI: a CI failure after the pick is recorded AGAINST THE ARM on the pick row, and the item escalates under the ITEM slug" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+// CI goes red, the one-shot CI-fix round runs, and CI is red again — the
+// budget is spent, so the item escalates ci-failed AFTER the pick routed it.
+winningArm('k1', 'baseline', 1101, 'abc1101', { ci: [
+  { outcome: 'CI_FAILED', failed_run_ids: [9101] },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'PUSHED', sha: 'abc1102', branch: 'build/k1@baseline' },
+  { outcome: 'CI_FAILED', failed_run_ids: [9102] },
+] });
+setWorker('k1@baseline',
+  { status: 'done', summary: 'initial', acceptance_results: [{ criterion: 'c', passed: true, evidence: 'e' }], commits: [] },
+  { status: 'done', summary: 'ci fix', acceptance_results: [], commits: [] });
+greenArm('k1', 'candidate');
+itemBarrier('k1');
+pickPhase('k1');
+
+globalThis.args = { ...dualArgs(['k1']), items: [
+  { slug: 'k1', branch: 'build/k1', title: 'K1', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? []).find(e => e.slug === 'k1');
+if (!esc || !/^ci-/.test(String(esc.kind)))
+  { console.log(JSON.stringify({ ok: false, reason: 'a post-pick CI failure must escalate under the ITEM slug: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const row = pickRow('k1');
+if (!row || row.post_pick_ci !== 'failed')
+  { console.log(JSON.stringify({ ok: false, reason: 'the pick row must record the post-pick CI outcome: ' + JSON.stringify(row) })); process.exit(0); }
+if (row.arm !== 'baseline' || row.loss_reason !== 'gate')
+  { console.log(JSON.stringify({ ok: false, reason: 'the failure must be recorded against the ARM that shipped: ' + JSON.stringify(row) })); process.exit(0); }
+if (!esc.payload.dual_build || esc.payload.dual_build.pick.post_pick_ci !== 'failed')
+  { console.log(JSON.stringify({ ok: false, reason: 'the escalation must carry the pick it came from: ' + JSON.stringify(esc.payload.dual_build) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2083 levelPick input: an override naming a slug this level never built REFUSES — a mistyped slug is a typo, not a silent no-op" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+winningArm('bad3', 'baseline', 1301, 'abc1301');
+greenArm('bad3', 'candidate');
+itemBarrier('bad3');
+
+globalThis.args = { ...dualArgs(['bad3']), levelPick: { verdict: 'override-item', items: [{ slug: 'bad3-typo', arm: 'candidate', reason: 'r' }] }, items: [
+  { slug: 'bad3', branch: 'build/bad3', title: 'Bad3', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? []).find(e => e.slug === 'bad3');
+if (!esc || esc.kind !== 'level-pick-input-invalid')
+  { console.log(JSON.stringify({ ok: false, reason: 'an override naming an unknown slug must REFUSE, never silently fall back to the tally: ' + JSON.stringify(result) })); process.exit(0); }
+if (!/bad3-typo/.test(String(esc.payload.reason)) || !/in scope/.test(String(esc.payload.reason)))
+  { console.log(JSON.stringify({ ok: false, reason: 'the refusal must name the unknown slug AND what IS in scope: ' + JSON.stringify(esc.payload) })); process.exit(0); }
+if (callLog.some(c => /^(pr-batch|stamp-arms):/.test(String(c.opts.label))))
+  { console.log(JSON.stringify({ ok: false, reason: 'a refused pick must route nothing: ' + JSON.stringify(callLog.map(c => c.opts.label)) })); process.exit(0); }
+// ROUND 3 HIGH 1 — see the sibling refusal case below for the full rationale.
+const db1 = result.dualBuild ?? {};
+if (db1.barrier !== 'held' || db1.awaiting !== 'level-pick' || (db1.pick ?? {}).held !== true)
+  { console.log(JSON.stringify({ ok: false, reason: 'a level refused over an unknown slug must report itself held: ' + JSON.stringify({ barrier: db1.barrier, awaiting: db1.awaiting, held: (db1.pick ?? {}).held }) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2083 levelPick input: a present-but-unusable levelPick REFUSES to route rather than silently discarding the operator's override" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+winningArm('bad2', 'baseline', 1201, 'abc1201');
+greenArm('bad2', 'candidate');
+itemBarrier('bad2');
+
+globalThis.args = { ...dualArgs(['bad2']), levelPick: { verdict: 'override-level' }, items: [
+  { slug: 'bad2', branch: 'build/bad2', title: 'Bad2', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? []).find(e => e.slug === 'bad2');
+if (!esc || esc.kind !== 'level-pick-input-invalid')
+  { console.log(JSON.stringify({ ok: false, reason: 'a malformed levelPick must REFUSE: ' + JSON.stringify(result) })); process.exit(0); }
+if (!/arm/.test(String(esc.payload.reason)))
+  { console.log(JSON.stringify({ ok: false, reason: 'the refusal must name what is missing: ' + JSON.stringify(esc.payload) })); process.exit(0); }
+if (callLog.some(c => /^(pr-batch|stamp-arms):/.test(String(c.opts.label))))
+  { console.log(JSON.stringify({ ok: false, reason: 'a refused pick must route nothing: ' + JSON.stringify(callLog.map(c => c.opts.label)) })); process.exit(0); }
+// ROUND 3 HIGH 1. Routing nothing is only half the contract — the LEVEL must
+// also REPORT itself held. The refusal summary once omitted the held field
+// entirely and the caller negated it (not-undefined is true), so a level where
+// every item refused reported barrier cleared + awaiting null — a dashboard or
+// a later build step reading that field sees nothing-pending for a level with
+// zero routed items. Assert the fail-closed reading directly.
+const db2 = result.dualBuild ?? {};
+if (db2.barrier !== 'held' || db2.awaiting !== 'level-pick')
+  { console.log(JSON.stringify({ ok: false, reason: 'a REFUSED level must report itself held, not cleared: ' + JSON.stringify({ barrier: db2.barrier, awaiting: db2.awaiting, held: (db2.pick ?? {}).held }) })); process.exit(0); }
+if ((db2.pick ?? {}).held !== true)
+  { console.log(JSON.stringify({ ok: false, reason: 'the refusal summary must carry the SAME held discriminant the other shapes do — a missing field is what let the caller coerce it to cleared: ' + JSON.stringify(db2.pick) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# --- temperloop#2083 static guards ------------------------------------------
+# The cases above prove the behaviour. These pin the STRUCTURAL facts a future
+# edit could undo while every case still passed.
+grep -q 'function tallyLevelPick' "$MJS" \
+  || fail "#2083: build-level.mjs has no tallyLevelPick — the level pick's rules must live in one named, pre-registered place, not inline at the routing site"
+grep -q 'function driveLevelPick' "$MJS" \
+  || fail "#2083: build-level.mjs has no driveLevelPick — phase 4 is not a callable boundary"
+grep -q "'level-pick'" "$MJS" \
+  || fail "#2083: build-level.mjs raises no level-pick escalation — the calibration-gated confirm has no surface"
+grep -q 'calibrationBarMet' "$MJS" \
+  || fail "#2083: build-level.mjs has no calibration bar read — the confirm gate would be unconditional"
+# FAIL-CLOSED: an unreadable calibration seam must NOT read as calibrated.
+K2083_CAL="$(awk '/^function calibrationBarMet/,/^\}$/' "$MJS")"
+printf '%s' "$K2083_CAL" | grep -F "cal.available" >/dev/null \
+  || fail "#2083: calibrationBarMet ignores whether the calibration read succeeded — an unreachable seam would auto-route a level's merges"
+# The pick must route through the EXISTING PR boundary, never a second copy.
+K2083_ROUTE="$(awk '/^async function routePickedItem/,/^\}$/' "$MJS")"
+printf '%s' "$K2083_ROUTE" | grep -F 'driveItemPr(winner.ctx)' >/dev/null \
+  || fail "#2083: routePickedItem does not hand the winning arm to driveItemPr — the winner must take the ordinary PR/CI/park path, not a parallel one"
+printf '%s' "$K2083_ROUTE" | grep -F 'archiveLosingArm' >/dev/null \
+  || fail "#2083: routePickedItem never archives the losing arm — a deleted branch with no verified patch is unrecoverable"
+# build.md must carry the handler prose (the class-A activation predicate).
+# SECTION-SCOPED, not a bare `level-pick` grep: that token also appears in the
+# hand-off contract's conditional-key sentence, so a bare grep would sit green
+# with the HANDLER itself deleted — the one thing an orchestrator actually
+# reads to dispose of this kind.
+K2083_BMD="$(grep -F -- '**`level-pick` — the LEVEL-scoped escalation' "$REPO_ROOT/claude/commands/build.md" || true)"
+[ -n "$K2083_BMD" ] \
+  || fail "#2083: claude/commands/build.md carries no level-pick HANDLER paragraph — the escalation would reach an orchestrator with no disposition for it"
+printf '%s' "$K2083_BMD" | grep -F 'override-item <slug> <arm>' >/dev/null \
+  || fail "#2083: build.md's level-pick handler does not state the verdict grammar the workflow parses — the operator would be asked in words levelPickInput() refuses"
+printf '%s' "$K2083_BMD" | grep -F 'no PR opened for any in-scope item' >/dev/null \
+  || fail "#2083: build.md's level-pick handler does not say the level holds with NO PR opened — the whole point of the calibration gate"
+# Same section-scoping for the merge-block disposition: `merge_blocked` also
+# appears inside the handler paragraph above, so a bare grep would sit green
+# with the DISPOSITION deleted.
+K2083_MB="$(grep -F -- 'is INELIGIBLE for Step 4' "$REPO_ROOT/claude/commands/build.md" || true)"
+[ -n "$K2083_MB" ] \
+  || fail "#2083: build.md gives no disposition for a merge_blocked item — an unstamped dual-built PR would reach Step 4's gate with nothing telling it to stop"
+printf '%s' "$K2083_MB" | grep -F 'arms-trailer-unstamped' >/dev/null \
+  || fail "#2083: build.md's merge-block disposition does not name the literal value build-level.mjs stamps, so the gate has nothing to match on"
+# The presentation-plane row is pinned by its OWNER pointer, not by the kind
+# name: `level-pick` also occurs inside the row as part of
+# `level-pick-input-invalid`, so a bare grep survives the row being renamed.
+grep -F 'driveLevelPick' "$REPO_ROOT/claude/presentation-plane.md" >/dev/null \
+  || fail "#2083: claude/presentation-plane.md has no row pointing at the level-pick kind's owner — a style template could restyle the verdict grammar the workflow parses"
+echo "PASS: #2083 static guards — the tally, the fail-closed calibration bar, the shared PR boundary, the loser archive, and both prose surfaces are wired"
+
+# --- temperloop#2083 round 2: the two BLOCKING pre-push review findings ------
+# Both HIGHs shipped because the round-1 guards above grep the WHOLE FILE for a
+# sentence. A whole-file grep cannot tell "declared at 3d-esc" from "enforced at
+# the site that fires", which is exactly the gap the kernel's § Mandatory-step
+# birth rule names. Every guard below is therefore REGION-SCOPED to the site the
+# behaviour must fire at, so deleting the enforcement goes red even though the
+# declaration elsewhere survives untouched.
+K2083_BMDF="$REPO_ROOT/claude/commands/build.md"
+[ -f "$K2083_BMDF" ] || fail "#2083 r2: claude/commands/build.md is missing"
+
+# HIGH 1 — `merge_blocked` must be ENFORCED inside Step 4, not only declared at
+# 3d-esc. Observed: Step 4's selected-set definition, its 4a summary, its 4a.5
+# union pre-check and its 4b consent ask mentioned the flag ZERO times, so a
+# merge_blocked item parked `[m]` like any other and nothing an orchestrator
+# reads at merge time excluded or flagged it — a dual-built PR merging with no
+# verified `Model-comparison-arms:` trailer, the one thing ADR 0040 exists to
+# prevent. `|| true` on each substitution per the #1937/#1219 idiom: a grep miss
+# under `set -e`/`pipefail` would otherwise abort before the guard can report.
+K2083_S4="$(awk '/^## Step 4 — Batch merge gate/{f=1} /^## Step 5 —/{f=0} f' "$K2083_BMDF" || true)"
+[ -n "$K2083_S4" ] || fail "#2083 r2: could not isolate Step 4 in build.md — every guard below would be vacuous"
+K2083_SEL="$(printf '%s\n' "$K2083_S4" | grep -F "The gate's selected set is the" || true)"
+[ -n "$K2083_SEL" ] \
+  || fail "#2083 r2: could not locate Step 4's selected-set definition — the one line that decides what reaches the merge gate"
+printf '%s' "$K2083_SEL" | grep -F 'merge_blocked' >/dev/null \
+  || fail "#2083 r2: Step 4's selected-set definition does not subtract \`merge_blocked\` items — a held dual-built PR parks \`[m]\` like any other, so without this filter it reaches the gate and merges unstamped (ADR 0040)"
+printf '%s' "$K2083_S4" | grep -F 'never offered as a 4b option' >/dev/null \
+  || fail "#2083 r2: Step 4 does not exclude a \`merge_blocked\` item from 4b's consent ask — a \"Merge all\" would sweep it up even with 4a rendering it"
+printf '%s' "$K2083_S4" | grep -F 'MERGE BLOCKED' >/dev/null \
+  || fail "#2083 r2: 4a renders no distinct row for a \`merge_blocked\` item — subtracted from the set AND absent from the block, a held item reads identically to one that merged"
+
+# HIGH 2 — `level-pick`'s operator-absent decision issue must be redirected to
+# the LEVEL's own receptacle. Step 2's generic disposition is one async decision
+# issue PER SLUG; `level-pick` fires on every in-scope item of the level by
+# construction and its answer is ONE `levelPick` object, so the unmodified
+# default fragments into N identical issues with no rule for collapsing N
+# replies into the one value `driveLevelPick` expects. 4b's risky-set approval
+# is the in-file precedent for the redirect; this pins the same words on the
+# level-pick handler paragraph, and the fallback when that receptacle is absent.
+K2083_HND="$(grep -F -- '**`level-pick` — the LEVEL-scoped escalation' "$K2083_BMDF" || true)"
+[ -n "$K2083_HND" ] \
+  || fail "#2083 r2: could not locate build.md's level-pick handler paragraph — the operator-absent guards below would be vacuous"
+printf '%s' "$K2083_HND" | grep -F "plan note's epic issue" >/dev/null \
+  || fail "#2083 r2: the level-pick handler names no epic-issue redirect for its operator-absent decision issue — it would fall through to step 2's per-slug default and post N duplicate issues for one level-scoped question"
+printf '%s' "$K2083_HND" | grep -F 'not any single item' >/dev/null \
+  || fail "#2083 r2: the level-pick handler does not EXCLUDE the per-item issue target the way 4b's risky-set approval does — a redirect stated without the exclusion still reads as compatible with the per-slug default"
+printf '%s' "$K2083_HND" | grep -F 'keyed by LEVEL' >/dev/null \
+  || fail "#2083 r2: the level-pick handler does not say the issue is keyed by LEVEL — one issue per level is what makes a single reply the level's verdict"
+printf '%s' "$K2083_HND" | grep -F 'loud terminal halt' >/dev/null \
+  || fail "#2083 r2: the level-pick handler gives no disposition for an unavailable epic issue — with no durable receptacle it would silently revert to the per-slug fan-out this redirect exists to prevent"
+
+# MEDIUM — the capability probe's conditional-key convention must name
+# `levelPick` the way it already names `dualBuild`. Without it a stale engine
+# with no level-pick support gets a false CAPABILITIES_OK and then HOLDS the
+# level on every continuation with no legible degradation notice (kernel K.49).
+K2083_PROBE="$(grep -F -- 'append `levelPick`' "$K2083_BMDF" || true)"
+[ -n "$K2083_PROBE" ] \
+  || fail "#2083 r2: build.md's handoffKeys probe convention does not tell the orchestrator to append \`levelPick\` on a level-pick continuation — the DEGRADED verdict would never name the key a stale engine drops"
+
+# MEDIUM — ADR 0038 is the design-of-record for this feature; it must name every
+# verdict that shipped. It described "two operator levers" while three verdicts
+# ship (`confirm`, `override-level`, `override-item`), leaving the level-wide
+# override unnamed in the document a future reader consults.
+K2083_ADR="$REPO_ROOT/docs/adr/0038-judge-per-item-pick-per-level-in-build.md"
+[ -f "$K2083_ADR" ] || fail "#2083 r2: ADR 0038 is missing — the level pick has no design-of-record"
+K2083_ADR_DEC="$(awk '/^## Decision/{f=1} /^\*\*Rejected alternatives/{f=0} f' "$K2083_ADR" || true)"
+[ -n "$K2083_ADR_DEC" ] || fail "#2083 r2: could not isolate ADR 0038's Decision section"
+printf '%s' "$K2083_ADR_DEC" | grep -F 'override-level' >/dev/null \
+  || fail "#2083 r2: ADR 0038's Decision section never names \`override-level\` — the shipped grammar has three verdicts and the design-of-record must match what ships"
+printf '%s' "$K2083_ADR_DEC" | grep -F 'override-item' >/dev/null \
+  || fail "#2083 r2: ADR 0038's Decision section never names \`override-item\` — same reason"
+echo "PASS: #2083 r2 — merge_blocked is enforced at Step 4, level-pick's operator-absent issue is keyed by level on the epic issue, and both MEDIUM surfaces name what ships"
+
+# --- temperloop#2083 round 3: the second pre-push review's two BLOCKING ------
+# HIGH 1 — the CALLER must name the safe branch POSITIVELY. The behavioural
+# cases above assert today's three summary shapes all report held correctly; this
+# pins the shape of the TEST itself, because a fourth summary shape added later
+# would sail past them. `!pick.held` reads a missing field as "cleared"; only
+# `=== false` makes an omission fall to the conservative reading. Same
+# falsy-coercion class as `!inScope` on an empty array, third in this epic.
+K2083_BAR="$(grep -n "barrier: pick" "$MJS" || true)"
+[ -n "$K2083_BAR" ]   || fail "#2083 r3: could not locate the level summary's barrier field — the guard below would be vacuous"
+printf '%s' "$K2083_BAR" | grep -F 'pick.held === false' >/dev/null   || fail "#2083 r3: the level summary's barrier NEGATES an optional field instead of testing \`held === false\` — a summary shape that omits \`held\` would report a level with zero routed items as \`cleared\`"
+printf '%s' "$K2083_BAR" | grep -F '!pick.held' >/dev/null   && fail "#2083 r3: the level summary still negates \`pick.held\` — \`!undefined === true\` is the permissive default this fix replaced"
+# And the refusal summary must CARRY the discriminant, not rely on the caller.
+K2083_REF="$(grep -F 'refused: lp.invalid' "$MJS" || true)"
+[ -n "$K2083_REF" ]   || fail "#2083 r3: could not locate driveLevelPick's invalid-input summary"
+printf '%s' "$K2083_REF" | grep -F 'held: true' >/dev/null   || fail "#2083 r3: the invalid-input summary omits the \`held\` discriminant the other two shapes carry — a refusal IS a held state (nothing routed), and an inconsistently-shaped result is what let the caller coerce it to cleared"
+
+# HIGH 2 — `merge_blocked` must have a DURABLE carrier. Round 2 put the
+# exclusion in Step 4, but only over the current invocation's in-memory return:
+# a crash or a `/build <plan>` resume between Step 3 and Step 4 dropped it and
+# merged an unstamped dual-build PR (ADR 0040). Guard all three legs of the
+# persistence path — the writer, the reader, and the resume carry-forward.
+grep -q -- '--merge-blocked' "$REPO_ROOT/workflows/scripts/build/plan.sh"   || fail "#2083 r3: plan.sh writeback has no --merge-blocked flag — the hold has no deterministic writer and lives only in memory"
+grep -q 'merge_blocked=' "$REPO_ROOT/workflows/scripts/build/plan.sh"   || fail "#2083 r3: plan.sh does not PARSE merge_blocked back out — a resumed gate could write the sub-line and still never read it"
+K2083_3H="$(grep -F 'Record success first' "$K2083_BMDF" || true)"
+[ -n "$K2083_3H" ] || fail "#2083 r3: could not locate 3h step 1 — the park-time stamp site"
+printf '%s' "$K2083_3H" | grep -F 'merge_blocked' >/dev/null   || fail "#2083 r3: 3h step 1 stamps no \`merge_blocked:\` sub-line — the flag dies with the invocation that computed it"
+K2083_14="$(grep -F 'revalidated before' "$K2083_BMDF" || true)"
+[ -n "$K2083_14" ] || fail "#2083 r3: could not locate Step 1.4's [m] resume revalidation"
+printf '%s' "$K2083_14" | grep -F 'merge_blocked' >/dev/null   || fail "#2083 r3: Step 1.4's resume revalidation says nothing about \`merge_blocked\` — a green, OPEN PR is exactly what a blocked item looks like, so a resume would roll it straight into the gate"
+printf '%s' "$K2083_SEL" | grep -F 'PLAN NOTE' >/dev/null   || fail "#2083 r3: Step 4's selected set still reads the in-memory level summary as its authority — the one source a resumed run does not have"
+echo "PASS: #2083 r3 — the barrier names its safe branch positively, every summary shape carries the held discriminant, and merge_blocked has a durable writer/parser/resume path"
 
 echo ""
 echo "All test_workflow.sh cases passed."

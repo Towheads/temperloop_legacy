@@ -977,3 +977,112 @@ if [ -f "$BUILD_MD" ]; then
 else
   echo "SKIP: build.md invocation guard (spec not present in this checkout)"
 fi
+
+# --- temperloop#2083 round 3: `merge_blocked` is DURABLE and survives a resume -
+# The pre-push review's HIGH 2: the dual-build merge hold lived only in the
+# current invocation's in-memory level summary. A crash or a `/build <plan>`
+# resume between Step 3 (which computes it) and Step 4 (which consumes it) left
+# an ordinary-looking `[m]` item with an ordinary `pr:` line and merged it
+# UNSTAMPED — the exact ADR 0040 disclosure violation the hold exists to
+# prevent, reached by silent loss rather than by logic. The fix makes the note
+# itself the carrier. This block is the RESUME test: persist → re-read from the
+# note alone → assert the gate surface still excludes it.
+# Re-install the 200-returning curl shim: a later block above swapped it for an
+# unreachable one, and this block needs the WRITTEN path.
+cat > "$TMP/bin/curl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$TMP/curl-args"
+for a in "\$@"; do case "\$a" in @*) cp "\${a#@}" "$TMP/put-body" ;; esac; done
+printf '200'
+EOF
+chmod +x "$TMP/bin/curl"
+
+cat > "$TMP/mb.md" <<'EOF'
+---
+tags: [plan, project/temperloop]
+date: 2026-09-19
+status: approved
+---
+
+# temperloop - merge_blocked fixture
+
+## Items
+
+- [~] **Dual built** `slug: dual` — winner routed to PR
+  - branch: `feat/dual`
+  - size: M
+  - gh_issue: 2083
+  - acceptance:
+    - it works
+
+- [~] **Ordinary** `slug: plain` — single-arm item
+  - branch: `feat/plain`
+  - size: S
+  - acceptance:
+    - it works
+EOF
+
+# 1. PERSIST — park `[m]` and stamp the hold in the same writeback.
+out="$(PATH="$TMP/bin:$PATH" PLAN_API_KEY_FILE="$TMP/keydir/data.json" \
+  bash "$SCRIPT" writeback "$TMP/mb.md" --slug dual --sentinel '[m]' \
+  --pr 2083 --pushed-sha deadbee --merge-blocked arms-trailer-unstamped)"
+[ "$(jq -r .outcome <<<"$out")" = "WRITTEN" ] || fail "#2083 r3: writeback --merge-blocked not WRITTEN (got: $out)"
+grep -q '^  - merge_blocked: arms-trailer-unstamped' "$TMP/put-body" \
+  || fail "#2083 r3: writeback did not stamp the merge_blocked sub-line — the hold has no durable carrier and a resumed gate would merge an unstamped dual-build PR"
+
+# 2. RE-READ — the persisted note is the ONLY input from here on. This is the
+#    resumed run: nothing in memory survived.
+cp "$TMP/put-body" "$TMP/mb-resumed.md"
+
+# 3. STICKINESS — a later writeback that names neither flag must NOT drop the
+#    hold. Every sentinel flip after park would otherwise silently un-block it.
+out="$(PATH="$TMP/bin:$PATH" PLAN_API_KEY_FILE="$TMP/keydir/data.json" \
+  bash "$SCRIPT" writeback "$TMP/mb-resumed.md" --slug dual --sentinel '[m]' --pr 2083)"
+grep -q '^  - merge_blocked: arms-trailer-unstamped' "$TMP/put-body" \
+  || fail "#2083 r3: a writeback that did not name the flag DROPPED the merge_blocked sub-line — a hold that any later sentinel flip erases is no hold at all"
+cp "$TMP/put-body" "$TMP/mb-resumed.md"
+
+# 4. THE GATE SURFACE — roster --stage gate is what Step 4 renders and counts.
+#    A held item must be reported, named, and OUT of the merge set.
+out="$(bash "$SCRIPT" roster "$TMP/mb-resumed.md" --level 0 --stage gate --owner-repo Towheads/temperloop)"
+grep -q 'MERGE BLOCKED (arms-trailer-unstamped)' <<<"$out" \
+  || fail "#2083 r3: the resumed gate roster does not name the hold — a blocked item with a green, OPEN PR reads identically to a merge-eligible one (got: $out)"
+grep -q 'held out of the merge set' <<<"$out" \
+  || fail "#2083 r3: the resumed gate roster does not say the item is held OUT of the merge set (got: $out)"
+# Capture the held row FIRST. Asserting "no [m] row says 'in the merge set'"
+# straight off the pipeline would pass just as happily when there is NO [m] row
+# at all — a roster that dropped the item entirely would read as success.
+mb_row="$(grep -E '^\[m\][[:space:]]+dual' <<<"$out" || true)"
+[ -n "$mb_row" ] \
+  || fail "#2083 r3: the resumed gate roster has no [m] row for the held item — it was dropped from the roster rather than held out of the merge set (got: $out)"
+case "$mb_row" in
+  *'in the merge set'*)
+    fail "#2083 r3: the resumed gate roster still reports the held item IN the merge set (got: $mb_row)" ;;
+esac
+# The merge COUNT is what a consenting operator actually reads at the gate.
+# `plain` is [~] and `dual` is held, so BOTH sit outside and the count is ZERO.
+# Asserted on the rendered header ALONE, and on the exact rendered field: an
+# `|| grep 'MERGE BLOCKED'` fallback would make this vacuous, since assertion 4a
+# above has already proved that string present — the check could never go red.
+grep -F '2 items · 0 in the merge set · 2 outside it' <<<"$out" >/dev/null \
+  || fail "#2083 r3: the held item did not leave the merge COUNT — the gate header still offers it for merge (got: $out)"
+
+# 5. CLEARING is EXPLICIT — the one way out is landing the trailer.
+out="$(PATH="$TMP/bin:$PATH" PLAN_API_KEY_FILE="$TMP/keydir/data.json" \
+  bash "$SCRIPT" writeback "$TMP/mb-resumed.md" --slug dual --sentinel '[m]' --pr 2083 --clear-merge-blocked)"
+grep -q '^  - merge_blocked:' "$TMP/put-body" \
+  && fail "#2083 r3: --clear-merge-blocked left the sub-line in place"
+out="$(bash "$SCRIPT" roster "$TMP/put-body" --level 0 --stage gate --owner-repo Towheads/temperloop)"
+grep -q 'in the merge set' <<<"$out" \
+  || fail "#2083 r3: a CLEARED item never rejoins the merge set — the exclusion would be permanent (got: $out)"
+
+# 6. The two flags are mutually exclusive — a writeback that both sets and
+#    clears has no defensible outcome, so it must refuse rather than pick one.
+set +e
+out="$(PATH="$TMP/bin:$PATH" PLAN_API_KEY_FILE="$TMP/keydir/data.json" \
+  bash "$SCRIPT" writeback "$TMP/mb-resumed.md" --slug dual --sentinel '[m]' \
+  --merge-blocked x --clear-merge-blocked 2>&1)"
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "#2083 r3: --merge-blocked together with --clear-merge-blocked was accepted (got: $out)"
+echo "PASS: #2083 r3 — merge_blocked persists to the plan note, is sticky across writebacks, keeps a resumed gate roster from counting the item in the merge set, and clears only explicitly"

@@ -1284,7 +1284,48 @@ fi
 # this commit; the two cited later items reseed the cap to build.md's new
 # measured size when they land, per the usual convention, and may raise or
 # lower it again if their measured cost differs from this projection.
-: "${PROSE_BUDGET_TIER2_FILE_CAP:=1261}"
+# RESEEDED 1261->1263 (2026-09-19, temperloop#2083 'level-pick + operator
+# levers', the second of the two items the 1201->1261 raise above priced in).
+# Its measured cost is +4 (build.md 1259 -> 1263), not the +25 projected — the
+# CAP moves only +2 because the 1261 raise left two lines of slack over the
+# 1259 the file actually measured, and this ratchet reseeds to the measured
+# size, never by the cost delta. The cost is +4 because the level-pick handler is
+# TWO paragraphs in `claude/commands/build.md` 3d-esc (the escalation's
+# no-default confirm plus the verdict grammar, and the merge-blocked
+# disposition for an unstamped arms trailer) rather than a section of its own,
+# because 3d-esc's per-kind disposition list is where an orchestrator already
+# looks for exactly this. A trim ran FIRST, before the ratchet moved: the
+# item's third addition — a standalone hand-off bullet for the new `levelPick`
+# key — was folded into the existing conditional-key sentence, which this item
+# had to rewrite anyway (it said `dualBuild` was "the one CONDITIONAL key",
+# which stopped being true), buying a line back at no cost to contract
+# surface. Reseeded to build.md's measured size with ZERO headroom, the same
+# convention as every raise since temperloop#956; the sibling L2 item
+# (`dual-build-report`) is docs-only and adds nothing to this file.
+# RESEEDED 1263->1266 (2026-09-19, temperloop#2083 ROUND 2 — the pre-push
+# review's two BLOCKING findings). `merge_blocked` was DECLARED at 3d-esc but
+# never ENFORCED at Step 4: the gate's selected-set definition, 4a, 4a.5 and 4b
+# named it zero times, so a held dual-built PR parked `[m]` like any other and
+# nothing an orchestrator reads at merge time excluded it; and `level-pick`'s
+# operator-absent decision issue had no stated redirect, so Step 2's per-slug
+# default would fragment one level-scoped question into N issues. Measured cost
+# +3 (build.md 1263 -> 1266): the Step-4 selected-set filter and the epic-issue
+# redirect are in-place rewrites of existing lines and cost nothing, leaving one
+# new 4a paragraph (its blank-line separator + the render sentence) and one new
+# comment line in the handoffKeys probe convention naming `levelPick` beside the
+# `dualBuild` sentence already there. NO subtraction pass ran, deliberately: all
+# three additions ARE the enforcement the review found missing, and 4a's
+# per-item distinct-render list (`acceptance_unverified`, `NO_CI`, host-config
+# deferrals) is precisely the surface that stops an unvetted PR reading as a
+# clean one — folding the merge-blocked row into a neighbour would recreate the
+# invisibility this round fixes. ROUND 3 (the same item's second review) moved
+# this cap NOT AT ALL: its build.md changes — the durable `merge_blocked:`
+# sub-line at 3h step 1, the resume carry-forward at Step 1.4, and Step 4
+# reading the plan note rather than the in-memory summary — are all in-place
+# sentence extensions on existing lines, so the file still measures 1266.
+# Reseeded to build.md's measured size with ZERO headroom, the same convention
+# as every raise since temperloop#956.
+: "${PROSE_BUDGET_TIER2_FILE_CAP:=1266}"
 
 # ── Pipeline spend profiler (temperloop#958) ───────────────────────────────
 # Settings for `workflows/scripts/pipeline-spend-report.sh` and its

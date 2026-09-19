@@ -10,7 +10,8 @@
 #   plan.sh validate  <planFile>                 # schema validation (plan-schema.md § Validation rules)
 #   plan.sh toposort  <planFile>                 # dependency levels from depends-on ∪ after
 #   plan.sh writeback <planFile> --slug <slug> --sentinel <state> \
-#         [--pr N] [--pushed-sha SHA] [--speculative] [--run-status <text>]
+#         [--pr N] [--pushed-sha SHA] [--speculative] [--run-status <text>] \
+#         [--merge-blocked <value>] [--clear-merge-blocked]
 #   plan.sh roster    <planFile> --level <k> --stage <launch|gate|close> \
 #         [--owner-repo <o/r>] [--only-slugs <csv>] [--driver <text>] [--plan-link <text>]
 #
@@ -30,7 +31,8 @@
 #
 # `writeback` flips an item's checkbox sentinel ([ ]→[~]→[m]→[x], the as-you-go
 # variant [ ]→[~]→[>]→[x] (temperloop#1026), plus [v]/[-])
-# and stamps sub-lines (pr:, pushed_sha:, speculative:, Run-status:) on the plan
+# and stamps sub-lines (pr:, pushed_sha:, speculative:, merge_blocked:,
+# Run-status:) on the plan
 # note. It is the SOLE sentinel-writeback path: ALL vault writes route through a
 # single `_plan_vault_write` indirection (mirrors board.sh's `_board_gh`),
 # overridable in tests.
@@ -88,7 +90,7 @@ die() {
 }
 
 usage() {
-  die "usage: plan.sh validate <planFile> | toposort <planFile> | writeback <planFile> --slug <slug> --sentinel <[ ]|[~]|[m]|[>]|[x]|[v]|[-]> [--pr N] [--pushed-sha SHA] [--speculative] [--run-status <text>] | roster <planFile> --level <k> --stage <launch|gate|close> [--owner-repo <owner/repo>] [--only-slugs <csv>] [--driver <text>] [--plan-link <text>]"
+  die "usage: plan.sh validate <planFile> | toposort <planFile> | writeback <planFile> --slug <slug> --sentinel <[ ]|[~]|[m]|[>]|[x]|[v]|[-]> [--pr N] [--pushed-sha SHA] [--speculative] [--run-status <text>] [--merge-blocked <value>] [--clear-merge-blocked] | roster <planFile> --level <k> --stage <launch|gate|close> [--owner-repo <owner/repo>] [--only-slugs <csv>] [--driver <text>] [--plan-link <text>]"
 }
 
 # --- the ONE test-injection seam ---------------------------------------------
@@ -270,6 +272,7 @@ parse_items() {
         rec = rec SEP "cost_because=" cost_because
         rec = rec SEP "pr=" pr
         rec = rec SEP "speculative=" speculative
+        rec = rec SEP "merge_blocked=" merge_blocked
         rec = rec SEP "run_status=" run_status
         rec = rec SEP "repo=" repo
         print rec
@@ -280,7 +283,7 @@ parse_items() {
       activation=0; act_class=""; act_proof=""; in_activation=0
       kind=""; keystone=""; files=""
       cost=0; cost_because=""; in_cost=0
-      pr=""; speculative=""; run_status=""; repo=""
+      pr=""; speculative=""; run_status=""; repo=""; merge_blocked=""
     }
     BEGIN { SEP=sprintf("%c",31); in_items=0 }
     /^##[[:space:]]+Items[[:space:]]*$/ { in_items=1; next }
@@ -400,6 +403,13 @@ parse_items() {
       # `roster` renders each item stage/disposition from them (temperloop#1310).
       if (match(l, /^[[:space:]]*-[[:space:]]*pr:[[:space:]]*/)) {
         v=l; sub(/^[[:space:]]*-[[:space:]]*pr:[[:space:]]*/,"",v); gsub(/#/,"",v); gsub(/`/,"",v); gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); pr=v; next
+      }
+      # temperloop#2083. The dual-build merge HOLD. Parsed because the Step 4
+      # merge-gate selected set subtracts every item carrying it, and a resumed
+      # run has nothing else to read it from — the level summary that computed
+      # it died with the previous invocation.
+      if (match(l, /^[[:space:]]*-[[:space:]]*merge_blocked:[[:space:]]*/)) {
+        v=l; sub(/^[[:space:]]*-[[:space:]]*merge_blocked:[[:space:]]*/,"",v); gsub(/`/,"",v); gsub(/[[:space:]]*#.*/,"",v); gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); merge_blocked=v; next
       }
       if (match(l, /^[[:space:]]*-[[:space:]]*speculative:[[:space:]]*/)) {
         v=l; sub(/^[[:space:]]*-[[:space:]]*speculative:[[:space:]]*/,"",v); gsub(/`/,"",v); gsub(/[[:space:]]*#.*/,"",v); gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); speculative=v; next
@@ -712,6 +722,13 @@ cmd_toposort() {
 # vault-relative path is the segment after the vault root.
 cmd_writeback() {
   local file="" slug="" sentinel="" pr="" pushed_sha="" speculative="" run_status="" has_run_status=0
+  # temperloop#2083. `merge_blocked` is a HOLD, not a pointer, so it is STICKY:
+  # unlike the stamps below, an existing sub-line is carried through untouched
+  # by any writeback that does not name it, and clearing it takes an explicit
+  # --clear-merge-blocked. A hold that a later sentinel flip could silently drop
+  # is the same silent-loss bug as never persisting it (an unstamped dual-build
+  # PR reaching Step 4's merge gate, ADR 0040).
+  local merge_blocked="" clear_merge_blocked=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --slug)        [ $# -ge 2 ] || usage; slug="$2"; shift ;;
@@ -720,6 +737,8 @@ cmd_writeback() {
       --pushed-sha)  [ $# -ge 2 ] || usage; pushed_sha="$2"; shift ;;
       --speculative) speculative=1 ;;
       --run-status)  [ $# -ge 2 ] || usage; run_status="$2"; has_run_status=1; shift ;;
+      --merge-blocked) [ $# -ge 2 ] || usage; merge_blocked="$2"; shift ;;
+      --clear-merge-blocked) clear_merge_blocked=1 ;;
       --*)           usage ;;
       *)             if [ -z "$file" ]; then file="$1"; else usage; fi ;;
     esac
@@ -729,6 +748,9 @@ cmd_writeback() {
   [ -n "$slug" ]     || die "writeback requires --slug"
   [ -n "$sentinel" ] || die "writeback requires --sentinel"
   [ -f "$file" ]     || die "plan file '$file' does not exist"
+  if [ -n "$merge_blocked" ] && [ "$clear_merge_blocked" = 1 ]; then
+    die "--merge-blocked and --clear-merge-blocked are mutually exclusive"
+  fi
   case "$sentinel" in
     ' '|~|m|'>'|x|v|-) sentinel="[$sentinel]" ;;         # bare char form
     '[ ]'|'[~]'|'[m]'|'[>]'|'[x]'|'[v]'|'[-]') : ;;      # bracketed form
@@ -748,13 +770,15 @@ cmd_writeback() {
   PLAN_SLUG="$slug" PLAN_SENTINEL="$sentinel" PLAN_PR="$pr" \
   PLAN_PUSHED_SHA="$pushed_sha" PLAN_SPECULATIVE="$speculative" \
   PLAN_RUN_STATUS="$run_status" PLAN_HAS_RUN_STATUS="$has_run_status" \
+  PLAN_MERGE_BLOCKED="$merge_blocked" PLAN_CLEAR_MERGE_BLOCKED="$clear_merge_blocked" \
   awk '
     BEGIN {
       slug=ENVIRON["PLAN_SLUG"]; sent=ENVIRON["PLAN_SENTINEL"]
       pr=ENVIRON["PLAN_PR"]; sha=ENVIRON["PLAN_PUSHED_SHA"]
       spec=ENVIRON["PLAN_SPECULATIVE"]; rs=ENVIRON["PLAN_RUN_STATUS"]
       has_rs=ENVIRON["PLAN_HAS_RUN_STATUS"]
-      in_item=0; pr_done=0; sha_done=0; spec_done=0; rs_done=0
+      mb=ENVIRON["PLAN_MERGE_BLOCKED"]; mb_clear=ENVIRON["PLAN_CLEAR_MERGE_BLOCKED"]
+      in_item=0; pr_done=0; sha_done=0; spec_done=0; rs_done=0; mb_done=0
     }
     # leaving the target item block: flush any not-yet-present sub-lines.
     function flush_stamps() {
@@ -762,6 +786,7 @@ cmd_writeback() {
       if (sha!="" && !sha_done) print "  - pushed_sha: " sha
       if (spec=="1" && !spec_done) print "  - speculative: true"
       if (has_rs=="1" && !rs_done) print "  - Run-status: " rs
+      if (mb!="" && !mb_done) print "  - merge_blocked: " mb
     }
     # any item header line
     /^[[:space:]]*-[[:space:]]*\[.\]/ {
@@ -788,6 +813,15 @@ cmd_writeback() {
     }
     in_item && /^[[:space:]]*-[[:space:]]*Run-status:/ {
       if (has_rs=="1") { print "  - Run-status: " rs; rs_done=1 } ; next
+    }
+    # STICKY, by design: an existing hold is re-printed verbatim when this
+    # writeback names neither flag. The neighbours above drop their sub-line in
+    # that case; for a merge HOLD that would mean any later sentinel flip
+    # silently un-blocks an unstamped dual-build PR.
+    in_item && /^[[:space:]]*-[[:space:]]*merge_blocked:/ {
+      if (mb_clear=="1") { next }
+      if (mb!="") { print "  - merge_blocked: " mb; mb_done=1; next }
+      mb_done=1; print; next
     }
     # leaving the block on a blank line or a new top-level construct
     in_item && (/^[^[:space:]]/ || /^[[:space:]]*$/) {
@@ -942,6 +976,7 @@ cmd_roster() {
     [ -n "$kind" ] || kind="code"
     pr="$(rec_field "$rec" pr)"
     spec="$(rec_field "$rec" speculative)"
+    mblk="$(rec_field "$rec" merge_blocked)"
     rs="$(rec_field "$rec" run_status)"
 
     in_only=0
@@ -984,12 +1019,20 @@ cmd_roster() {
         '[>]') disp="as-you-go merge in flight — awaiting confirmed MERGED${pr:+ (PR #$pr)}"
                n_other=$((n_other + 1)) ;;
         '[m]')
-          if [ "$stage" = gate ]; then
+          # temperloop#2083. A `merge_blocked` item parks `[m]` with an open,
+          # green PR — indistinguishable here from a merge-eligible one unless
+          # the hold is read back off the note. It is HELD, not failed, so it is
+          # reported and counted, just never as part of the merge set.
+          if [ -n "$mblk" ]; then
+            disp="MERGE BLOCKED (${mblk}) — held out of the merge set${pr:+ (PR #$pr)}"
+            n_other=$((n_other + 1)); n_open=$((n_open + 1))
+          elif [ "$stage" = gate ]; then
             disp="in the merge set — mergeability detailed above${pr:+ (PR #$pr)}"
+            n_merge=$((n_merge + 1)); n_open=$((n_open + 1))
           else
             disp="left open — awaiting manual merge${pr:+ (PR #$pr)}"
-          fi
-          n_merge=$((n_merge + 1)); n_open=$((n_open + 1)) ;;
+            n_merge=$((n_merge + 1)); n_open=$((n_open + 1))
+          fi ;;
         '[v]') disp="verdict captured"; n_other=$((n_other + 1)) ;;
         '[-]') disp="skipped"; n_skipped=$((n_skipped + 1)) ;;
         '[~]') disp="still in flight — not in the merge set"; n_other=$((n_other + 1)) ;;
