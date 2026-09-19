@@ -498,3 +498,5 @@ bash workflows/scripts/validate-docs-footer.sh	README.md docs/** workflows/scrip
 bash workflows/scripts/tests/test_validate_docs_footer.sh	workflows/scripts/validate-docs-footer.sh workflows/scripts/tests/test_validate_docs_footer.sh
 bash workflows/scripts/validate-agent-charter-links.sh	claude/agents/** workflows/scripts/validate-agent-charter-links.sh
 bash workflows/scripts/tests/test_validate_agent_charter_links.sh	workflows/scripts/validate-agent-charter-links.sh workflows/scripts/tests/test_validate_agent_charter_links.sh
+bash workflows/scripts/check-workflow-script-size.sh	claude/workflows/** workflows/scripts/check-workflow-script-size.sh workflows/scripts/build/build.config.sh
+bash workflows/scripts/tests/test_workflow_script_size.sh	claude/workflows/** workflows/scripts/check-workflow-script-size.sh workflows/scripts/tests/test_workflow_script_size.sh workflows/scripts/build/build.config.sh

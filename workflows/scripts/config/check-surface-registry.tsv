@@ -252,3 +252,6 @@ workflows/scripts/validate-state-graph-call.sh	empty	covered	workflows/scripts/t
 workflows/scripts/config/check-join-keys.sh	absent	covered	workflows/scripts/tests/test_check_surface_degenerate_backfill.sh	check-join-keys.sh [absent]: exits non-zero, never a silent OK
 workflows/scripts/config/check-join-keys.sh	unreadable	covered	workflows/scripts/tests/test_check_surface_degenerate_backfill.sh	check-join-keys.sh [unreadable]: exits non-zero, never a silent OK
 workflows/scripts/config/check-join-keys.sh	empty	covered	workflows/scripts/tests/test_check_surface_degenerate_backfill.sh	check-join-keys.sh [empty]: exits non-zero, never a silent OK
+workflows/scripts/check-workflow-script-size.sh	absent	covered	workflows/scripts/tests/test_workflow_script_size.sh	an absent workflows dir SKIPs explicitly rather than passing silently
+workflows/scripts/check-workflow-script-size.sh	unreadable	covered	workflows/scripts/tests/test_workflow_script_size.sh	an unreadable .mjs FAILS rather than measuring as zero bytes
+workflows/scripts/check-workflow-script-size.sh	empty	covered	workflows/scripts/tests/test_workflow_script_size.sh	an empty .mjs is measured, not skipped

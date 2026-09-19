@@ -592,3 +592,4 @@ kernel CHANGELOG.md
 kernel changelog.d/*
 kernel VERSIONING.md
 kernel VERSION
+kernel workflows/scripts/check-workflow-script-size.sh
