@@ -21,6 +21,13 @@
 #      differently from one that has only just crossed the cutoff.
 #   8  --unattended implies --apply and records the auto-take to the
 #      pending-decisions surface.
+#   9  the OPEN-PR carve-out, proved in BOTH directions in one fixture: the
+#      candidate an open PR would close is reported and NOT stripped, while
+#      the identical candidate with NO open PR beside it still IS — so the
+#      carve-out cannot silently disable the whole lens.
+#  10  the carve-out's FAILURE PATH: an errored open-PR read, and an
+#      unparseable one, both produce ZERO strips (unknown is never permissive).
+#  11  the held bucket carries its AGE on the report-only path too.
 #
 # Zero network: reconcile.sh is SOURCED (its execute-guard suppresses the
 # auto-run) and its `_board_gh` / `_reconcile_session_mtime` / `_reconcile_now`
@@ -76,6 +83,13 @@ ALL_ISSUES_JSON='[]'
 SESSION_MTIMES=""
 NOW_EPOCH=1789000000        # 2026-09-09T05:46:40Z — pinned so ages never vary
 WRITES="/dev/null"          # every mutating gh call this run made
+# Open PRs, in gh's `--json number,closingIssuesReferences` shape. Default: an
+# empty repo, so every pre-carve-out case behaves exactly as it did before.
+OPEN_PRS_JSON='[]'
+# 1 = the open-PR read ERRORS (non-zero), for the failure-path case. The read is
+# the carve-out's only network dependency, so this is the one seam that case
+# needs.
+PR_LIST_FAIL=0
 
 _board_gh() {
   case "$1 $2" in
@@ -97,6 +111,12 @@ _board_gh() {
         [ .[]
           | select(((.state // "open") | ascii_downcase) == $s)
           | { number, title: (.title // ""), milestone: null, labels: (.labels // []) } ]'
+      ;;
+    "pr list")
+      # The carve-out's flat repo-wide read. PR_LIST_FAIL=1 makes it error the
+      # way a rate-limited / offline gh would.
+      [ "$PR_LIST_FAIL" = 1 ] && return 4
+      printf '%s' "$OPEN_PRS_JSON"
       ;;
     "issue edit")  printf '%s\n' "$*" >>"$WRITES"; return 0 ;;
     "issue close") printf '%s\n' "$*" >>"$WRITES"; return 0 ;;
@@ -364,6 +384,101 @@ grep -q "Default taken:\*\* applied — cleared 1 dead-session claim stamp(s)" "
 grep -q "Status:\*\* open" "$LEGACY_DOC" || fail "case8: entry missing Status: open\n$(cat "$LEGACY_DOC")"
 unset KNOWLEDGE_STORE_ROOT
 echo "PASS: case 8 --unattended applies and records the auto-take to the pending-decisions surface"
+
+# =========================================================================
+# Case 9: the OPEN-PR carve-out, proved in BOTH directions from ONE fixture.
+# Two identical dead-session candidates; only #2154 is referenced by an open
+# PR. It must be REPORTED in its own bucket and never stripped (its work is
+# delivered and the claim is held until Done, K#275) — while #1938 beside it,
+# with no PR, must STILL be stripped, so the carve-out provably narrows the
+# lens rather than silently disabling it.
+# =========================================================================
+ALL_ISSUES_JSON='[
+  {"number":2154,"state":"OPEN","title":"Parked [m] awaiting the merge gate","labels":[{"name":"'"$IP_LABEL"'"},{"name":"'"$DEAD_STAMP"'"}]},
+  {"number":1938,"state":"OPEN","title":"Epic with 4 open members","labels":[{"name":"'"$IP_LABEL"'"},{"name":"'"$DEAD_STAMP"'"}]}
+]'
+OPEN_PRS_JSON='[
+  {"number":3001,"closingIssuesReferences":[{"number":2154}]},
+  {"number":3002,"closingIssuesReferences":[]}
+]'
+SESSION_MTIMES="$DEAD_SESS=$FOUR_DAYS_AGO"
+CLAIMS_APPLY=1
+CLAIMS_UNATTENDED=0
+run_claims
+
+grep -q "held by an OPEN PR (DELIBERATELY NOT STRIPPED" <<<"$OUT" \
+  || fail "case9: expected the open-PR held bucket\n$OUT"
+grep -qF "#2154 — stamped 'testhost:$DEAD_SESS' — stale for 4d 2h (cutoff 1d 0h) — open PR #3001" <<<"$OUT" \
+  || fail "case9: expected #2154 held, naming its PR and its age\n$OUT"
+grep -q "stripped: #2154" <<<"$OUT" \
+  && fail "case9: an item with an open PR must NEVER be stripped\n$OUT"
+grep -q "^issue edit 2154 " "$WRITES" \
+  && fail "case9: no write may reach an open-PR item\n$(cat "$WRITES")"
+# The other direction: the carve-out must not disable the lens.
+grep -qF "stripped: #1938 $DEAD_STAMP" <<<"$OUT" \
+  || fail "case9: the identical candidate with NO open PR must still be stripped\n$OUT"
+grep -q "applied: cleared 1 dead-session claim stamp(s)" <<<"$OUT" \
+  || fail "case9: exactly one of the two should strip\n$OUT"
+grep -q "not stripped by design: 1 held by an open PR" <<<"$OUT" \
+  || fail "case9: the apply summary must name what it deliberately left alone\n$OUT"
+echo "PASS: case 9 an open-PR candidate is reported not stripped, while its no-PR twin still strips"
+
+# =========================================================================
+# Case 10: the carve-out is a FAILURE PATH, not a happy path. An open-PR read
+# that ERRORS, and one that returns an unparseable body, both yield ZERO
+# strips — an unestablished PR state is never the permissive branch.
+# =========================================================================
+for _pr_fault in errored unparseable; do
+  case "$_pr_fault" in
+    errored)     PR_LIST_FAIL=1; OPEN_PRS_JSON='[]' ;;
+    unparseable) PR_LIST_FAIL=0; OPEN_PRS_JSON='{"not":"an array"' ;;
+  esac
+  CLAIMS_APPLY=1
+  CLAIMS_UNATTENDED=0
+  run_claims
+  rc=$?
+
+  [ "$rc" -eq 0 ] || fail "case10/$_pr_fault: the sweep must still exit 0, got $rc"
+  grep -q "open-PR state UNESTABLISHED (NOT STRIPPED" <<<"$OUT" \
+    || fail "case10/$_pr_fault: expected the unestablished-PR bucket\n$OUT"
+  for n in 2154 1938; do
+    grep -q "#$n — stamped .* — open-PR state UNKNOWN" <<<"$OUT" \
+      || fail "case10/$_pr_fault: expected #$n reported as PR-state-unknown\n$OUT"
+    grep -q "stripped: #$n" <<<"$OUT" \
+      && fail "case10/$_pr_fault: #$n must NOT be stripped on an unreadable PR state\n$OUT"
+  done
+  grep -q "^applied:" <<<"$OUT" \
+    && fail "case10/$_pr_fault: nothing may be applied when the PR state is unknown\n$OUT"
+  grep -q "Nothing to strip:" <<<"$OUT" \
+    || fail "case10/$_pr_fault: expected the nothing-to-strip verdict\n$OUT"
+  [ ! -s "$WRITES" ] \
+    || fail "case10/$_pr_fault: an unreadable PR state must issue ZERO writes\n$(cat "$WRITES")"
+done
+PR_LIST_FAIL=0
+echo "PASS: case 10 an errored or unparseable open-PR read strips nothing (unknown is never permissive)"
+
+# =========================================================================
+# Case 11: the held bucket carries its AGE on the REPORT-ONLY path too, and a
+# dry run over an all-held board still issues zero writes.
+# =========================================================================
+ALL_ISSUES_JSON='[
+  {"number":2154,"state":"OPEN","title":"Parked [m] awaiting the merge gate","labels":[{"name":"'"$IP_LABEL"'"},{"name":"'"$DEAD_STAMP"'"}]}
+]'
+OPEN_PRS_JSON='[{"number":3001,"closingIssuesReferences":[{"number":2154}]}]'
+SESSION_MTIMES="$DEAD_SESS=$FOUR_DAYS_AGO"
+CLAIMS_APPLY=0
+CLAIMS_UNATTENDED=0
+run_claims
+
+grep -qF "#2154 — stamped 'testhost:$DEAD_SESS' — stale for 4d 2h (cutoff 1d 0h) — open PR #3001" <<<"$OUT" \
+  || fail "case11: the held bucket must carry its age on the report path too\n$OUT"
+grep -q "Nothing to strip: every dead-session claim stamp on this host is held by an open PR" <<<"$OUT" \
+  || fail "case11: expected the all-held verdict\n$OUT"
+grep -q "In sync:" <<<"$OUT" \
+  && fail "case11: an all-held board is NOT in sync — it has candidates it deliberately left\n$OUT"
+[ ! -s "$WRITES" ] || fail "case11: a dry run must issue ZERO writes\n$(cat "$WRITES")"
+OPEN_PRS_JSON='[]'
+echo "PASS: case 11 the open-PR held bucket carries its age on the report-only path"
 
 echo
 echo "ALL reconcile --claims (Lens 4) tests passed."

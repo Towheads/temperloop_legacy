@@ -33,7 +33,9 @@
 #          ... --claims --apply         also strips the dead stamp — and ONLY
 #                                       the stamp. `fnd:status:*` is left
 #                                       byte-identical, the issue is never
-#                                       closed, the Status is never moved.
+#                                       closed, the Status is never moved. A
+#                                       candidate with an OPEN PR is reported,
+#                                       never stripped (claim held until Done).
 #          ... --claims --unattended    implies --apply, AND records the
 #                                       auto-taken apply to the pending-
 #                                       decisions surface (ask-at-checkin).
@@ -328,7 +330,7 @@
 # knowledge store at `Decisions/temperloop - dead-session claim stamps are
 # auto-cleared, status untouched`.
 #
-# Three boundaries, deliberate and NOT negotiable:
+# Four boundaries, deliberate and NOT negotiable:
 #
 #   * SAME HOST ONLY. A FOREIGN-host stamp is NEVER stripped — that session's
 #     liveness cannot be checked from this machine at all, so there is no
@@ -343,6 +345,30 @@
 #     `issue edit --remove-label <the stamp>` per candidate. It never closes
 #     an issue, never writes a Status, and never reads or touches any label
 #     outside the `fnd:host/session:` prefix.
+#
+#   * NO OPEN PR (temperloop#2069 round 2). A candidate whose issue is
+#     referenced by an OPEN PR is REPORTED in its own bucket, never stripped.
+#     An item parked `[m]` awaiting the merge gate has DELIVERED work, and its
+#     claim is one `claude/CLAUDE.md` § Task workflow → "Claim held until
+#     Done" (K#275) declares SANCTIONED rather than drift. Stripping it would
+#     also be SILENT: `board_claim_contended()` opens
+#     `[ -n "$existing" ] || return 1`, so with the stamp gone contention
+#     reports "not contended" and the next claim overwrites the owner
+#     unconditionally, with no warning anywhere.
+#
+#     This NARROWS the operator's auto-clear decision; it does NOT reverse it.
+#     A dead session's stamp on an item with NO open PR still auto-clears —
+#     the genuinely-dead-and-unfinished case the decision was about, which
+#     still covers both motivating epics (temperloop#1938, temperloop#1910 are
+#     parents; the PRs belong to their members, not to them).
+#
+#     The open-PR read is a FAILURE PATH, not a happy path. If it errors, or
+#     its result cannot be established at all, EVERY candidate is treated as
+#     NOT strippable and reported. An unknown PR state is never the permissive
+#     branch. The read routes through board.sh's `_board_gh` like every other
+#     board read here, so it is cached, counted, and test-stubbable, and it
+#     costs ONE flat repo-wide `pr list` for the whole sweep (not one per
+#     candidate) — and it is skipped entirely when the scan found no candidate.
 #
 # Each strip is preceded by an IMMEDIATE re-read of that one issue (a fresh
 # single-issue `api` call, never the scan's snapshot) that requires the issue
@@ -1623,6 +1649,58 @@ _claims_reconcile_append_pending_decision() {
   return 0
 }
 
+# The OPEN-PR carve-out read (temperloop#2069 round 2). Resolves, in ONE flat
+# repo-wide read, which issues an OPEN PR would close — so a candidate whose
+# work is already delivered and parked `[m]` at the merge gate keeps the claim
+# `claude/CLAUDE.md` § Task workflow → "Claim held until Done" (K#275) sanctions.
+#
+# Publishes three globals rather than returning them, the same convention
+# _label_reconcile_strip_rows uses for $_LABEL_STRIP_APPLIED (a
+# command-substitution subshell would swallow them):
+#   $_CLAIMS_PR_MAP      {"<issue#>": [<pr#>, …]} — meaningful only when OK=1
+#   $_CLAIMS_PR_READ_OK  1 = the open-PR state was ESTABLISHED; 0 = unknown
+#   $_CLAIMS_PR_WHY      why it could not be established (empty when OK=1)
+#
+# OK=0 is the SAFE direction by construction: the caller treats an
+# unestablished PR state as "do not strip", so an error, an unparseable body,
+# or a capped (hence UNDER-read) list can never become the permissive branch.
+# Never returns non-zero — the sweep degrades to reporting, it never fails.
+#   _claims_reconcile_open_pr_map <owner/repo>
+_CLAIMS_PR_MAP='{}'
+_CLAIMS_PR_READ_OK=1
+_CLAIMS_PR_WHY=""
+_claims_reconcile_open_pr_map() {
+  local repo="$1" prs_json="" map=""
+  _CLAIMS_PR_MAP='{}'; _CLAIMS_PR_READ_OK=1; _CLAIMS_PR_WHY=""
+
+  # Same dialect as status_reconcile_main's PR read: through _board_gh (cached,
+  # counted, stubbable), one flat list call, capped by $STATE_LIMIT.
+  if ! prs_json="$(_board_gh pr list -R "$repo" --state open --limit "$STATE_LIMIT" \
+                     --json number,closingIssuesReferences 2>/dev/null)"; then
+    _CLAIMS_PR_READ_OK=0; _CLAIMS_PR_WHY="the open-PR list read failed"; return 0
+  fi
+  if [ -z "$prs_json" ] || ! printf '%s' "$prs_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    _CLAIMS_PR_READ_OK=0; _CLAIMS_PR_WHY="the open-PR list returned no parseable array"; return 0
+  fi
+  # A CAPPED read is an under-read: a PR past the cap reads as absent, which is
+  # exactly the permissive direction. Refuse to establish rather than guess.
+  if [ "$(printf '%s' "$prs_json" | jq 'length')" -ge "$STATE_LIMIT" ]; then
+    _CLAIMS_PR_READ_OK=0
+    _CLAIMS_PR_WHY="the open-PR list hit the ${STATE_LIMIT}-item cap, so it is an under-read"
+    return 0
+  fi
+  if ! map="$(printf '%s' "$prs_json" | jq -c '
+        reduce .[] as $p ({};
+          reduce ($p.closingIssuesReferences[]?.number) as $i
+            (.; .[$i | tostring] = ((.[$i | tostring] // []) + [$p.number])))' 2>/dev/null)"; then
+    _CLAIMS_PR_READ_OK=0
+    _CLAIMS_PR_WHY="the open-PR list carried no readable closing-issue references"
+    return 0
+  fi
+  _CLAIMS_PR_MAP="$map"
+  return 0
+}
+
 # The Lens 4 report+apply, wrapped like reconcile_main / status_reconcile_main /
 # label_reconcile_main so a test can source this file, override _board_gh and
 # the session/clock seams, set $CLAIMS_APPLY / $CLAIMS_UNATTENDED, and drive it
@@ -1630,6 +1708,7 @@ _claims_reconcile_append_pending_decision() {
 claims_reconcile_main() {
   local repo HOST hs_prefix inprogress_label rows
   local now candidates="" foreign="" strip_rows="" fresh_rows=""
+  local dead_rows="" held="" unknown="" prs
   local num stamp title shost ssess mt age_secs age n l cleared=0
 
   board_resolve "$PROJECT_NUMBER"
@@ -1681,9 +1760,35 @@ claims_reconcile_main() {
     else
       age="no transcript for session '$ssess' on this host (dead)"
     fi
-    candidates+="  #$num — stamped '$stamp' — $age — $title"$'\n'
-    strip_rows+="$num"$'\t'"$hs_prefix$stamp"$'\n'
+    # Staged, not yet classified: the OPEN-PR carve-out below decides which of
+    # these are strippable, and it must not pay its read when there are none.
+    dead_rows+="$num"$'\t'"$stamp"$'\t'"$age"$'\t'"$title"$'\n'
   done < <(printf '%s\n' "$rows")
+
+  # ── the open-PR carve-out (temperloop#2069 round 2) ──────────────────────
+  # One flat repo-wide read, skipped entirely when the scan found no candidate.
+  # A candidate an OPEN PR would close is parked `[m]` at the merge gate with
+  # its work DELIVERED, so its claim is held-until-Done (K#275), not drift; and
+  # a PR state that cannot be ESTABLISHED is never read as "no PR". Both land
+  # in their own report bucket instead of the strip list.
+  if [ -n "$dead_rows" ]; then
+    _claims_reconcile_open_pr_map "$repo"
+    while IFS=$'\t' read -r num stamp age title; do
+      [ -n "$num" ] || continue
+      if [ "$_CLAIMS_PR_READ_OK" != 1 ]; then
+        unknown+="  #$num — stamped '$stamp' — $age — open-PR state UNKNOWN ($_CLAIMS_PR_WHY) — $title"$'\n'
+        continue
+      fi
+      prs="$(printf '%s' "$_CLAIMS_PR_MAP" | jq -r --arg n "$num" \
+               '((.[$n] // []) | map("#" + (. | tostring)) | join(", "))')"
+      if [ -n "$prs" ]; then
+        held+="  #$num — stamped '$stamp' — $age — open PR $prs — $title"$'\n'
+        continue
+      fi
+      candidates+="  #$num — stamped '$stamp' — $age — $title"$'\n'
+      strip_rows+="$num"$'\t'"$hs_prefix$stamp"$'\n'
+    done <<<"$dead_rows"
+  fi
 
   echo "Dead-session claim stamps — board $PROJECT_NUMBER ($repo)"
   echo
@@ -1693,13 +1798,27 @@ claims_reconcile_main() {
     printf '%s' "$candidates"
     echo
   fi
+  if [ -n "$held" ]; then
+    echo "held by an OPEN PR (DELIBERATELY NOT STRIPPED — the work is delivered and the claim is held until Done, K#275; it clears on the merge cascade):"
+    printf '%s' "$held"
+    echo
+  fi
+  if [ -n "$unknown" ]; then
+    echo "open-PR state UNESTABLISHED (NOT STRIPPED — an unknown PR state is never the permissive branch; re-run once the read succeeds):"
+    printf '%s' "$unknown"
+    echo
+  fi
   if [ -n "$foreign" ]; then
     echo "foreign claims (another host — REPORT-ONLY, never stripped from here; verify on the owning host):"
     printf '%s' "$foreign"
     echo
   fi
   if [ -z "$candidates" ]; then
-    echo "In sync: no In-Progress item on this host carries a claim stamp from a dead session (nothing to strip)."
+    if [ -n "$held" ] || [ -n "$unknown" ]; then
+      echo "Nothing to strip: every dead-session claim stamp on this host is held by an open PR, or its PR state could not be established."
+    else
+      echo "In sync: no In-Progress item on this host carries a claim stamp from a dead session (nothing to strip)."
+    fi
     return 0
   fi
 
@@ -1739,6 +1858,11 @@ claims_reconcile_main() {
 
   echo
   echo "applied: cleared $cleared dead-session claim stamp(s); 0 status label(s) written, 0 item(s) closed or moved."
+  # The carve-out counts ride the apply summary too, so a Step-6 fold of this
+  # one line still shows that something was deliberately left alone.
+  if [ -n "$held" ] || [ -n "$unknown" ]; then
+    echo "not stripped by design: $(printf '%s' "$held" | grep -c '^  #' || true) held by an open PR, $(printf '%s' "$unknown" | grep -c '^  #' || true) with an unestablished PR state."
+  fi
 
   if [ "$CLAIMS_UNATTENDED" = 1 ] && [ "$cleared" -gt 0 ]; then
     _claims_reconcile_append_pending_decision "$PROJECT_NUMBER" "$repo" "$cleared"

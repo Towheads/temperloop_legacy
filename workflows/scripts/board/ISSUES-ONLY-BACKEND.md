@@ -582,6 +582,14 @@ Two halves, both shipped:
   sweeping machine) and stays report-only; a LIVE same-host session's own
   claim self-excludes. Candidates are reported with their staleness AGE.
 
+  One further carve-out NARROWS that auto-apply (it does not reverse it): a
+  candidate an **OPEN PR** would close is reported, never stripped — its work
+  is delivered and its claim is held until Done (K#275), and `board.sh`'s
+  `board_claim_contended()` opens `[ -n "$existing" ] || return 1`, so a
+  stripped stamp lets the next claim overwrite the owner with no warning. The
+  open-PR read is a failure path: if it errors or cannot be established, every
+  candidate is reported rather than stripped.
+
   ```sh
   workflows/scripts/board/reconcile.sh --board 7 --claims          # report
   workflows/scripts/board/reconcile.sh --board 7 --claims --apply  # + strip

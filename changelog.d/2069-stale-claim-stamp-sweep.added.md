@@ -14,5 +14,9 @@
   performs the strips; `--unattended` implies `--apply` and records what it
   cleared to the pending-decisions note. A stamp on another host is never
   stripped — that session's liveness cannot be checked from here — and a live
-  session's own claim is never touched. `claude/commands/tidy.md` runs the
-  sweep on its nightly pass.
+  session's own claim is never touched. An item an **open PR** would close is
+  reported rather than stripped: its work is already delivered and its claim is
+  held until the merge cascade clears it, so clearing the stamp early would let
+  a later claim silently overwrite the owner. If the open-PR read errors, or
+  its result cannot be established, every candidate is reported and nothing is
+  stripped. `claude/commands/tidy.md` runs the sweep on its nightly pass.
