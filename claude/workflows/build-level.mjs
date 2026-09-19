@@ -556,6 +556,15 @@ const SPINE_OUTCOME_SCHEMA = {
     exitCode: { type: ['number', 'string'] },
     // REVIEW_DIFF passthrough (temperloop#1430) — the changed-file list (rep — see build-level.design-notes.md#review-diff-passthrough-temperloop-1430-the-changed-fil
     files: { type: 'array', items: { type: 'string' } },
+    // temperloop#2129: the files that changed between `review_prior_sha` and
+    // this round's HEAD — the CONTINUATION DELTA, narrower than `files` above
+    // (which is the whole branch diff against origin/<default> and stays the
+    // routing input). reviewCarryForward() reads it to decide which routed
+    // seats a continuation round must actually re-spawn. Declared here rather
+    // than left to `additionalProperties` for the same reason
+    // `review_prior_sha` is: the driver branches on it. Empty array whenever
+    // there is no usable prior sha, which the reader treats as "carry nobody".
+    files_since_prior: { type: 'array', items: { type: 'string' } },
     // temperloop#2020: the routing table's DATA ROWS as an array of strings — see build-level.design-notes.md#temperloop-2020-the-routing-table-s-data-rows-as-an-array-of
     tsv_lines: { type: 'array', items: { type: 'string' } },
     // LEGACY (pre-#2020), still accepted so an un-migrated caller or a — see build-level.design-notes.md#legacy-pre-2020-still-accepted-so-an-un-migrated-caller
@@ -3113,6 +3122,33 @@ function reviewDiffCmd(wt, bump = true) {
     `    review_prior_sha=""`,
     `  fi`,
     `fi`,
+    // temperloop#2129 — the DELTA the prior round did not see: the files that
+    // changed between the commit the prior round reviewed and this round's
+    // HEAD. `files` above is the whole branch diff against origin/<default>
+    // and is what the ROUTING decision reads; this narrower list is what the
+    // continuation-round CARRY decision reads (reviewCarryForward), so a seat
+    // whose routed files are all absent from it is not re-spawned.
+    //
+    // Computed HERE, from the SAME validated `review_prior_sha` the field
+    // above emits — never from a second, independently-resolved sha — so the
+    // two can never disagree about which commit "the prior round" means. It
+    // sits BEFORE the bump block below for the same reason that read does:
+    // the bump overwrites the marker with THIS round's HEAD, and a delta
+    // measured against that would be empty by construction.
+    //
+    // FAILS SOFT IN THE PERMISSIVE DIRECTION, like every other marker step
+    // here. No prior sha (absent, corrupted, orphaned by a rebase) leaves the
+    // field an empty array AND `review_prior_sha` empty, and the reader arms
+    // the carry only when BOTH are usable — so a dropped or garbled field can
+    // only ever cause MORE reviewers to re-run, never fewer. The one shape
+    // that must not be conflated with it — a valid prior sha and a genuinely
+    // empty delta — is distinguishable because `review_prior_sha` is non-empty
+    // there.
+    `since_json='[]'`,
+    `if [ -n "$review_prior_sha" ]; then`,
+    `  since_json="$(git diff --name-only "$review_prior_sha..HEAD" 2>/dev/null | jq -R -s -c 'split("\\n") | map(select(length>0))')"`,
+    `fi`,
+    `[ -n "$since_json" ] || since_json='[]'`,
     ...(bump
       ? [
           `if [ -n "$rounds_file" ]; then`,
@@ -3146,7 +3182,7 @@ function reviewDiffCmd(wt, bump = true) {
     `  tsv_rows=0`,
     `  tsv_checksum=0`,
     `fi`,
-    `printf '{"outcome":"REVIEW_DIFF","files":%s,"tsv_lines":%s,"tsv_rows":%s,"tsv_checksum":%s,"review_rounds":%s,"review_prior_sha":"%s"}\\n' "$files_json" "$tsv_json" "$tsv_rows" "$tsv_checksum" "$review_rounds" "$review_prior_sha"`,
+    `printf '{"outcome":"REVIEW_DIFF","files":%s,"files_since_prior":%s,"tsv_lines":%s,"tsv_rows":%s,"tsv_checksum":%s,"review_rounds":%s,"review_prior_sha":"%s"}\\n' "$files_json" "$since_json" "$tsv_json" "$tsv_rows" "$tsv_checksum" "$review_rounds" "$review_prior_sha"`,
   ].join('\n');
 }
 
@@ -3207,20 +3243,35 @@ const REVIEW_PROSE_MD_RE = /\.md$/;
 function determineReviewers(item, files, tsvText, opts = {}) {
   const tableAvailable = opts.tableAvailable !== false;
   const rows = tableAvailable ? parseTsvRows(tsvText) : [];
-  const matched = new Map(); // reviewer -> Set(reasons)
-  const add = (reviewer, reason) => {
+  // reviewer -> { reasons: Set, files: Set, fileScoped: boolean }
+  //
+  // temperloop#2129 adds the second and third fields. `files` is WHICH changed
+  // files put this reviewer on the roster — the continuation carry decision
+  // (reviewCarryForward) needs per-seat file attribution, and re-deriving it
+  // there would be a second implementation of the very matching rule this
+  // function owns. `fileScoped` is false as soon as ANY of a reviewer's
+  // reasons came from an axis with no file behind it (the `review:` override,
+  // `kind: architectural`), because such a seat's relevance is not a function
+  // of which files moved and it must therefore always re-run.
+  const matched = new Map();
+  const add = (reviewer, reason, file) => {
     if (!reviewer) return;
-    if (!matched.has(reviewer)) matched.set(reviewer, new Set());
-    matched.get(reviewer).add(reason);
+    if (!matched.has(reviewer)) matched.set(reviewer, { reasons: new Set(), files: new Set(), fileScoped: true });
+    const entry = matched.get(reviewer);
+    entry.reasons.add(reason);
+    if (file) entry.files.add(file);
+    else entry.fileScoped = false;
   };
 
   if (item.review) add(item.review, 'review: override');
   if (item.kind === 'architectural') add('architecture-reviewer', 'kind: architectural');
 
   let anyCommandsDoc = false;
+  const commandDocFiles = [];
   for (const f of files) {
     if (REVIEW_COMMANDS_DOC_RE.test(f)) {
       anyCommandsDoc = true;
+      commandDocFiles.push(f);
       continue; // the mandatory rule below claims this file, never the tsv/prose fallback
     }
     // Both remaining axes read `rows`; with no trustworthy table there is — see build-level.design-notes-4.md#both-remaining-axes-read-rows-with-no-trustworthy-table
@@ -3228,24 +3279,106 @@ function determineReviewers(item, files, tsvText, opts = {}) {
     let tsvHit = false;
     for (const row of rows) {
       if (reviewGlobMatch(row.key, f)) {
-        add(row.reviewer, `${row.key} -> ${row.reviewer}`);
+        add(row.reviewer, `${row.key} -> ${row.reviewer}`, f);
         tsvHit = true;
       }
     }
     if (!tsvHit && REVIEW_PROSE_MD_RE.test(f)) {
-      add('docs-reviewer', 'prose *.md fallback (no tsv row)');
+      add('docs-reviewer', 'prose *.md fallback (no tsv row)', f);
     }
   }
   // Mandatory command-doc rule (foundation#1007) — always wins for a
   // claude/commands/*.md diff, regardless of any tsv row or the prose
   // fallback; never omitted, never worker-discretion.
-  if (anyCommandsDoc) add('workflow-reviewer', 'claude/commands/*.md (foundation#1007 — mandatory)');
+  if (anyCommandsDoc) {
+    for (const f of commandDocFiles) add('workflow-reviewer', 'claude/commands/*.md (foundation#1007 — mandatory)', f);
+  }
 
-  return Array.from(matched.entries()).map(([reviewer, reasons]) => ({
+  return Array.from(matched.entries()).map(([reviewer, entry]) => ({
     reviewer,
     mandatory: reviewer === 'workflow-reviewer' && anyCommandsDoc,
-    reasons: Array.from(reasons),
+    reasons: Array.from(entry.reasons),
+    // temperloop#2129 — carry-decision inputs. Consumed ONLY by
+    // reviewCarryForward(); every other reader of a route ignores them.
+    files: Array.from(entry.files),
+    fileScoped: entry.fileScoped,
   }));
+}
+
+// reviewCarryForward — temperloop#2129. THE CONTINUATION-ROUND ROSTER RULE.
+//
+// THE COST THIS CUTS. temperloop#2127 made a continuation round DELTA-AWARE in
+// the PROMPT — every routed seat still re-spawned, it was just told what had
+// changed. On an item that loops the full REVIEW_BLOCKING_MAX_ROUNDS budget
+// that re-runs every seat on every round, and the seats whose files the fix
+// never touched re-read the same unchanged code and re-emit the same verdict.
+// With build-level.mjs now carrying TWO seats (`.mjs` -> typescript-reviewer
+// and `**/build-level.mjs` -> shell-reviewer, this same item), a shell-only fix
+// round re-pays for a full ~9,000-line JavaScript review that cannot have
+// changed. This narrows the ROSTER to match the prompt's delta.
+//
+// THE RULE, and why each clause is where the safety lives. A routed seat is
+// CARRIED (not re-spawned) only when ALL of these hold:
+//   - the carry is ARMED at all: round > 1, a VALIDATED prior sha, and a
+//     `files_since_prior` array that actually arrived. Any of the three
+//     missing arms nothing, so every seat re-runs — the same
+//     permissive-on-degradation direction every other marker read here takes
+//     (a relay that drops a field can only ever cause MORE review, never
+//     less).
+//   - the seat is NOT MANDATORY. foundation#1007's command-doc rule is a
+//     GATE, and `review.mandatory_ok` means "workflow-reviewer actually ran on
+//     this command-doc diff". Carrying it would report a gate as passed on the
+//     strength of a previous round — the K.49/foundation#164 silent-skip class
+//     dressed as an optimisation. Never carried, at any delta.
+//   - the seat is FILE-SCOPED and has at least one routed file. A `review:`
+//     override or a `kind: architectural` route has no file behind it, so
+//     "did its files change" is not a question that can be asked about it.
+//   - the seat did NOT raise the prior round's blocking finding. This is the
+//     load-bearing one: the whole point of a `review-blocking` continuation is
+//     for THAT seat to re-check the fix, and the fix routinely lands in files
+//     that seat is not routed for (a JS-side fix for a shell finding, a doc
+//     fix for a prose finding). Attribution is by reviewer NAME against the
+//     prior findings text the orchestrator handed back, and it FAILS SAFE: if
+//     that text is present but names no routed seat, the carry disarms
+//     entirely rather than guess — better to re-run everything than to carry
+//     the one seat that had to run.
+//   - NONE of its routed files appear in the delta.
+//
+// A carried seat is never silent. It is recorded in `skipped` (so the tally's
+// `routed_not_run` names it, exactly as that field's contract already says a
+// seat skipped in one round and run in another should be) AND in `sections`,
+// so the PR body still renders a block for it under `## Review notes` rather
+// than losing the seat between rounds. See the carried disposition in
+// disposeReviewSlot() for what that block says and what it honestly cannot.
+//
+// Mutates each carried route in place (`route.carriedFrom`) rather than
+// returning a partition, so route ORDER — which fixes spawn order, `ran` order
+// and section order — is preserved by construction with no second array to
+// keep in step.
+function reviewCarryForward(routes, ctx) {
+  const priorSha = typeof ctx.priorSha === 'string' ? ctx.priorSha : '';
+  const changedSince = Array.isArray(ctx.changedSince) ? ctx.changedSince : null;
+  if (!(ctx.round > 1) || !priorSha || !changedSince) return { armed: false, carried: [] };
+
+  const changed = new Set(changedSince.map((f) => String(f)));
+  const priorText = typeof ctx.priorFindingsText === 'string' ? ctx.priorFindingsText : '';
+  const blockingSeats = routes.filter((r) => priorText.includes(r.reviewer)).map((r) => r.reviewer);
+  // FAIL SAFE (see the rule above): prior findings exist but name no routed
+  // seat, so the seat that must re-run cannot be identified. Disarm.
+  if (priorText.trim() && blockingSeats.length === 0) return { armed: false, carried: [] };
+
+  const carried = [];
+  for (const route of routes) {
+    if (route.mandatory) continue;
+    if (!route.fileScoped) continue;
+    const routedFiles = Array.isArray(route.files) ? route.files : [];
+    if (routedFiles.length === 0) continue;
+    if (blockingSeats.includes(route.reviewer)) continue;
+    if (routedFiles.some((f) => changed.has(f))) continue;
+    route.carriedFrom = { round: ctx.round - 1, sha: priorSha, files: routedFiles };
+    carried.push(route.reviewer);
+  }
+  return { armed: true, carried };
 }
 
 // reviewContinuationSection — temperloop#2127. The delta-aware instructi — see build-level.design-notes-3.md#reviewcontinuationsection-temperloop-2127-the-delta-aware-in
@@ -3436,6 +3569,22 @@ async function runReviewers(item, wt, priorFindingsText) {
   // The orchestrator-supplied table wins outright when present (#1982); th — see build-level.design-notes-4.md#the-orchestrator-supplied-table-wins-outright-when-pres
   const tsvText = REVIEWER_ROUTING_TSV || reviewDiffTsvText(diffOut) || '';
   const routes = determineReviewers(item, files, tsvText, { tableAvailable: !routingDegraded });
+  // temperloop#2129 — narrow a CONTINUATION round's roster to the seats whose
+  // routed files actually moved (plus the blocking seat and every mandatory
+  // one, unconditionally). Mutates the routes it carries; see
+  // reviewCarryForward() for the full rule and its fail-safe arms.
+  const carryPlan = reviewCarryForward(routes, {
+    round,
+    priorSha,
+    changedSince: Array.isArray(diffOut.files_since_prior) ? diffOut.files_since_prior : null,
+    priorFindingsText,
+  });
+  if (carryPlan.carried.length > 0) {
+    log(
+      `[${item.slug}] §3e review round ${round} — carrying ${carryPlan.carried.join(', ')} forward from ` +
+        `round ${round - 1}: no routed file changed since ${priorSha} (temperloop#2129)`,
+    );
+  }
   if (routes.length === 0) {
     return {
       summary: degradedSkip ? degradedSkip.note : '',
@@ -3458,6 +3607,18 @@ async function runReviewers(item, wt, priorFindingsText) {
   // temperloop#2003 — SPAWN EVERY ROUTED REVIEWER FIRST, then wait on the — see build-level.design-notes-3.md#temperloop-2003-spawn-every-routed-reviewer-first-then-wait-
   const slots = routes.map((route) => {
     const slot = { route, done: false, value: undefined, error: undefined };
+    // temperloop#2129 — a CARRIED seat keeps its place in route order but is
+    // NOT SPAWNED: no agent() call is made for it at all, which is the whole
+    // saving. It is seeded already-settled so awaitReviewFanout's `pending()`
+    // never counts it (a carried seat must not hold the fanout open, nor be
+    // read as a ceiling breach), and disposeReviewSlot() gives it its own
+    // disposition kind.
+    if (route.carriedFrom) {
+      slot.done = true;
+      slot.carried = route.carriedFrom;
+      slot.promise = Promise.resolve();
+      return slot;
+    }
     // No `schema` — a plain read-only advisory pass, not a machine-validated — see build-level.design-notes-3.md#no-schema-a-plain-read-only-advisory-pass-not-a-machine-vali
     slot.promise = agent(reviewPrompt(item, wt, route, files, priorContext), {
       // `#<reviewer>` (not `:<reviewer>`) matches the label grammar every — see build-level.design-notes-4.md#reviewer-not-reviewer-matches-the-label-grammar-every
@@ -3503,6 +3664,26 @@ async function runReviewers(item, wt, priorFindingsText) {
     if (disposition.kind === 'skip') {
       log(`[${item.slug}] §3e review — ${disposition.note}`);
       skipped.push({ reviewer: route.reviewer, note: disposition.note, mandatory: route.mandatory });
+      continue;
+    }
+    // temperloop#2129 — the CARRIED seat. TWO records, deliberately, because
+    // they answer two different readers' questions and neither substitutes for
+    // the other:
+    //   - a `skipped` entry, so the Step 6 tally's `routed_not_run` names it
+    //     (its contract already covers exactly this case: "a reviewer skipped
+    //     in one round and run in another stays listed"), and so an operator
+    //     reading the roster never sees a seat silently vanish between rounds;
+    //   - a `sections` entry, so the PR body's `## Review notes` still renders
+    //     a BLOCK for this seat. Without it a cold reader of the final PR sees
+    //     only the seats that happened to run on the LAST round and has no way
+    //     to tell a seat that was carried from one that was never routed.
+    // `mandatory: false` is a statement of fact, not a choice: a mandatory
+    // route is never carried (reviewCarryForward), so this branch cannot be
+    // reached with one.
+    if (disposition.kind === 'carried') {
+      log(`[${item.slug}] §3e review — ${disposition.note}`);
+      skipped.push({ reviewer: route.reviewer, note: disposition.note, mandatory: false, carried_forward: true });
+      sections.push({ reviewer: route.reviewer, text: disposition.text });
       continue;
     }
     // EXHAUSTIVE on purpose. `disposeReviewSlot()` returns exactly two shape — see build-level.design-notes-3.md#exhaustive-on-purpose-disposereviewslot-returns-exactly-two-
@@ -3570,6 +3751,46 @@ async function runReviewers(item, wt, priorFindingsText) {
 // disposeReviewSlot — the verdict for ONE SETTLED reviewer slot, as a pu — see build-level.design-notes-4.md#disposereviewslot-the-verdict-for-one-settled-reviewer-slot-
 function disposeReviewSlot(slot) {
   const route = slot.route;
+  // temperloop#2129 — CARRIED, checked FIRST because a carried slot was never
+  // spawned: it has no value and no error, and every branch below would read
+  // that absence as a failure ("returned no verdict (skip/transient)").
+  //
+  // WHAT THE BLOCK CAN AND CANNOT SAY. It states the fact that settles the
+  // question for a cold reader of the PR — this seat was routed, it ran in the
+  // named round, and the files it is routed for have not moved since the
+  // commit it reviewed. It does NOT reproduce that round's findings text,
+  // because that text does not cross the round boundary: §3e escalates to the
+  // orchestrator between rounds and the only review content handed back is the
+  // BLOCKING findings (`verdicts[slug].verdict_section`, build.md Step 3). A
+  // carried seat by construction raised none — the blocking seat is always
+  // re-run (reviewCarryForward), and a continuation that did not come from a
+  // `review-blocking` escalation had no blocking findings at all — so what is
+  // unreproducible here is advisory MEDIUM/LOW prose, never a HIGH. The block
+  // says that plainly rather than implying the seat produced nothing.
+  if (slot.carried) {
+    const carried = slot.carried;
+    const shortSha = String(carried.sha).slice(0, 12);
+    const note =
+      `carried forward — ${route.reviewer} was not re-spawned this round: none of the ` +
+      `${carried.files.length} file(s) routed to it changed since ${shortSha}, the commit its ` +
+      `round ${carried.round} review already covered (temperloop#2129)`;
+    const text = [
+      `_Carried forward from round ${carried.round} (temperloop#2129) — this seat was NOT re-spawned._`,
+      '',
+      `Every file routed to \`${route.reviewer}\` on this branch is byte-identical to what it reviewed ` +
+        `in round ${carried.round}, at commit \`${shortSha}\`, so re-running it could only reproduce that ` +
+        'round\'s verdict. Its round ' + carried.round + ' review therefore stands for these files:',
+      '',
+      ...carried.files.map((f) => `- \`${f}\``),
+      '',
+      `Round ${carried.round}'s own findings text is not reproduced here: only BLOCKING findings cross ` +
+        'the escalate/re-invoke boundary between rounds, and a seat is only ever carried when it raised ' +
+        'none — so what is missing above is advisory MEDIUM/LOW prose from a round that did not block, ' +
+        'never an unresolved HIGH. The seats whose files DID change this round are reviewed in the ' +
+        'block(s) beside this one.',
+    ].join('\n');
+    return { kind: 'carried', note, text };
+  }
   if (slot.error) {
     const err = slot.error;
     const msg = String((err && err.message) || err);

@@ -15186,6 +15186,249 @@ grep -F 'driveLevelPick' "$REPO_ROOT/claude/presentation-plane.md" >/dev/null \
   || fail "#2083: claude/presentation-plane.md has no row pointing at the level-pick kind's owner — a style template could restyle the verdict grammar the workflow parses"
 echo "PASS: #2083 static guards — the tally, the fail-closed calibration bar, the shared PR boundary, the loser archive, and both prose surfaces are wired"
 
+# ============================================================================
+# TEMPERLOOP#2129 — the STABLE REVIEWER ROSTER, two halves.
+#
+# HALF 1 (round 1): claude/workflows/build-level.mjs emits shell — the gate,
+# PR, CI and review-diff machinery commands are bash built as JS template
+# strings and executed verbatim — and only the `.mjs` extension row routed it,
+# to typescript-reviewer, which reads those commands as string literals and
+# therefore never reads the shell inside them. The `**/build-level.mjs`
+# basename row adds a SECOND, shell seat on the same file (build.md 3e's
+# run-both multi-match rule), paired with a widened shell-reviewer scope so the
+# seat is told to review the emitted strings rather than the host language.
+#
+# HALF 2 (continuation rounds): with two seats on one file, re-spawning both on
+# every round of a blocking-review loop re-pays for a full ~9,000-line review
+# that the round's fix cannot have touched. A continuation now re-runs only the
+# seats whose ROUTED files actually moved since the prior round's reviewed
+# commit — with three unconditional exemptions (a mandatory route, a route with
+# no file behind it, and the seat that raised the prior blocking finding).
+#
+# The cases below are a discriminating set, not a coverage list: cases 2 and 3
+# differ ONLY in which seat the prior round's findings name, and they must
+# disagree about whether the typescript seat re-spawns.
+# ============================================================================
+run_node_case "K2129 round 1: a build-level.mjs-only diff routes BOTH the typescript seat and the shell seat" "
+$PREAMBLE
+const tsv = readFileSync('$REPO_ROOT/workflows/scripts/config/reviewer-routing.tsv', 'utf8');
+
+setMachinery('roster1',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/roster1' },
+  { outcome: 'REVIEW_DIFF', files: ['claude/workflows/build-level.mjs'], tsv_lines: tsvLines(tsv), tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv) },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'c129' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'c129', branch: 'build/roster1' },
+  { outcome: 'PR_OPENED', pr_number: 2129 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('roster1');
+// One queued response per matched reviewer, in route order: the .mjs extension
+// row precedes the **/build-level.mjs basename row in the tsv, so the
+// typescript seat is resolved first.
+setReview('roster1', 'TS-SEAT-ROUND1', 'SHELL-SEAT-ROUND1');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'roster1', branch: 'build/roster1', title: 'Emitted-shell routing', kind: 'impl', acceptance: ['c'] },
+]};
+const mod = await loadLevel();
+const result = await mod.default();
+const parked = (result.parked ?? [])[0];
+const spawned = callLog.filter(c => isReviewCall(c.opts)).map(c => c.opts.agentType);
+const prBatch = callLog.find(c => (c.opts.label||'').startsWith('pr-batch:roster1'));
+let reason = null;
+if ((result.escalations ?? []).length !== 0) reason = 'unexpected escalation: ' + JSON.stringify(result.escalations);
+else if (!parked) reason = 'the level must park the item: ' + JSON.stringify(result);
+else if (spawned.indexOf('typescript-reviewer') === -1) reason = 'the .mjs extension row must still route the typescript seat: ' + JSON.stringify(spawned);
+else if (spawned.indexOf('shell-reviewer') === -1) reason = 'the basename row must route the SHELL seat on ROUND 1 — a second-round-only shell seat is exactly the gap this item closes: ' + JSON.stringify(spawned);
+else if (spawned.length !== 2) reason = 'exactly two seats must be routed for a build-level.mjs-only diff: ' + JSON.stringify(spawned);
+else if ((parked.review.ran || []).map(r => r.reviewer).indexOf('shell-reviewer') === -1) reason = 'the shell seat must be TALLIED as ran, not merely spawned: ' + JSON.stringify(parked.review);
+else if (!prBatch) reason = 'the item must reach 3f — no pr-batch call was made';
+else if (prBatch.promptFull.indexOf('SHELL-SEAT-ROUND1') === -1) reason = 'the shell seat VERDICT TEXT must reach the PR body, not just its name';
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+run_node_case "K2129 round 2: a .sh-only delta does NOT re-spawn the typescript seat, and that seat's block still reaches the PR body" "
+$PREAMBLE
+// Models the round-2 shape with NO prior blocking findings (the §3g CI-fix
+// re-review: same shared per-worktree round counter, nothing carried back).
+// The branch touches a shell script AND build-level.mjs, but only the shell
+// script moved since the commit round 1 reviewed — so the typescript seat,
+// routed solely for build-level.mjs, has nothing new to read.
+const tsv = readFileSync('$REPO_ROOT/workflows/scripts/config/reviewer-routing.tsv', 'utf8');
+
+setMachinery('roster2',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/roster2' },
+  { outcome: 'REVIEW_DIFF',
+    files: ['workflows/scripts/x.sh', 'claude/workflows/build-level.mjs'],
+    files_since_prior: ['workflows/scripts/x.sh'],
+    review_rounds: 1,
+    review_prior_sha: 'abc1234def5678',
+    tsv_lines: tsvLines(tsv), tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv) },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'd129' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'd129', branch: 'build/roster2' },
+  { outcome: 'PR_OPENED', pr_number: 2130 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('roster2');
+setReview('roster2', 'SHELL-SEAT-ROUND2');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'roster2', branch: 'build/roster2', title: 'Shell-only delta', kind: 'impl', acceptance: ['c'] },
+]};
+const mod = await loadLevel();
+const result = await mod.default();
+const parked = (result.parked ?? [])[0];
+const spawned = callLog.filter(c => isReviewCall(c.opts)).map(c => c.opts.agentType);
+const prBatch = callLog.find(c => (c.opts.label||'').startsWith('pr-batch:roster2'));
+let reason = null;
+if ((result.escalations ?? []).length !== 0) reason = 'unexpected escalation: ' + JSON.stringify(result.escalations);
+else if (!parked) reason = 'the level must park the item: ' + JSON.stringify(result);
+else if (spawned.indexOf('shell-reviewer') === -1) reason = 'the seat whose routed file DID change must still re-run: ' + JSON.stringify(spawned);
+else if (spawned.indexOf('typescript-reviewer') !== -1) reason = 'the seat whose routed files did NOT change must not be re-spawned — that is the whole saving: ' + JSON.stringify(spawned);
+else {
+  const carried = (parked.review.skipped || []).find(s => s.reviewer === 'typescript-reviewer');
+  const notes = prBatch ? prBatch.promptFull : '';
+  if (!carried) reason = 'a carried seat must still appear in the tally, never vanish silently: ' + JSON.stringify(parked.review);
+  else if (carried.carried_forward !== true) reason = 'a carried entry must be distinguishable from the other skip reasons: ' + JSON.stringify(carried);
+  else if (!/^carried forward/.test(carried.note)) reason = 'the carried notice must say it was carried, not that the seat was unavailable or timed out: ' + carried.note;
+  else if (carried.note.indexOf('abc1234def56') === -1) reason = 'the carried notice must name the commit the prior round already covered: ' + carried.note;
+  else if (carried.mandatory !== false) reason = 'a carried entry must never be marked mandatory — a mandatory route is never carried: ' + JSON.stringify(carried);
+  else if ((parked.review.routed_not_run || []).indexOf('typescript-reviewer') === -1) reason = 'routed_not_run must name the carried seat: ' + JSON.stringify(parked.review);
+  else if (parked.review.mandatory_ok !== true) reason = 'no mandatory route here, so mandatory_ok must stay true: ' + JSON.stringify(parked.review);
+  else if (!prBatch) reason = 'the item must reach 3f — no pr-batch call was made';
+  else if (notes.indexOf('Carried forward from round 1') === -1) reason = 'the carried seat PRIOR-ROUND BLOCK must still be rendered in the PR body — otherwise a cold reader cannot tell a carried seat from one that was never routed: ' + notes.slice(0, 800);
+  else if (notes.indexOf('SHELL-SEAT-ROUND2') === -1) reason = 'the seat that DID re-run must still have its findings in the PR body: ' + notes.slice(0, 800);
+}
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+run_node_case "K2129 always re-run the blocking seat: the seat that raised the prior HIGH re-runs even when its routed files did not change" "
+$PREAMBLE
+// The DISCRIMINATING PAIR for the case above. Identical branch, identical
+// delta (only the .sh file moved), identical routing — the ONE difference is
+// that this continuation resumes from a review-blocking escalation whose
+// findings name the TYPESCRIPT seat. That seat's own routed file did not
+// change, so the file rule alone would carry it; the blocking-seat exemption
+// must override that, because re-checking the fix is the entire reason the
+// round exists and the fix routinely lands in a file that seat is not routed
+// for.
+const tsv = readFileSync('$REPO_ROOT/workflows/scripts/config/reviewer-routing.tsv', 'utf8');
+
+setMachinery('roster3',
+  { outcome: 'REVIEW_DIFF',
+    files: ['workflows/scripts/x.sh', 'claude/workflows/build-level.mjs'],
+    files_since_prior: ['workflows/scripts/x.sh'],
+    review_rounds: 1,
+    review_prior_sha: 'abc1234def5678',
+    tsv_lines: tsvLines(tsv), tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv) },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'e129' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'e129', branch: 'build/roster3' },
+  { outcome: 'PR_OPENED', pr_number: 2131 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('roster3');
+setReview('roster3', 'SHELL-SEAT-R2', 'TS-SEAT-R2');
+
+globalThis.args = { ...baseArgs,
+  onlySlugs: ['roster3'],
+  verdicts: { roster3: { kind: 'review-blocking', verdict_section: '## Design verdict\\n\\nRound 1 blocking finding from typescript-reviewer: an unawaited promise.' } },
+  items: [
+    { slug: 'roster3', branch: 'build/roster3', title: 'Blocking seat re-runs', kind: 'impl', acceptance: ['c'] },
+  ]};
+const mod = await loadLevel();
+const result = await mod.default();
+const parked = (result.parked ?? [])[0];
+const spawned = callLog.filter(c => isReviewCall(c.opts)).map(c => c.opts.agentType);
+let reason = null;
+if ((result.escalations ?? []).length !== 0) reason = 'unexpected escalation: ' + JSON.stringify(result.escalations);
+else if (!parked) reason = 'the level must park the item: ' + JSON.stringify(result);
+else if (spawned.indexOf('typescript-reviewer') === -1) reason = 'the seat that raised the prior BLOCKING finding must ALWAYS re-run, unchanged routed files or not — otherwise the fix it demanded is never re-checked: ' + JSON.stringify(spawned);
+else if (spawned.indexOf('shell-reviewer') === -1) reason = 'the seat whose routed file changed must re-run too: ' + JSON.stringify(spawned);
+else if ((parked.review.skipped || []).some(s => s.carried_forward)) reason = 'nothing may be carried on this round: ' + JSON.stringify(parked.review.skipped);
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+run_node_case "K2129 fail-soft: a continuation with no usable delta field re-runs EVERY routed seat, never fewer" "
+$PREAMBLE
+// The carry reads two fields the machinery relay has repeatedly been observed
+// mangling. Its degradation direction is therefore PERMISSIVE by construction:
+// a dropped files_since_prior can only ever cause MORE review, never a seat
+// silently skipped on the strength of a field that never arrived.
+const tsv = readFileSync('$REPO_ROOT/workflows/scripts/config/reviewer-routing.tsv', 'utf8');
+
+setMachinery('roster4',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/roster4' },
+  { outcome: 'REVIEW_DIFF',
+    files: ['workflows/scripts/x.sh', 'claude/workflows/build-level.mjs'],
+    review_rounds: 1,
+    review_prior_sha: 'abc1234def5678',
+    tsv_lines: tsvLines(tsv), tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv) },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'f129' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'f129', branch: 'build/roster4' },
+  { outcome: 'PR_OPENED', pr_number: 2132 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('roster4');
+setReview('roster4', 'SHELL-R2', 'TS-R2');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'roster4', branch: 'build/roster4', title: 'Dropped delta field', kind: 'impl', acceptance: ['c'] },
+]};
+const mod = await loadLevel();
+const result = await mod.default();
+const parked = (result.parked ?? [])[0];
+const spawned = callLog.filter(c => isReviewCall(c.opts)).map(c => c.opts.agentType);
+let reason = null;
+if (!parked) reason = 'the level must park the item: ' + JSON.stringify(result);
+else if (spawned.length !== 2) reason = 'an absent delta field must disarm the carry entirely — every routed seat re-runs: ' + JSON.stringify(spawned);
+else if ((parked.review.skipped || []).some(s => s.carried_forward)) reason = 'nothing may be carried when the delta field never arrived: ' + JSON.stringify(parked.review.skipped);
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+# --- K2129 static lockstep guards --------------------------------------------
+grep -qE '^\*\*/build-level\.mjs[[:space:]]+shell-reviewer[[:space:]]' "$REPO_ROOT/workflows/scripts/config/reviewer-routing.tsv" \
+  || fail "#2129: reviewer-routing.tsv must carry the **/build-level.mjs -> shell-reviewer basename row — without it no shell seat joins round 1"
+# The seat DEFINITION and the routing row are a pair: routing build-level.mjs to
+# a seat that scopes itself to a `.sh` script alone hands a shell reviewer ~9,400
+# lines of JavaScript with no instruction about what to read. Guard both halves.
+_k2129_desc="$(sed -n '/^description:/p' "$REPO_ROOT/claude/agents/reviewers/shell-reviewer.md")"
+[ -n "$_k2129_desc" ] \
+  || fail "#2129: shell-reviewer.md has no description: line — the routing row's paired half cannot be checked"
+printf '%s' "$_k2129_desc" | grep -F 'EMITS SHELL AS COMMAND STRINGS' >/dev/null \
+  || fail "#2129: shell-reviewer's description: must state that shell emitted as command strings from a non-.sh host file is in scope"
+printf '%s' "$_k2129_desc" | grep -F 'build-level.mjs' >/dev/null \
+  || fail "#2129: shell-reviewer's description: must name the concrete emitted-shell file the tsv now routes to it"
+if printf '%s' "$_k2129_desc" | grep -F '.sh` script. Read-only' >/dev/null; then
+  fail "#2129: shell-reviewer's description: still scopes the seat to a .sh diff ALONE — the emitted-shell clause was dropped"
+fi
+grep -F 'review the emitted strings, not the host language' "$REPO_ROOT/claude/agents/reviewers/shell-reviewer.md" >/dev/null \
+  || fail "#2129: shell-reviewer.md § Scope must tell the seat to review the emitted shell rather than the host language on such a file"
+grep -q 'files_since_prior' "$MJS" \
+  || fail "#2129: build-level.mjs must emit/read the continuation DELTA field — without it the carry has nothing to decide on"
+grep -q 'function reviewCarryForward(' "$MJS" \
+  || fail "#2129: reviewCarryForward() missing — a continuation would re-spawn every routed seat again"
+grep -q "kind: 'carried'" "$MJS" \
+  || fail "#2129: the carried disposition is gone — a not-re-spawned seat would fall through to the 'returned no verdict' branch and read as a failure"
+# REGION-SCOPED to reviewCarryForward()'s own body: a whole-file grep for these
+# three clauses would sit green with the exemptions deleted from the rule and
+# the words surviving in a comment somewhere else in the file.
+_k2129_fn="$(awk '/^function reviewCarryForward\(/,/^}/' "$MJS")"
+printf '%s' "$_k2129_fn" | grep -F 'if (route.mandatory) continue;' >/dev/null \
+  || fail "#2129: reviewCarryForward() no longer refuses to carry a MANDATORY route — the command-doc gate would report as passed on a previous round's strength"
+printf '%s' "$_k2129_fn" | grep -F 'blockingSeats.includes(route.reviewer)' >/dev/null \
+  || fail "#2129: reviewCarryForward() no longer always re-runs the seat that raised the prior blocking finding"
+printf '%s' "$_k2129_fn" | grep -F 'if (!route.fileScoped) continue;' >/dev/null \
+  || fail "#2129: reviewCarryForward() no longer exempts a route with no file behind it (a review: override, a kind: architectural route) — whether its files changed is not a question that can be asked of one"
+echo "PASS: #2129 stable reviewer roster — the basename row, the widened seat scope, the continuation carry and its three unconditional exemptions are all wired"
+
 # --- temperloop#2083 round 2: the two BLOCKING pre-push review findings ------
 # Both HIGHs shipped because the round-1 guards above grep the WHOLE FILE for a
 # sentence. A whole-file grep cannot tell "declared at 3d-esc" from "enforced at
