@@ -1054,6 +1054,32 @@ added by a branch not yet on main is invisible to that derivation.
  on an unestablished shape is exactly the errand this item removed.
 ```
 
+## gateInFlightSelectCmd(idx) — the ONE builder the executed probe AND
+<a id="gateinflightselectcmd-idx-the-one-builder-the-executed-probe-a"></a>
+
+```text
+ gateInFlightSelectCmd(idx) — the ONE builder the executed probe AND the
+ operator-facing `resolve` line are both made from (temperloop#1650 round 2).
+
+ Round 1 emitted the ordinal->name pipeline TWICE: once inside the probe (with
+ `${gateScopeEnv}` and every operand `sq()`-quoted) and once as the `resolve`
+ string handed to the reader (with neither). That is not cosmetic drift. The
+ scope env is what puts quality-gates.sh on its SCOPED arm, and the script
+ consults `QUALITY_GATES_SELECTION_PIN` only inside `if (( SCOPED ))` — so
+ without it the pin is ignored and `--list-selected` prints the FULL set
+ (measured in this tree: 211 lines unscoped, 43 scoped). The escalation's
+ ordinal indexes the 43-line list; the pasted command indexed the 211-line one,
+ so for any index > 0 it named an unrelated gate with total confidence — the
+ plausible-looking-wrong-answer failure this item exists to remove, on the only
+ path `resolve` is ever rendered on (`BUILD_GATE_SCOPED` defaults to 1).
+
+ So the two are ONE function, and the probe wraps it rather than restating it.
+ Quoting follows for free: a checkout path with a space no longer breaks the
+ pasted line. A fixture case executes BOTH strings against a stub
+ quality-gates.sh whose selected and full lists differ, and asserts they name
+ the same gate — the test that fails against round 1's code.
+```
+
 ## gateInFlightNameCmd(idx) — turn a stopped run's gate ORDINAL into
 <a id="gateinflightnamecmd-idx-turn-a-stopped-run-s-gate-ordinal-into"></a>
 

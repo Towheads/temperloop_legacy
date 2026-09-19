@@ -6801,11 +6801,14 @@ async function driveItemBuildPhase(item, arm, box) {
     `QUALITY_GATES_SCOPED=$(. ${sq(configBin)} >/dev/null 2>&1; echo "\${BUILD_GATE_SCOPED:-1}")`;
   // SLICE-STABLE SELECTION (temperloop#1663). `QUALITY_GATES_START_AT` is — see build-level.design-notes-5.md#slice-stable-selection-temperloop-1663-quality-gates-start-a
   const gatePin = `/tmp/qg-${item.slug}.selection-pin`;
+  // gateInFlightSelectCmd(idx) — the ONE builder the executed probe AND the — see build-level.design-notes-6.md#gateinflightselectcmd-idx-the-one-builder-the-executed-probe-a
+  const gateInFlightSelectCmd = (idx) =>
+    `cd ${sq(wt)} && ${gateScopeEnv} QUALITY_GATES_SELECTION_PIN=${sq(gatePin)} ` +
+    `${sq(qgBin)} --list-selected 2>/dev/null | grep -E '^(make|bash) ' | sed -n '${idx + 1}p'`;
   // gateInFlightNameCmd(idx) — turn a stopped run's gate ORDINAL into its  — see build-level.design-notes-6.md#gateinflightnamecmd-idx-turn-a-stopped-run-s-gate-ordinal-into
   const gateInFlightNameCmd = (idx) =>
     `if [ ! -x ${sq(qgBin)} ]; then echo '{"outcome":"GATE_NAME_UNKNOWN"}'; else ` +
-    `__g=$( cd ${sq(wt)} && ${gateScopeEnv} QUALITY_GATES_SELECTION_PIN=${sq(gatePin)} ` +
-    `${sq(qgBin)} --list-selected 2>/dev/null | grep -E '^(make|bash) ' | sed -n '${idx + 1}p' | tr -d '"' ); ` +
+    `__g=$( ${gateInFlightSelectCmd(idx)} | tr -d '"\\\\' ); ` +
     `if [ -n "$__g" ]; then printf '{"outcome":"GATE_NAMED","gate":"%s"}\\n' "$__g"; ` +
     `else echo '{"outcome":"GATE_NAME_UNKNOWN"}'; fi; fi`;
   const gateCmd = (startAt, expectSelection) =>
@@ -6960,7 +6963,7 @@ async function driveItemBuildPhase(item, arm, box) {
       inFlightGate = {
         index: inFlightIndex,
         slice: gateSliceLedger.length,
-        resolve: `cd ${wt} && QUALITY_GATES_SELECTION_PIN=${gatePin} ${qgBin} --list-selected | grep -E '^(make|bash) ' | sed -n '${inFlightIndex + 1}p'`,
+        resolve: gateInFlightSelectCmd(inFlightIndex),
         sliceLog: gateSliceLog,
       };
       // Fail-SOFT: the escalation is the deliverable, the name is an enrichment.

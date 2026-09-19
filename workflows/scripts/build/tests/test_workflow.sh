@@ -306,6 +306,12 @@ const preserveMap = new Map();
 // next. Default (map miss): GATE_NAMED with a plausible gate command, so every
 // pre-#1650 GATE_TIMEOUT case keeps working unchanged.
 const gateInFlightMap = new Map();
+// gateInFlightExecMap: slug → true — temperloop#1650 round 2. A RESPONSE MOCK
+// agrees with any command string, correct or not, so the queue above can never
+// catch a defect IN the emitted shell. A slug listed here instead RUNS the
+// emitted probe for real (bash -c) and returns whatever it printed, so the
+// fixture's own stub quality-gates.sh is the oracle.
+const gateInFlightExecMap = new Map();
 // workerClockMap / workerUsageMap: slug → [outcome, ...] — temperloop#2065's
 // worker-cost-capture seam (`worker-clock:<slug>#<tag>` / `worker-usage:
 // <slug>#<tag>`), each its OWN queue, mirroring freshnessMap/preserveMap/
@@ -391,6 +397,7 @@ globalThis.reviewMap = reviewMap;
 globalThis.freshnessMap = freshnessMap;
 globalThis.preserveMap = preserveMap;
 globalThis.gateInFlightMap = gateInFlightMap;
+globalThis.gateInFlightExecMap = gateInFlightExecMap;
 globalThis.workerClockMap = workerClockMap;
 globalThis.workerUsageMap = workerUsageMap;
 globalThis.setWorkerClock = (slug, ...outcomes) => { workerClockMap.set(slug, outcomes); };
@@ -419,6 +426,22 @@ globalThis.agent = async function agent(prompt, opts = {}) {
       // gateInFlightMap). A queued { __throw: msg } models runMachinery() itself
       // throwing — the case the caller's fail-soft try/catch exists for.
       if (/^gate-inflight:/.test(String(opts.label || ''))) {
+        // EXECUTE the emitted command instead of answering it (see
+        // gateInFlightExecMap) — the only way a bad command string can fail.
+        if (gateInFlightExecMap.get(slug)) {
+          const { execFileSync } = await import('node:child_process');
+          // The machinery PROMPT wraps the emitted command in prose and in the
+          // shared __lb wall-clock watchdog. Run the STEP BODY only: __lb parks
+          // a `sleep $ceiling` watchdog whose bash subshell defers the SIGTERM
+          // that retires it until that sleep returns, so running the wrapper
+          // here would block the case for the full ceiling. The watchdog is
+          // shared machinery with its own coverage; the step body is the
+          // temperloop#1650 string under test.
+          const body = /\n__s0\(\) \{\n([\s\S]*?)\n\}\n/.exec(String(prompt));
+          if (!body) throw new Error('gate-inflight prompt carried no __s0 step body');
+          const raw = String(execFileSync('bash', ['-c', body[1]], { encoding: 'utf8' })).trim();
+          return JSON.parse(raw.split('\n').pop());
+        }
         const v = nextFromMap(gateInFlightMap, slug, { outcome: 'GATE_NAMED', gate: 'bash workflows/scripts/build/tests/test_state_graph_soak.sh' });
         if (v && v.__throw) throw new Error(v.__throw);
         return v;
@@ -537,6 +560,7 @@ globalThis.setMergeCheck = (slug, ...states) => { mergeCheckMap.set(slug, states
 globalThis.setFreshness = (slug, ...outcomes) => { freshnessMap.set(slug, outcomes); };
 globalThis.setPreserve = (slug, ...outcomes) => { preserveMap.set(slug, outcomes); };
 globalThis.setGateInFlight = (slug, ...outcomes) => { gateInFlightMap.set(slug, outcomes); };
+globalThis.setGateInFlightExec = (slug) => { gateInFlightExecMap.set(slug, true); };
 globalThis.setReview = (slug, ...responses) => { reviewMap.set(slug, responses); };
 // tsvRows(text) — temperloop#1976: the harness's OWN independent restatement
 // of reviewDiffCmd's row-count rule (non-blank, non-`#` lines — the same
@@ -2110,6 +2134,149 @@ if (/can rise only/.test(remedy))
 // The slice budget the payload reports is the CLAMPED one it just described.
 if (esc?.payload?.sliceBudgetSecs !== 360)
   { console.log(JSON.stringify({ ok: false, reason: 'slice budget did not resolve to the clamp: ' + JSON.stringify(esc?.payload) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-4 (temperloop#1650 round 2): EXECUTE the emitted ordinal->name
+#   shell, and execute the `resolve` line the operator is handed, against a
+#   stub quality-gates.sh whose SCOPED and FULL lists differ. A response mock
+#   agrees with any command string, so only a real run can catch a defect IN
+#   the command. Round 1 built the two strings separately and the operator-
+#   facing one dropped $gateScopeEnv — quality-gates.sh reads
+#   QUALITY_GATES_SELECTION_PIN only inside `if (( SCOPED ))`, so the pasted
+#   line listed the FULL set and named an unrelated gate at the same ordinal.
+#   The worktree path carries a SPACE, so unquoted interpolation fails too.
+# ============================================================================
+run_node_case "1650 probe: the emitted probe AND the operator-facing resolve line both name the SCOPED gate" "
+$PREAMBLE
+
+const os = await import('node:os');
+const fs = await import('node:fs');
+const path = await import('node:path');
+const { execFileSync } = await import('node:child_process');
+
+// A worktree path with a SPACE in it — the case unquoted interpolation breaks.
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qg1650-'));
+const wt = path.join(root, 'wt with space');
+fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+const qg = path.join(wt, 'scripts', 'quality-gates.sh');
+// The stub is the ORACLE: its scoped list and its full list differ at every
+// ordinal, and the trailing indented skipped line must be filtered out.
+fs.writeFileSync(qg, [
+  '#!/usr/bin/env bash',
+  'if [ x\${QUALITY_GATES_SCOPED:-0} = x1 ]; then',
+  \"  echo 'selection: diff-scoped, 4 of 6'\",
+  \"  echo 'make scoped-zero'\",
+  \"  echo 'make scoped-one'\",
+  \"  echo 'bash scripts/tests/test_scoped_two.sh'\",
+  \"  echo 'make scoped-three'\",
+  \"  echo '  skipped: make full-two - no changed path reaches it'\",
+  'else',
+  \"  echo 'selection: full set'\",
+  \"  echo 'make full-zero'\",
+  \"  echo 'make full-one'\",
+  \"  echo 'make full-two'\",
+  \"  echo 'make full-three'\",
+  \"  echo 'bash scripts/tests/test_full_four.sh'\",
+  \"  echo 'make full-five'\",
+  'fi',
+].join('\n') + '\n');
+fs.chmodSync(qg, 0o755);
+
+setMachinery('item-exec1650',
+  { outcome: 'CREATED', path: wt },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 2, failed: 0, elapsedSecs: 301 },
+  { outcome: 'GATE_TIMEOUT' },
+);
+// RUN the emitted probe for real instead of answering it.
+setGateInFlightExec('item-exec1650');
+happyWorker('item-exec1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-exec1650', branch: 'build/item-exec1650', title: 'Probe', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const esc = (result.escalations ?? [])[0];
+if (!esc || esc.kind !== 'acceptance-gate-timeout')
+  { console.log(JSON.stringify({ ok: false, reason: 'expected acceptance-gate-timeout: ' + JSON.stringify(result.escalations) })); process.exit(0); }
+const inFlight = esc.payload?.inFlightGate;
+const EXPECT = 'bash scripts/tests/test_scoped_two.sh';
+if (!inFlight || inFlight.index !== 2)
+  { console.log(JSON.stringify({ ok: false, reason: 'expected the run to stop at ordinal 2: ' + JSON.stringify(inFlight) })); process.exit(0); }
+// THE EXECUTED PROBE: line idx+1 of the SELECTED set, skipped lines filtered.
+if (inFlight.gate !== EXPECT)
+  { console.log(JSON.stringify({ ok: false, reason: 'the executed probe named ' + JSON.stringify(inFlight.gate) + ', expected ' + EXPECT })); process.exit(0); }
+// THE OPERATOR-FACING LINE: run it exactly as pasted. It must agree.
+let pasted = '';
+try { pasted = String(execFileSync('bash', ['-c', String(inFlight.resolve)], { encoding: 'utf8' })).trim(); }
+catch (e) { console.log(JSON.stringify({ ok: false, reason: 'the resolve line does not run: ' + String(e && e.message).slice(0, 300) })); process.exit(0); }
+if (pasted !== EXPECT)
+  { console.log(JSON.stringify({ ok: false, reason: 'the pasted resolve line named ' + JSON.stringify(pasted) + ', not the probe answer ' + EXPECT + ' — resolve: ' + inFlight.resolve })); process.exit(0); }
+// …and it must be the SAME builder, not a parallel string that happens to agree.
+if (!/QUALITY_GATES_SCOPED/.test(String(inFlight.resolve)))
+  { console.log(JSON.stringify({ ok: false, reason: 'the resolve line omits the scope env: ' + inFlight.resolve })); process.exit(0); }
+fs.rmSync(root, { recursive: true, force: true });
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ============================================================================
+# TEST 11d-5 (temperloop#1650 round 2, LOW): the gate name is injected into a
+#   hand-rolled `printf '…"gate":"%s"…'`, so it is sanitized first. Round 1
+#   stripped `"` only; a BACKSLASH survived and emitted a JSON string with an
+#   unescaped escape — `--name "a\\b"` parsed back as a BACKSPACE, silently
+#   wrong rather than loudly broken. Executed, not mocked, for the same reason
+#   as 11d-4: only a real run can falsify the emitted shell.
+# ============================================================================
+run_node_case "1650 probe: a gate name carrying a quote and a backslash is sanitized before it reaches the JSON" "
+$PREAMBLE
+
+const os = await import('node:os');
+const fs = await import('node:fs');
+const path = await import('node:path');
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qg1650b-'));
+const wt = path.join(root, 'wt');
+fs.mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+const qg = path.join(wt, 'scripts', 'quality-gates.sh');
+fs.writeFileSync(qg, [
+  '#!/usr/bin/env bash',
+  \"echo 'selection: diff-scoped'\",
+  \"echo 'make zero'\",
+  \"printf '%s\\\\n' 'bash scripts/x.sh --name \\\"a\\\\\\\\b\\\"'\",
+].join('\n') + '\n');
+fs.chmodSync(qg, 0o755);
+
+setMachinery('item-esc1650',
+  { outcome: 'CREATED', path: wt },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_SLICE', resumeAt: 1, failed: 0, elapsedSecs: 301 },
+  { outcome: 'GATE_TIMEOUT' },
+);
+setGateInFlightExec('item-esc1650');
+happyWorker('item-esc1650');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-esc1650', branch: 'build/item-esc1650', title: 'Escape', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const inFlight = (result.escalations ?? [])[0]?.payload?.inFlightGate;
+if (!inFlight || inFlight.index !== 1)
+  { console.log(JSON.stringify({ ok: false, reason: 'expected the run to stop at ordinal 1: ' + JSON.stringify(inFlight) })); process.exit(0); }
+// Both JSON-hostile characters are gone — no quote, no backslash, no control
+// character smuggled in by an unescaped escape sequence.
+if (inFlight.gate !== 'bash scripts/x.sh --name ab')
+  { console.log(JSON.stringify({ ok: false, reason: 'the gate name was not sanitized: ' + JSON.stringify(inFlight.gate) })); process.exit(0); }
+fs.rmSync(root, { recursive: true, force: true });
 
 console.log(JSON.stringify({ ok: true }));
 "

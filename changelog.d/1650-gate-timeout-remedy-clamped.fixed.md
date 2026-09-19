@@ -20,3 +20,14 @@
     to leave the reader to find the offending gate themselves; the escalation now
     carries that gate's position in the list and, when the list still resolves,
     its name and the one command that prints it.
+  - **That command is now the same command the report ran.** It was being built
+    twice, and the copy handed to the reader left out the setting that puts the
+    gate suite on its scoped selection — so it listed the full gate set and, at
+    the same position, named an unrelated gate with complete confidence. Both are
+    now built from one place, quoted so a checkout path containing a space still
+    works, and a gate name carrying a quote or a backslash no longer corrupts the
+    report it is written into.
+  - **A gate spelled outside the expected vocabulary now fails the build.** The
+    position-to-name lookup only recognises gates that begin `make ` or `bash `;
+    one spelled any other way was silently dropped and shifted every later
+    position by one. `check-gate-paths.sh` gained a fifth check that fails on it.
