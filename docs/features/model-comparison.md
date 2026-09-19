@@ -491,8 +491,9 @@ environment variable, plan-note field, or prior run turns it on, so a
 `/build` with no flag is byte-identical to before the harness existed.
 Items outside the tested tier build once, exactly as today.
 
-**Pre-flight and consent.** Before anything is built, `/build`'s Step 1.9
-projects every level's cost via `dual-build-preflight.sh` against the
+**Pre-flight and consent.** Before anything is built, `/build`'s dual-build
+pre-flight (spec: [`claude/commands/build.md`](../../claude/commands/build.md)
+Step 1.9) projects every level's cost via `dual-build-preflight.sh` against the
 model-comparison module's own shared `REPLAY_PREFLIGHT_CEILING_TOKENS`
 ceiling (never a second, dual-build-specific one) and **declines** — building
 that level single-arm instead — a level with fewer than
@@ -507,7 +508,9 @@ and the run **parks** rather than proceeding on a timeout.
 **The level barrier.** A dual-built level cannot interleave build → gate → PR
 per item the way a single-arm level does: both arms build, locally gate, and
 get pairwise-judged on **every** in-scope item before a single PR opens for
-the level (ADR 0038). This is what stops `main` from ever accumulating a
+the level ([ADR 0038](../adr/0038-judge-per-item-pick-per-level-in-build.md) —
+judges every item, picks a winner per level). This is what stops `main` from
+ever accumulating a
 level authored by an unchosen mix of two models. A `/build` resumed
 **without** the flag over a level that was interrupted mid-barrier — arm rows
 recorded, no level pick yet — refuses outright, naming the level and how to
@@ -543,8 +546,9 @@ comparison before either order is spawned.
 result, cost (worker tokens, wall-clock, retry tokens, retry count), the
 judge verdict, the level's pick, an override if one happened, and a
 `loss_reason` when it lost — is appended to
-`.temperloop/model-comparison/dual-build/rows.jsonl` (ADR 0039), a folder of
-its own rather than a piggyback on any resume/retry ledger, so the record
+`.temperloop/model-comparison/dual-build/rows.jsonl` ([ADR
+0039](../adr/0039-dual-build-ledger-is-an-own-folder-with-a-versioned-row-schema.md)
+— its own folder, not a piggyback on the resume ledger), so the record
 survives past the run that wrote it and is never invalidated by an unrelated
 machinery-version bump. A `git format-patch` archive per (item, arm) sits
 beside it, so a losing arm's full diff is preserved — unshipped, never lost —
@@ -567,7 +571,10 @@ override with the identical grammar (confirm the tally, override the whole
 level, or override named items).
 
 **Calibrate mode.** The pairwise judge's preference has never been checked
-against a human, so a `calibrate` mode (ADR 0041) samples archived item pairs
+against a human, so a `calibrate` mode ([ADR
+0041](../adr/0041-pairwise-judge-calibration-from-blind-pairs-only.md) —
+the verdict is withheld until blind-pair calibration clears a bar) samples
+archived item pairs
 **blind** — both diffs shown, the judge's own preference and margin withheld —
 and records a human preference. Only these blind pairs count toward the
 agreement statistic; an operator's own overrides are recorded in the same
@@ -646,14 +653,17 @@ absent `tokens` producer would.
   disagree.
 - The dual-build harness additionally **consumes** `/build`'s own worktree,
   branch-naming, PR and merge machinery (`worktree.sh --arm`, `pr.sh`, the
-  Step 4 merge gate) and `judge.sh`'s single-judge rubric lineage (the
+  batch merge gate) and `judge.sh`'s single-judge rubric lineage (the
   pairwise mode reuses the same rubric.md content, never a second rubric);
   it **produces** the `.temperloop/model-comparison/dual-build/` ledger and
-  patch archives (ADR 0039), the `Model-comparison-arms:` PR trailer (ADR
-  0040), and the blind-calibration record (`calibration-pairs.jsonl` /
+  patch archives (ADR 0039), the `Model-comparison-arms:` PR trailer ([ADR
+  0040](../adr/0040-model-comparison-arms-trailer-is-a-second-line-not-a-widened-model-provenance.md)
+  — a second trailer line, not a widened Model-provenance), and the
+  blind-calibration record (`calibration-pairs.jsonl` /
   `calibration.json`, ADR 0041).
 
-**`/build --dual-build`'s own entry points.** `claude/commands/build.md` Step
+**`/build --dual-build`'s own entry points.**
+[`claude/commands/build.md`](../../claude/commands/build.md) Step
 1.9 owns flag resolution, the pre-flight/consent gate, and the
 partial-dual-build resume refusal; `claude/workflows/build-level.mjs` owns
 the level-barrier build, the level pick, and the two operator levers. Nothing
@@ -665,7 +675,9 @@ holds (ADR 0027).
 this trailer on a merged PR should read it as an instruction, not a
 footnote: the PR was authored under a **recorded** model comparison, so
 authorship should never be silently attributed to whichever single arm's
-model happens to show in the (unchanged) `Model-provenance:` line alone. If
+model happens to show in the (unchanged) `Model-provenance:` line alone —
+the existing per-PR model-attribution trailer, specified in
+[`claude/presentation-plane.md`](../../claude/presentation-plane.md). If
 the reviewer wants to inspect what did *not* ship, the losing arm's full
 diff lives only in the local, gitignored patch archive
 (`.temperloop/model-comparison/dual-build/archives/`) — never in the PR
@@ -817,8 +829,8 @@ second attempt-through-retry build** (worker tokens and wall-clock, every
 retry included — not just a first attempt) on top of today's single build,
 plus two pairwise-judge calls. Items outside the tested tier build once,
 exactly as today, so the multiplier applies only to the in-scope subset, not
-the whole level. This is gated, not assumed: Step 1.9's pre-flight projects
-the extra cost against the SAME `REPLAY_PREFLIGHT_CEILING_TOKENS` ceiling the
+the whole level. This is gated, not assumed: the dual-build pre-flight
+projects the extra cost against the SAME `REPLAY_PREFLIGHT_CEILING_TOKENS` ceiling the
 replay harness above already shares, and requires consent before a single
 dual-built worker spawns. Read plainly: 2× worker spend plus two judge calls
 per in-scope item is spend that directly competes with shipping work, which
