@@ -14974,5 +14974,403 @@ grep -qF 'hard cap ${GATE_MAX_SLICES * (GATE_RESUME_EXTENSIONS + 1)}' "$MJS" \
   || fail "#2133: the §3e.5 gate PASS log must DERIVE the hard cap from GATE_MAX_SLICES and GATE_RESUME_EXTENSIONS (kernel § Named-setting convention) — never restate it as a literal, which silently rots when either constant moves"
 echo "PASS: #2133 gate-PASS decay signal — the green-path log names the base cap, the extension allowance, the derived hard cap, the extensions spent and this run's ceiling, every figure derived from its constant"
 
+# ============================================================================
+# TEST (K2137): the ALREADY-FIXED continuation close — a `review-blocking`
+#   retry that lands on a branch ALREADY carrying the fix re-runs §3e ONLY,
+#   with NO worker spawned, and says so in the PR body.
+#
+#   THE WASTE. build.md's 3d-esc loop resumes a `review-blocking` escalation
+#   through 3c -> 3e. When the branch tip already carries the fix, the
+#   re-spawned implementation worker reads the finding, reads the code, finds
+#   nothing to do and returns "no source change" — a full implementation agent
+#   spent to learn that. Four PRs in the 2026-09-18 dual-build epic (#2096,
+#   #2100, #2101, #2102) had `-r2`/`-r3` branches that changed nothing at all.
+#   temperloop#1934 closed the WORKER half; this is the ORCHESTRATOR half.
+#
+#   THE TRAP, and why the arms below are asymmetric. The predicate decides
+#   whether to skip real work, so a FALSE POSITIVE (claiming the fix is present
+#   when it is not) silently drops the fix round and lets a branch still
+#   carrying a HIGH reach the merge gate LOOKING reviewed — strictly worse than
+#   the waste. A false NEGATIVE costs one worker spawn, i.e. exactly today's
+#   behaviour. So ONE arm skips (a positively-established ALREADY_FIXED) and
+#   EVERY other arm spawns, and the fail-closed arms get their own fixtures
+#   below rather than riding on the happy one.
+# ============================================================================
+run_node_case "K2137: a review-blocking continuation whose tip already carries the fix re-runs 3e with NO worker spawned, and the PR body says so" "
+$PREAMBLE
+
+// The prior round's blocking findings, in the reviewers' own documented output
+// format ('**Where:** <file:line or function name>' — claude/agents/reviewers/*).
+// The file:line form is the ONLY one this predicate can check, and this fixture
+// uses it.
+const PRIOR = '### shell-reviewer\\n### [HIGH] Unquoted expansion splits on a path with a space\\n**Where:** claude/commands/build.md:42\\n';
+
+setMachinery('af-fixed',
+  // The 3c probe: every named finding line is gone from the tip.
+  { outcome: 'ALREADY_FIXED', detail: 'every-named-finding-line-is-gone-from-the-tip', sha: 'deadbeefcafe01', matches: ['claude/commands/build.md:42'] },
+  { outcome: 'REVIEW_DIFF', files: ['claude/commands/build.md'], tsv: '', tsv_rows: 0, tsv_checksum: 0, review_rounds: 1, review_prior_sha: 'deadbeefcafe01' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'c0ffee37' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'c0ffee37', branch: 'build/af-fixed' },
+  { outcome: 'PR_OPENED', pr_number: 2137 },
+  { outcome: 'CI_GREEN' },
+);
+// Deliberately queued but must never be consumed: if the driver spawns a worker
+// on this arm the case fails on the worker-call assertion, not on a mock miss.
+setWorker('af-fixed', { status: 'done', summary: 'no source change', acceptance_results: [], commits: [] });
+setReview('af-fixed', '## Summary\\nClean after the fix.\\n\\n## Findings\\nNone.\\n');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'af-fixed', branch: 'build/af-fixed', title: 'AlreadyFixed', kind: 'impl', acceptance: ['the gate quotes its path argument'] },
+], onlySlugs: ['af-fixed'], verdicts: { 'af-fixed': { kind: 'review-blocking', verdict_section: PRIOR } } };
+const mod = await loadLevel();
+const result = await mod.default();
+
+const workerCalls = callLog.filter(c => /^worker:af-fixed/.test(String(c.opts.label || '')));
+const probeCalls = callLog.filter(c => /^already-fixed:af-fixed/.test(String(c.opts.label || '')));
+const reviewCalls = callLog.filter(c => /^review:af-fixed/.test(String(c.opts.label || '')));
+const prBatch = callLog.find(c => /^pr-batch:af-fixed/.test(String(c.opts.label || '')));
+
+let reason = null;
+if (probeCalls.length !== 1)
+  reason = 'expected exactly ONE already-fixed probe call, got ' + probeCalls.length;
+else if (workerCalls.length !== 0)
+  reason = 'a worker was SPAWNED on the already-fixed arm — the whole point of the item is that it is not: ' + JSON.stringify(workerCalls.map(c => c.opts.label));
+else if (reviewCalls.length === 0)
+  reason = '3e did not re-run — skipping the worker must re-run the review, not skip the item: ' + JSON.stringify(result);
+else if (!prBatch)
+  reason = 'no pr-batch call captured, so the PR body cannot be inspected: ' + JSON.stringify(result);
+else if (prBatch.promptFull.indexOf('No implementation worker ran on this round (temperloop#2137)') === -1)
+  reason = 'the PR body does not state that NO WORKER RAN: ' + prBatch.promptFull.slice(0, 1200);
+else if (prBatch.promptFull.indexOf('claude/commands/build.md:42') === -1)
+  reason = 'the PR body does not name WHY (the finding location checked against the prior reviewed commit): ' + prBatch.promptFull.slice(0, 1200);
+else if (prBatch.promptFull.indexOf('deadbeefcafe01') === -1)
+  reason = 'the PR body does not name the PRIOR REVIEWED SHA the tip was compared against: ' + prBatch.promptFull.slice(0, 1200);
+else if ((result.parked ?? []).length !== 1)
+  reason = 'expected the continuation to park cleanly: ' + JSON.stringify(result);
+
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+# ============================================================================
+# TEST (K2137-spawns): the UNCHANGED arm. A continuation whose branch does NOT
+#   carry the fix spawns the worker exactly as today, and the PR body carries
+#   the WORKER's verdict — never the no-worker notice.
+#
+#   This is the regression half of the pair: the skip is only safe if the
+#   spawning path is byte-for-byte what it was, so this asserts the positive
+#   (worker spawned, its summary in the body) AND the negative (no no-worker
+#   notice anywhere in the body).
+# ============================================================================
+run_node_case "K2137-spawns: a review-blocking continuation whose branch does NOT carry the fix spawns the worker exactly as today" "
+$PREAMBLE
+
+const PRIOR = '### shell-reviewer\\n### [HIGH] Unquoted expansion splits on a path with a space\\n**Where:** claude/commands/build.md:42\\n';
+
+setMachinery('af-spawns',
+  // The probe ran and answered DEFINITIVELY that the finding is still there.
+  { outcome: 'NOT_ALREADY_FIXED', detail: 'finding-line-still-present-claude/commands/build.md-42' },
+  { outcome: 'REVIEW_DIFF', files: ['claude/commands/build.md'], tsv: '', tsv_rows: 0, tsv_checksum: 0, review_rounds: 1, review_prior_sha: 'deadbeefcafe01' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'c0ffee38' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'c0ffee38', branch: 'build/af-spawns' },
+  { outcome: 'PR_OPENED', pr_number: 2138 },
+  { outcome: 'CI_GREEN' },
+);
+setWorker('af-spawns', { status: 'done', summary: 'THE-FIX-ROUND-RAN-AND-QUOTED-THE-PATH', acceptance_results: [{ criterion: 'q', passed: true, evidence: 'e', discrimination_evidence: 'd' }], commits: [] });
+setReview('af-spawns', '## Summary\\nClean.\\n\\n## Findings\\nNone.\\n');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'af-spawns', branch: 'build/af-spawns', title: 'Spawns', kind: 'impl', acceptance: ['q'] },
+], onlySlugs: ['af-spawns'], verdicts: { 'af-spawns': { kind: 'review-blocking', verdict_section: PRIOR } } };
+const mod = await loadLevel();
+const result = await mod.default();
+
+const workerCalls = callLog.filter(c => /^worker:af-spawns/.test(String(c.opts.label || '')));
+const prBatch = callLog.find(c => /^pr-batch:af-spawns/.test(String(c.opts.label || '')));
+
+let reason = null;
+if (workerCalls.length !== 1)
+  reason = 'expected EXACTLY ONE worker spawn on the not-fixed arm, got ' + workerCalls.length + ': ' + JSON.stringify(result);
+else if (!prBatch)
+  reason = 'no pr-batch call captured: ' + JSON.stringify(result);
+else if (prBatch.promptFull.indexOf('THE-FIX-ROUND-RAN-AND-QUOTED-THE-PATH') === -1)
+  reason = 'the PR body must carry the WORKER verdict on this arm: ' + prBatch.promptFull.slice(0, 1200);
+else if (prBatch.promptFull.indexOf('No implementation worker ran on this round') !== -1)
+  reason = 'the no-worker notice leaked onto an arm where a worker DID run: ' + prBatch.promptFull.slice(0, 1200);
+else if ((result.parked ?? []).length !== 1)
+  reason = 'expected the continuation to park cleanly: ' + JSON.stringify(result);
+
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+# ============================================================================
+# TEST (K2137-failclosed): FOUR uncertainty shapes, ONE required answer —
+#   spawn the worker.
+#
+#   The predicate's only dangerous error is the false positive, so each shape
+#   that CANNOT positively establish 'this finding's line is gone from the tip'
+#   gets its own fixture here rather than being argued from the happy arm:
+#     A. the probe answers ALREADY_FIXED_UNKNOWN (no usable prior reviewed SHA)
+#     B. the finding's '**Where:**' names no line at all (a prose locator) —
+#        and this arm ALSO asserts the cheap read declines in JS, spending NO
+#        machinery call
+#     C. the continuation resumes from a NON-review-blocking escalation
+#     D. a FRESH (non-continuation) item, which must never probe at all
+# ============================================================================
+run_node_case "K2137-failclosed: an unknown probe, an unlocatable finding, a non-review-blocking continuation and a fresh item ALL spawn the worker" "
+$PREAMBLE
+
+const LOCATABLE = '### shell-reviewer\\n### [HIGH] Unquoted expansion\\n**Where:** claude/commands/build.md:42\\n';
+// A '**Where:**' that names a SECTION, not a line — nothing for the probe to
+// check, so the whole finding set is unverifiable.
+const UNLOCATABLE = '### workflow-reviewer\\n### [HIGH] Silent failure mode\\n**Where:** claude/commands/build.md - Step 3\\n';
+
+const tail = [
+  { outcome: 'REVIEW_DIFF', files: ['claude/commands/build.md'], tsv: '', tsv_rows: 0, tsv_checksum: 0, review_rounds: 1, review_prior_sha: 'deadbeefcafe01' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'c0ffee39' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'c0ffee39', branch: 'build/x' },
+  { outcome: 'PR_OPENED', pr_number: 2139 },
+  { outcome: 'CI_GREEN' },
+];
+
+let reason = null;
+
+async function drive(slug, opts) {
+  setMachinery(slug, ...(opts.head ?? []), ...tail.map(o => ({ ...o })));
+  setWorker(slug, { status: 'done', summary: slug + ' worker ran', acceptance_results: [{ criterion: 'c', passed: true, evidence: 'e', discrimination_evidence: 'd' }], commits: [] });
+  setReview(slug, '## Summary\\nClean.\\n\\n## Findings\\nNone.\\n');
+  globalThis.args = { ...baseArgs, items: [
+    { slug, branch: 'build/' + slug, title: slug, kind: 'impl', acceptance: ['c'] },
+  ], ...(opts.args ?? {}) };
+  const mod = await loadLevel();
+  return await mod.default();
+}
+
+// A. the probe cannot establish an answer.
+const rA = await drive('af-unknown', {
+  head: [{ outcome: 'ALREADY_FIXED_UNKNOWN', detail: 'no-usable-prior-reviewed-sha' }],
+  args: { onlySlugs: ['af-unknown'], verdicts: { 'af-unknown': { kind: 'review-blocking', verdict_section: LOCATABLE } } },
+});
+if (callLog.filter(c => /^worker:af-unknown/.test(String(c.opts.label || ''))).length !== 1)
+  reason = 'A: an UNKNOWN probe verdict must fail CLOSED and spawn the worker: ' + JSON.stringify(rA);
+
+// B. the finding names no checkable line — declined in JS, no machinery call.
+const rB = await drive('af-noloc', {
+  args: { onlySlugs: ['af-noloc'], verdicts: { 'af-noloc': { kind: 'review-blocking', verdict_section: UNLOCATABLE } } },
+});
+if (!reason && callLog.filter(c => /^worker:af-noloc/.test(String(c.opts.label || ''))).length !== 1)
+  reason = 'B: a finding with no file:line must fail CLOSED and spawn the worker: ' + JSON.stringify(rB);
+else if (!reason && callLog.filter(c => /^already-fixed:af-noloc/.test(String(c.opts.label || ''))).length !== 0)
+  reason = 'B: an unlocatable finding must be declined in JS, spending NO machinery call at all';
+
+// C. a continuation resuming from a DIFFERENT escalation kind.
+const rC = await drive('af-otherkind', {
+  args: { onlySlugs: ['af-otherkind'], verdicts: { 'af-otherkind': { kind: 'rebase-conflict', verdict_section: LOCATABLE } } },
+});
+if (!reason && callLog.filter(c => /^worker:af-otherkind/.test(String(c.opts.label || ''))).length !== 1)
+  reason = 'C: a non-review-blocking continuation must spawn the worker: ' + JSON.stringify(rC);
+else if (!reason && callLog.filter(c => /^already-fixed:af-otherkind/.test(String(c.opts.label || ''))).length !== 0)
+  reason = 'C: a non-review-blocking continuation must never probe — its verdict block is not review output';
+
+// D. a FRESH item. The prelude adds a CREATED step ahead of the tail.
+const rD = await drive('af-fresh', {
+  head: [{ outcome: 'CREATED', path: '/tmp/repo.wt/af-fresh' }],
+});
+if (!reason && callLog.filter(c => /^worker:af-fresh/.test(String(c.opts.label || ''))).length !== 1)
+  reason = 'D: a fresh item must spawn its worker: ' + JSON.stringify(rD);
+else if (!reason && callLog.filter(c => /^already-fixed:af-fresh/.test(String(c.opts.label || ''))).length !== 0)
+  reason = 'D: a fresh item has no prior round and must never probe';
+
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+# ============================================================================
+# TEST (K2137-e2e): the probe's GENERATED SHELL, executed for real against a
+#   REAL LINKED worktree and a REAL prior-reviewed-SHA marker.
+#
+#   Every mock case above hands the driver a probe OUTCOME and never runs the
+#   shell continuationAlreadyFixedCmd() actually generates — so the part that
+#   decides the outcome (read the #2127 marker, resolve it against this repo,
+#   pull the reviewed line at that commit, look for it at the tip) would be
+#   entirely untested by them. This closes that, mirroring the #1970-e2e /
+#   #1937-e2e lift-the-generated-command pattern.
+#
+#   SIX arms, and five of them are the fail-closed direction, because that is
+#   where the damage lives: only arm 4 may skip a worker.
+# ============================================================================
+K2137_E2E="$WF_TEST_TMPDIR/already-fixed-e2e"
+mkdir -p "$K2137_E2E/main-checkout"
+(
+  set -e
+  cd "$K2137_E2E/main-checkout"
+  git init --quiet .
+  git symbolic-ref HEAD refs/heads/main
+  git config user.email t@example.com
+  git config user.name t
+  printf 'first line of the fixture file\nUNQUOTED_EXPANSION_THE_REVIEWER_FLAGGED=one\nthird line of the fixture file\n' > f.txt
+  git add -A && git commit --quiet -m base
+) || fail "#2137-e2e: could not build the base fixture"
+git -C "$K2137_E2E/main-checkout" worktree add --quiet "$K2137_E2E/repo.wt/af" -b build/af main \
+  || fail "#2137-e2e: could not create the linked worktree"
+# Fixture self-check: a LINKED worktree's .git is a pointer FILE, so the probe
+# must reach its private git dir via `git rev-parse --git-dir` — the same shape
+# #1937 was burned by and the same one the #2127 marker lives in.
+[ -f "$K2137_E2E/repo.wt/af/.git" ] \
+  || fail "#2137-e2e: fixture worktree's .git is not a pointer FILE — this fixture does not exercise the linked-worktree shape"
+
+read -r -d '' K2137_EMIT_BODY << 'K2137_EMIT_END' || true
+import { writeFileSync } from 'fs';
+// The generated command's location list is baked in at emit time from THIS
+// findings text, so the fixture's file:line and the probe's agree by
+// construction rather than by a restated literal.
+const PRIOR = '### workflow-reviewer\n### [HIGH] Unquoted expansion\n**Where:** f.txt:2\n';
+setMachinery('af', { outcome: 'ERROR', error: 'stop after the probe' });
+happyWorker('af');
+globalThis.args = { ...baseArgs, repoRoot: process.env.K2137_ROOT + '/repo', items: [
+  { slug: 'af', branch: 'build/af', title: 'e2e', kind: 'impl', acceptance: ['c'] },
+], onlySlugs: ['af'], verdicts: { af: { kind: 'review-blocking', verdict_section: PRIOR } } };
+const mod = await loadLevel();
+await mod.default();
+const c = callLog.find(x => /^already-fixed:/.test(String(x.opts.label || '')));
+writeFileSync(process.env.K2137_OUT, c ? (c.promptFull.split(/\nCommand:\n/)[1] || '') : '');
+K2137_EMIT_END
+
+K2137_CASE="$WF_TEST_TMPDIR/e2e-already-fixed.mjs"
+printf '%s\n' "$PREAMBLE" > "$K2137_CASE"
+printf '%s\n' "$K2137_EMIT_BODY" >> "$K2137_CASE"
+MJS_PATH="$MJS" AGENT_DEF_PATH="$AGENT_DEF" \
+K2137_ROOT="$K2137_E2E" K2137_OUT="$K2137_E2E/probe.sh" \
+  node "$K2137_CASE" >/dev/null || fail "#2137-e2e: could not emit the generated probe command (node failed)"
+[ -s "$K2137_E2E/probe.sh" ] \
+  || fail "#2137-e2e: no probe command was generated — the 3c dispatch did not reach continuationAlreadyFixed() on a review-blocking continuation with a locatable finding"
+
+K2137_WT="$K2137_E2E/repo.wt/af"
+K2137_GD="$(git -C "$K2137_WT" rev-parse --git-dir)"
+K2137_MARK="$K2137_GD/build-review-rounds-sha"
+[ -e "$K2137_MARK" ] \
+  && fail "#2137-e2e: fixture self-check failed — the prior-sha marker already exists before any arm runs"
+K2137_C1="$(git -C "$K2137_WT" rev-parse HEAD)"
+
+# CAPTURE FAILURES MUST NOT KILL THE SUITE: this file runs under `set -euo
+# pipefail`, so a bare command substitution whose command exits non-zero would
+# terminate the run AT THE ASSIGNMENT, before the `|| fail "… got '…'"` on the
+# next line could name what went wrong (same treatment as the #1970-e2e
+# captures).
+k2137_run() { bash "$K2137_E2E/probe.sh" 2>/dev/null || true; }
+
+# ARM 1 — no marker at all. Nothing establishes a prior reviewed commit.
+K2137_A1="$(k2137_run)"
+printf '%s' "$K2137_A1" | grep -F '"outcome":"ALREADY_FIXED_UNKNOWN"' >/dev/null \
+  || fail "#2137-e2e arm 1: with NO prior-sha marker the probe must fail CLOSED (ALREADY_FIXED_UNKNOWN), never claim the fix is present; got '$K2137_A1'"
+printf '%s' "$K2137_A1" | grep -F 'no-usable-prior-reviewed-sha' >/dev/null \
+  || fail "#2137-e2e arm 1: the UNKNOWN verdict must NAME why it could not establish an answer; got '$K2137_A1'"
+
+# ARM 2 — a CORRUPTED marker. `tr -cd` is a FILTER, not a validator: 'not a sha
+# at all' survives it as the perfectly well-shaped hex 'aaaa'. The floor plus
+# the resolve-against-this-repo check are what reject it.
+printf '%s\n' 'not a sha at all' > "$K2137_MARK"
+K2137_A2="$(k2137_run)"
+printf '%s' "$K2137_A2" | grep -F '"outcome":"ALREADY_FIXED_UNKNOWN"' >/dev/null \
+  || fail "#2137-e2e arm 2: a CORRUPTED marker must be rejected, not filtered down to plausible hex and trusted; got '$K2137_A2'"
+
+# ARM 3 — marker == HEAD. The tip carries nothing new, so it cannot carry a fix.
+printf '%s\n' "$K2137_C1" > "$K2137_MARK"
+K2137_A3="$(k2137_run)"
+printf '%s' "$K2137_A3" | grep -F '"outcome":"NOT_ALREADY_FIXED"' >/dev/null \
+  || fail "#2137-e2e arm 3: a tip IDENTICAL to the reviewed commit carries no fix and must read NOT_ALREADY_FIXED; got '$K2137_A3'"
+printf '%s' "$K2137_A3" | grep -F 'tip-unchanged-since-the-reviewed-commit' >/dev/null \
+  || fail "#2137-e2e arm 3: the NOT_ALREADY_FIXED verdict must name the degenerate tip-unchanged case; got '$K2137_A3'"
+
+# ARM 4 — THE MOTIVATING CASE, INVERTED. A new commit lands (the `-r2` branch is
+# no longer empty) but the flagged line is untouched: the fix is NOT carried, so
+# a worker must still be spawned. This is the arm that fails if the probe ever
+# degrades into "did anything change since the last review".
+(
+  set -e
+  cd "$K2137_WT"
+  printf 'unrelated\n' > z.txt
+  git add -A && git commit --quiet -m 'unrelated change'
+) || fail "#2137-e2e: could not add the unrelated commit"
+K2137_A4="$(k2137_run)"
+printf '%s' "$K2137_A4" | grep -F '"outcome":"NOT_ALREADY_FIXED"' >/dev/null \
+  || fail "#2137-e2e arm 4: the tip MOVED but the flagged line is still there — the fix is NOT carried and the worker must still run; got '$K2137_A4'"
+printf '%s' "$K2137_A4" | grep -F 'finding-line-still-present' >/dev/null \
+  || fail "#2137-e2e arm 4: the NOT_ALREADY_FIXED verdict must name the line it still found; got '$K2137_A4'"
+
+# ARM 5 — the ONLY skipping arm. The flagged line as it stood at the reviewed
+# commit is gone from the file at the tip.
+(
+  set -e
+  cd "$K2137_WT"
+  printf 'first line of the fixture file\nQUOTED_EXPANSION_AFTER_THE_FIX=one\nthird line of the fixture file\n' > f.txt
+  git add -A && git commit --quiet -m 'the fix'
+) || fail "#2137-e2e: could not add the fix commit"
+K2137_A5="$(k2137_run)"
+printf '%s' "$K2137_A5" | grep -F '"outcome":"ALREADY_FIXED"' >/dev/null \
+  || fail "#2137-e2e arm 5: the reviewed line is gone from the tip, so the probe must report ALREADY_FIXED — otherwise the item saves nothing at all; got '$K2137_A5'"
+printf '%s' "$K2137_A5" | grep -F "\"sha\":\"$K2137_C1\"" >/dev/null \
+  || fail "#2137-e2e arm 5: the ALREADY_FIXED line must carry the PRIOR REVIEWED SHA it compared against (the PR body names it); got '$K2137_A5'"
+
+# ARM 6 — the FINGERPRINT FLOOR. The probe's evidence is 'the exact reviewed
+# line is no longer anywhere in this file'. For a line like `fi` that test is
+# meaningless, so a too-short line must read UNKNOWN (spawn) rather than be
+# treated as evidence either way.
+(
+  set -e
+  cd "$K2137_WT"
+  printf 'first line of the fixture file\nfi\nthird line of the fixture file\n' > f.txt
+  git add -A && git commit --quiet -m 'weak line'
+) || fail "#2137-e2e: could not add the weak-fingerprint commit"
+K2137_C4="$(git -C "$K2137_WT" rev-parse HEAD)"
+(
+  set -e
+  cd "$K2137_WT"
+  printf 'moved on\n' > z.txt
+  git add -A && git commit --quiet -m 'move the tip past the weak line'
+) || fail "#2137-e2e: could not move the tip past the weak-fingerprint commit"
+printf '%s\n' "$K2137_C4" > "$K2137_MARK"
+K2137_A6="$(k2137_run)"
+printf '%s' "$K2137_A6" | grep -F '"outcome":"ALREADY_FIXED_UNKNOWN"' >/dev/null \
+  || fail "#2137-e2e arm 6: a reviewed line too short to be a fingerprint must fail CLOSED, never be read as evidence; got '$K2137_A6'"
+printf '%s' "$K2137_A6" | grep -F 'fingerprint-too-weak' >/dev/null \
+  || fail "#2137-e2e arm 6: the UNKNOWN verdict must name the weak-fingerprint reason; got '$K2137_A6'"
+
+unset K2137_A1 K2137_A2 K2137_A3 K2137_A4 K2137_A5 K2137_A6
+echo "PASS: #2137-e2e the generated probe shell, run for real against a linked worktree: no marker, a corrupted marker and a weak fingerprint all fail CLOSED; an unchanged tip and a tip whose flagged line survives read NOT_ALREADY_FIXED; only a tip whose reviewed line is gone reads ALREADY_FIXED, carrying the prior reviewed SHA"
+
+# --- K2137 static lockstep guards --------------------------------------------
+# Class-A activation proof plus the lockstep the node cases cannot express: a
+# predicate that exists but is never CALLED, or one whose skip arm widens past
+# the single positively-established outcome, passes every mock above.
+grep -q 'continuationAlreadyFixed' "$MJS" \
+  || fail "#2137: build-level.mjs must define the continuationAlreadyFixed() predicate — this is the item's Class-A activation proof"
+grep -qF 'await continuationAlreadyFixed(' "$MJS" \
+  || fail "#2137: the 3c dispatch must CALL continuationAlreadyFixed(); a match on the DEFINITION alone does not prove the worker spawn is actually gated on it"
+_k2137_spawn="$(grep -nF 'alreadyFixed.fixed' "$MJS" || true)"
+[ -n "$_k2137_spawn" ] \
+  || fail "#2137: the worker spawn must be gated on the predicate's verdict (alreadyFixed.fixed) — without that gate the probe runs and its answer is discarded, which is strictly worse than not probing"
+unset _k2137_spawn
+grep -qF "out.outcome !== 'ALREADY_FIXED'" "$MJS" \
+  || fail "#2137: the skip must be gated on the SINGLE positively-established outcome. Widening it (to 'not NOT_ALREADY_FIXED', say) makes every relay drop, timeout and garble read as 'the fix is present' — the false positive that lets a branch still carrying a HIGH reach the merge gate looking reviewed"
+grep -qF "priorVerdict.kind !== 'review-blocking'" "$MJS" \
+  || fail "#2137: the predicate must decline any escalation kind other than review-blocking — another kind's verdict block is a human/mechanical decision, not review findings, and has no findings to check"
+grep -qF "'ALREADY_FIXED', 'NOT_ALREADY_FIXED', 'ALREADY_FIXED_UNKNOWN'" "$MJS" \
+  || fail "#2137: all three probe outcomes must be declared in the spine outcome enum — an undeclared outcome is rejected by the executor's schema at runtime, which no mock in this suite can see"
+# ONE SHA SOURCE. The item's whole premise is that it consumes the marker
+# temperloop#2127 already writes; a second notion of 'the commit the last round
+# reviewed' would drift against the one the continuation reviewer is handed.
+_k2137_mark="$(grep -cF 'build-review-rounds-sha' "$MJS" || true)"
+[ "${_k2137_mark:-0}" -ge 2 ] \
+  || fail "#2137: the probe must read the SAME prior-reviewed-SHA marker reviewDiffCmd writes (build-review-rounds-sha), not invent a second SHA source; found $_k2137_mark reference(s)"
+unset _k2137_mark
+grep -qF 'No implementation worker ran on this round (temperloop#2137)' "$MJS" \
+  || fail "#2137: the skipped-worker verdict must state IN THE PR BODY that no worker ran; a silent skip is indistinguishable from a review that passed on a worker's fix"
+echo "PASS: #2137 static lockstep guards — the predicate exists AND is called, the worker spawn is gated on its verdict, the skip arm is pinned to the single positively-established ALREADY_FIXED outcome, all three outcomes are schema-declared, the prior SHA comes from the #2127 marker, and the PR body carries the no-worker notice"
+
 echo ""
 echo "All test_workflow.sh cases passed."

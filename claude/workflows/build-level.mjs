@@ -440,6 +440,19 @@ const SPINE_OUTCOME_SCHEMA = {
         'ACTIVATION_CONTROL_DISCRIMINATES', 'ACTIVATION_CONTROL_VACUOUS', 'ACTIVATION_CONTROL_ERROR',
         // The 3e pre-push review's diff/routing-data fetch (temperloop#1430). — see build-level.design-notes.md#the-3e-pre-push-review-s-diff-routing-data-fetch-temperloop-
         'REVIEW_DIFF',
+        // The 3c already-fixed continuation probe (temperloop#2137). THREE
+        // closed outcomes, and the asymmetry between them IS the design: only
+        // ALREADY_FIXED skips a worker spawn, so it is the ONLY one the JS
+        // reads as a skip, and it is emitted ONLY when EVERY finding location
+        // was positively established to be gone from the tip.
+        // NOT_ALREADY_FIXED (a named finding's line is demonstrably still on
+        // the tip) and ALREADY_FIXED_UNKNOWN (the probe could not establish an
+        // answer — no usable prior reviewed SHA, a file unreadable at either
+        // revision, a fingerprint too weak to be evidence) both spawn the
+        // worker exactly as today. A relay that drops or garbles this line
+        // reads as none of the three, which is also a spawn — so the
+        // fail-closed direction holds by construction, not by discipline.
+        'ALREADY_FIXED', 'NOT_ALREADY_FIXED', 'ALREADY_FIXED_UNKNOWN',
         'CLAIMED', 'CLAIM_CONFLICT',
         // worktree.sh deps-merged (3b-0) — its outcomes were consumed at the — see build-level.design-notes.md#worktree-sh-deps-merged-3b-0-its-outcomes-were-consumed
         'DEPS_MERGED', 'DEPS_UNMERGED',
@@ -2440,6 +2453,253 @@ function recoveredVerdict(item, probe, reason) {
       '**Reviewer action required:** verify each acceptance criterion above directly — do not',
       'read the unchecked boxes as failures, and do not read this PR as self-verified.',
     ].join('\n'),
+  };
+}
+
+// --- 3c already-fixed continuation close (temperloop#2137) -------------------
+//
+// THE WASTE THIS CLOSES. A `review-blocking` escalation loops the item back
+// through 3c → 3e. Sometimes the branch ALREADY carries the fix by the time the
+// continuation runs, so the re-spawned worker reads the finding, reads the code,
+// finds nothing to do, and returns "no source change" — a full implementation
+// agent spent to learn that. Four PRs in the 2026-09-18 dual-build epic
+// (#2096, #2100, #2101, #2102) had `-r2`/`-r3` branches that changed nothing at
+// all. temperloop#1934 closed the WORKER side of this for the join-key-registry
+// case (the worker recognising it has nothing to do); this is the ORCHESTRATOR
+// side — not spawning it in the first place.
+//
+// WHAT IT CONSUMES, AND WHY THERE IS EXACTLY ONE SOURCE. The prior reviewed SHA
+// is the marker `reviewDiffCmd` writes beside `build-review-rounds` in the
+// worktree's own git dir (temperloop#2127, merged in level 0 — see that
+// function's comment for the durability contract and the two resolution checks).
+// This probe re-reads THAT marker with THAT file's own validation, never a
+// second SHA source: a parallel notion of "the commit the last round reviewed"
+// would drift against the one the continuation reviewer is already being handed.
+//
+// FAIL CLOSED — THE ONLY DIRECTION THAT MATTERS. This predicate decides whether
+// to skip real work. A FALSE POSITIVE (claiming the fix is present when it is
+// not) silently drops the fix round and lets a branch that still carries a HIGH
+// reach the merge gate LOOKING reviewed, which is strictly worse than the waste
+// it is trying to avoid. A false NEGATIVE costs one worker spawn — exactly
+// today's behaviour. So every step below that cannot POSITIVELY establish "this
+// finding's line is gone from the tip" returns not-fixed:
+//   - the escalation is not `review-blocking`, or carries no findings text
+//   - no `**Where:** <path>:<line>` location parses out of the findings
+//   - a `**Where:**` line is present but does NOT yield a usable path:line
+//     (a function name, a prose locator like `build.md - Step 3`): one
+//     unlocatable finding means the SET cannot be established
+//   - fewer located findings than `### [HIGH` headings
+//   - the machinery call is denied, times out, or returns anything other than
+//     the single `ALREADY_FIXED` outcome
+// and the emitted shell applies the same rule to everything it alone can see
+// (no usable prior SHA, tip identical to the reviewed commit, a file unreadable
+// at either revision, a fingerprint too weak to be evidence).
+
+// A reviewer's finding location, per the reviewer agents' own output format:
+// `**Where:** <file:line or function name>`. Only the file:line form is usable
+// here — the function-name form names no line to check.
+const WHERE_LINE_RE = /^\s*\*{0,2}Where:?\*{0,2}\s*(.+?)\s*$/i;
+const WHERE_LOCATION_RE = /(?:^|[\s(`"'])([A-Za-z0-9][A-Za-z0-9._/-]*):(\d{1,7})(?![0-9])/;
+// The BLOCKING-finding heading, the same shape reviewHasBlockingFinding() reads.
+const HIGH_HEADING_RE = /^\s*###\s*\[\s*HIGH\b/gim;
+// A bound on how much one probe may check. Past it the findings text is not the
+// shape this predicate was built to read, so it declines rather than guesses.
+const CONTINUATION_FIX_MAX_LOCATIONS = 12;
+// THE FINGERPRINT FLOOR, and why it is not cosmetic. The probe's evidence is
+// "the exact text of the reviewed line is no longer anywhere in the file at the
+// tip". For a line like `fi`, `}` or `done` that test is meaningless — such a
+// line is present in almost any version of almost any file, so its ABSENCE
+// would be the only informative answer and its absence is vanishingly unlikely
+// to mean what the probe would read into it. Below this many non-space
+// characters the line is declared too weak to be evidence and the probe returns
+// UNKNOWN, i.e. spawns the worker.
+const CONTINUATION_FIX_MIN_FINGERPRINT = 12;
+
+// continuationFindingLocations(findingsText) — the parsed `{ file, line }` set,
+// or [] meaning "cannot establish". Never partial: an all-or-nothing read, for
+// the fail-closed reason above.
+function continuationFindingLocations(findingsText) {
+  const text = String(findingsText ?? '');
+  if (!text.trim()) return [];
+  const highCount = (text.match(HIGH_HEADING_RE) ?? []).length;
+  const out = [];
+  const seen = new Set();
+  let whereLines = 0;
+  for (const raw of text.split('\n')) {
+    const w = raw.match(WHERE_LINE_RE);
+    if (!w) continue;
+    whereLines += 1;
+    const loc = w[1].match(WHERE_LOCATION_RE);
+    // A `**Where:**` that names no line (a function name, a prose locator)
+    // leaves that finding unverifiable, so the whole set is unverifiable.
+    if (!loc) return [];
+    const file = loc[1];
+    const line = Number(loc[2]);
+    // Reject anything that is not a plain in-tree relative path, and any line
+    // number that is not a positive integer. Both are belt AND suspenders: the
+    // value is interpolated into a `git show <rev>:<path>` argument below, and
+    // the charset the regex already enforces excludes every shell metacharacter
+    // — this rejects the two shapes that charset still admits.
+    if (file.startsWith('/') || file.includes('..') || !Number.isInteger(line) || line < 1) return [];
+    const key = `${file}:${line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ file, line });
+    if (out.length > CONTINUATION_FIX_MAX_LOCATIONS) return [];
+  }
+  if (out.length === 0) return [];
+  // Every HIGH must have contributed a location. A HIGH with no `**Where:**` at
+  // all is exactly the finding this probe would otherwise skip past unchecked.
+  if (whereLines < highCount) return [];
+  return out;
+}
+
+// continuationAlreadyFixedCmd(wt, locations) — ONE machinery call, no worker.
+// Emits exactly one of the three closed outcomes declared in the spine schema.
+function continuationAlreadyFixedCmd(wt, locations) {
+  const emit = (outcome, detail) =>
+    `printf '%s\\n' '{"outcome":"${outcome}","detail":"${detail}"}'`;
+  const probes = locations.map((l) => `probe ${sq(l.file)} ${sq(String(l.line))}`);
+  const matchesJson = JSON.stringify(locations.map((l) => `${l.file}:${l.line}`));
+  return [
+    `cd ${sq(wt)} 2>/dev/null || { ${emit('ALREADY_FIXED_UNKNOWN', 'worktree-unreadable')}; exit 0; }`,
+    `gd="$(git rev-parse --git-dir 2>/dev/null || true)"`,
+    `prior=""`,
+    `if [ -n "$gd" ] && [ -f "$gd/build-review-rounds-sha" ]; then`,
+    `  prior="$( { tr -cd '0-9a-fA-F' < "$gd/build-review-rounds-sha"; } 2>/dev/null )"`,
+    `fi`,
+    // The SAME floor and the SAME two resolution checks reviewDiffCmd applies
+    // to this marker: 7 is git's own minimum abbreviation length, and `tr -cd`
+    // is a FILTER, so a corrupted marker survives it as plausible-looking hex
+    // that only the repo itself can reject.
+    `if [ "${'${#prior}'}" -lt 7 ]; then prior=""; fi`,
+    `if [ -n "$prior" ]; then`,
+    `  if ! git rev-parse --verify --quiet "$prior^{commit}" >/dev/null 2>&1; then`,
+    `    prior=""`,
+    `  elif ! git merge-base --is-ancestor "$prior" HEAD >/dev/null 2>&1; then`,
+    `    prior=""`,
+    `  fi`,
+    `fi`,
+    `if [ -z "$prior" ]; then ${emit('ALREADY_FIXED_UNKNOWN', 'no-usable-prior-reviewed-sha')}; exit 0; fi`,
+    `head_sha="$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)"`,
+    `prior_full="$(git rev-parse --verify --quiet "$prior^{commit}" 2>/dev/null || true)"`,
+    `if [ -z "$head_sha" ]; then ${emit('ALREADY_FIXED_UNKNOWN', 'head-unreadable')}; exit 0; fi`,
+    // The degenerate case, checked explicitly rather than left to fall out of
+    // the per-location test: a tip identical to the reviewed commit carries
+    // NOTHING new, so it cannot carry a fix.
+    `if [ "$head_sha" = "$prior_full" ]; then ${emit('NOT_ALREADY_FIXED', 'tip-unchanged-since-the-reviewed-commit')}; exit 0; fi`,
+    `old_f="$(mktemp 2>/dev/null)" || { ${emit('ALREADY_FIXED_UNKNOWN', 'mktemp-failed')}; exit 0; }`,
+    `new_f="$(mktemp 2>/dev/null)" || { rm -f "$old_f"; ${emit('ALREADY_FIXED_UNKNOWN', 'mktemp-failed')}; exit 0; }`,
+    `verdict=ALREADY_FIXED`,
+    `detail=every-named-finding-line-is-gone-from-the-tip`,
+    `probe() {`,
+    `  f="$1"; n="$2"`,
+    `  if [ "$verdict" != ALREADY_FIXED ]; then return 0; fi`,
+    `  if ! git show "$prior:$f" > "$old_f" 2>/dev/null; then`,
+    `    verdict=ALREADY_FIXED_UNKNOWN; detail="unreadable-at-prior-sha-$f"; return 0`,
+    `  fi`,
+    `  old="$(sed -n "${'${n}'}p" "$old_f")"`,
+    `  old="$(printf '%s' "$old" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"`,
+    `  if [ "${'${#old}'}" -lt ${CONTINUATION_FIX_MIN_FINGERPRINT} ]; then`,
+    `    verdict=ALREADY_FIXED_UNKNOWN; detail="fingerprint-too-weak-$f-$n"; return 0`,
+    `  fi`,
+    `  if ! printf '%s' "$old" | grep -E '[A-Za-z0-9]' >/dev/null 2>&1; then`,
+    `    verdict=ALREADY_FIXED_UNKNOWN; detail="fingerprint-not-alphanumeric-$f-$n"; return 0`,
+    `  fi`,
+    `  if ! git show "HEAD:$f" > "$new_f" 2>/dev/null; then`,
+    `    verdict=ALREADY_FIXED_UNKNOWN; detail="unreadable-at-tip-$f"; return 0`,
+    `  fi`,
+    // `grep -F --` never `-q`: a `-q` here would SIGPIPE nothing (the input is a
+    // file, not a pipe) but the repo lints the flag out at sweep scale rather
+    // than per-site, so the sanctioned form is used everywhere (temperloop#1050).
+    `  if grep -F -- "$old" "$new_f" >/dev/null 2>&1; then`,
+    `    verdict=NOT_ALREADY_FIXED; detail="finding-line-still-present-$f-$n"; return 0`,
+    `  fi`,
+    `  return 0`,
+    `}`,
+    ...probes,
+    `rm -f "$old_f" "$new_f"`,
+    `printf '{"outcome":"%s","detail":"%s","sha":"%s","matches":%s}\\n' "$verdict" "$detail" "$prior_full" ${sq(matchesJson)}`,
+  ].join('\n');
+}
+
+// continuationAlreadyFixed(item, wt, priorVerdict, phaseName) — the predicate the
+// 3c dispatch calls. Returns `{ fixed, reason, locations, sha }`; `fixed` is true
+// ONLY on a positively-established ALREADY_FIXED.
+async function continuationAlreadyFixed(item, wt, priorVerdict, phaseName) {
+  if (!priorVerdict || priorVerdict.kind !== 'review-blocking') {
+    return { fixed: false, reason: 'not-a-review-blocking-continuation', locations: [] };
+  }
+  const locations = continuationFindingLocations(priorVerdict.verdict_section);
+  if (locations.length === 0) {
+    // No machinery call at all on this arm — the cheap read declines first, so
+    // a continuation whose findings name no line costs exactly what it costs
+    // today (one worker spawn, no extra executor).
+    return { fixed: false, reason: 'no-usable-finding-location-in-the-prior-findings', locations: [] };
+  }
+  const out = await runMachinery(continuationAlreadyFixedCmd(wt, locations), {
+    label: `already-fixed:${item.slug}`,
+    slug: item.slug,
+    phase: phaseName,
+  });
+  if (machineryDenied(out)) {
+    return { fixed: false, reason: 'probe-denied', locations };
+  }
+  if (!out || out.outcome !== 'ALREADY_FIXED') {
+    return {
+      fixed: false,
+      reason: out && typeof out.detail === 'string' && out.detail
+        ? `${out.outcome ?? 'no-outcome'}: ${out.detail}`
+        : String((out && out.outcome) ?? 'no-outcome'),
+      locations,
+    };
+  }
+  return {
+    fixed: true,
+    reason: typeof out.detail === 'string' ? out.detail : 'every-named-finding-line-is-gone-from-the-tip',
+    locations,
+    sha: typeof out.sha === 'string' ? out.sha : null,
+  };
+}
+
+// alreadyFixedVerdict(item, probe) — the verdict record the skipped worker would
+// have returned. Shaped exactly like recoveredVerdict() above, and for the same
+// reason: each criterion carries a CRITERION and an EVIDENCE line and NO
+// `passed` boolean, so §3d reads no failure into it and discriminationGaps()
+// reads no unproven pass out of it. The acceptance behind this tree was already
+// self-verified by the round that got the item as far as §3e in the first place
+// (a `review-blocking` escalation happens strictly AFTER 3d passes), and the
+// worker's own `.build-verification.md` is still on disk and still rides the PR
+// via 3f's `--verification-surface-file` — so nothing is lost here, and the
+// summary says so rather than leaving the reviewer to infer it.
+const ALREADY_FIXED_EVIDENCE =
+  'carried forward — verified by the earlier round on this same tree; no worker ran this round ' +
+  '(temperloop#2137, already-fixed continuation close)';
+
+function alreadyFixedVerdict(item, probe) {
+  const criteria = acceptanceList(item);
+  const located = (probe.locations ?? []).map((l) => `\`${l.file}:${l.line}\``).join(', ');
+  const results = (criteria.length ? criteria : ['(no acceptance criteria carried on this plan item)']).map(
+    (c) => ({
+      criterion: typeof c === 'string' ? c : JSON.stringify(c),
+      evidence: ALREADY_FIXED_EVIDENCE,
+    }),
+  );
+  const summary =
+    `**No implementation worker ran on this round (temperloop#2137).** This \`${item.slug}\` round ` +
+    'resumed from a §3e `review-blocking` escalation, and the branch tip ALREADY carried the fix: for ' +
+    `every line the prior round's blocking finding(s) named (${located || 'none recorded'}), the exact ` +
+    `source line as it stood at the prior reviewed commit \`${probe.sha ?? 'unknown'}\` is no longer ` +
+    'present anywhere in that file at the tip. Re-spawning an implementation worker could only have had ' +
+    'it report "no source change", so the spawn was skipped and §3e was re-run on its own. Acceptance ' +
+    'was self-verified by the earlier round on this same tree (a `review-blocking` escalation is raised ' +
+    'only after §3d passes) and that round\'s verification surface is the one attached below; the ' +
+    'per-criterion table is therefore carried forward rather than re-asserted.';
+  return {
+    status: 'done',
+    alreadyFixed: true,
+    summary,
+    acceptance_results: results,
   };
 }
 
@@ -6231,9 +6491,37 @@ async function driveItemBuildPhase(item, arm, box) {
   let recovery = null; // temperloop#939 — set only on a lost-return recovery
   // temperloop#2065 — the main worker's cost, accumulated across BOTH this — see build-level.design-notes-5.md#temperloop-2065-the-main-worker-s-cost-accumulated-across-bo
   let mainCost = { wallClockMs: null, tokensIn: null, tokensOut: null };
-  let w = await callWorker(item, wt, verdictSection, `worker:${item.slug}`, enterStage(STAGE_BUILD));
-  mainCost = mergeWorkerCost(mainCost, w);
-  let verdict = w.verdict;
+  // temperloop#2137 — the ALREADY-FIXED CONTINUATION CLOSE, and it sits HERE,
+  // before the spawn, because that is the only place the spawn can still be
+  // avoided. Runs at most one machinery call, and only on a `review-blocking`
+  // continuation whose findings name a checkable `<path>:<line>`; every other
+  // path (a fresh item, any other escalation kind, findings with no located
+  // line) short-circuits in JS with no extra call at all. See
+  // continuationAlreadyFixed() for the fail-closed contract — `fixed` is true
+  // ONLY on a positively-established ALREADY_FIXED, so every uncertainty spawns
+  // the worker exactly as before.
+  const alreadyFixed = await continuationAlreadyFixed(
+    item,
+    wt,
+    isContinuation ? input.verdicts?.[item.slug] : null,
+    enterStage(STAGE_BUILD),
+  );
+  if (alreadyFixed.fixed) {
+    log(
+      `[${item.slug}] §3c worker spawn SKIPPED (temperloop#2137) — this \`review-blocking\` ` +
+        `continuation's branch tip already carries the fix: ${alreadyFixed.reason} ` +
+        `(prior reviewed SHA ${alreadyFixed.sha ?? 'unknown'}; checked ` +
+        `${alreadyFixed.locations.map((l) => `${l.file}:${l.line}`).join(', ')}). ` +
+        'Re-running §3e only; the PR body records that no worker ran and why.',
+    );
+  }
+  let w = alreadyFixed.fixed
+    ? null
+    : await callWorker(item, wt, verdictSection, `worker:${item.slug}`, enterStage(STAGE_BUILD));
+  if (w) mainCost = mergeWorkerCost(mainCost, w);
+  // alreadyFixedVerdict() never returns null, so the whole lost-return recovery
+  // ladder below is reachable ONLY on the spawning arm — `w` is non-null there.
+  let verdict = alreadyFixed.fixed ? alreadyFixedVerdict(item, alreadyFixed) : w.verdict;
   if (verdict == null) {
     // temperloop#1819 — classify a session-quota death FIRST, before the pro — see build-level.design-notes-5.md#temperloop-1819-classify-a-session-quota-death-first-be
     if (await workerQuotaDeath(w)) {
