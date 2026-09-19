@@ -1015,3 +1015,131 @@ added by a branch not yet on main is invisible to that derivation.
  continuation — the worktree already exists and its base was gated at first
  create; re-gating would need SHAs the continuation input does not carry.
 ```
+
+## Every loop in this file that can RE-ATTEMPT something, with its hard c
+<a id="every-loop-in-this-file-that-can-re-attempt-something-with-i"></a>
+
+```text
+ Every loop in this file that can RE-ATTEMPT something, with its hard cap and
+ its transient-vs-deterministic disposition. Repeating a deterministically-
+ failing operation cannot change its outcome, so a loop either classifies
+ before retrying or states why classification does not apply. The audit is
+ kept HERE, beside the budgets, so a new loop cannot be added without a
+ reviewer seeing the shape it has to satisfy.
+
+   1. ciPollLoop slice loop — CAP: maxSlices = ceil(CI_POLL_TOTAL_SECS /
+      CI_POLL_SLICE_SECS). NOT A RETRY: each slice waits on external state
+      (pending check-runs) that genuinely changes between polls, and every
+      terminal verdict (CI_GREEN / CI_FAILED / NO_CI) exits the loop on the
+      spot. The deterministic cases it MUST not spin on are already short-
+      circuited by name, not by budget: CONFLICTING/DIRTY escalates
+      merge-conflict immediately (#543), a NO_CI SHA resolves through
+      ci-poll.sh's bounded grace window (temperloop#605), and any ERROR
+      escalates rather than re-polls. No classification step applies.
+   2. CI_FAILED worker re-spawn — CAP: CI_FAIL_RETRY_BUDGET (below), past
+      which the item escalates `ci-failed` for a human. NOT A RETRY EITHER, in
+      the sense that matters here: the re-attempt does not re-issue the failed
+      operation, it spawns a worker to FIX the failure and pushes a NEW SHA, so
+      the input to the next CI run differs by construction. That is what makes
+      a classify-before-retry step inapplicable — and the budget is already at
+      its floor of one, so a deterministic repeat cannot cost a second one.
+   3. null-verdict main-worker re-spawn (driveItem, ~1145) — CAP: exactly one,
+      and CLASSIFIED BEFORE IT FIRES on both axes: the recover-probe runs FIRST
+      and adopts any work that already landed (so a lost return is never re-
+      built), and the retry prompt is deliberately DIFFERENT from the first
+      (FOREGROUND_CURE appended) because a byte-identical retry re-stalls
+      identically. The read-only spike worker's null escalates with NO retry.
+   4. pr.sh `EXISTS` adoption (3f) — not a loop: a create-retry whose first
+      attempt in fact succeeded is ADOPTED as PR_OPENED rather than re-issued.
+   5. STEP_TIMEOUT disposal (temperloop#1071) — NOT A RETRY AT ALL, and named
+      here so a future edit cannot quietly make it one. A machinery step killed
+      by the workflow liveness ceiling is CLASSIFIED FIRST (pr.sh recover-probe,
+      the same ladder rule 3 uses) and then either ADOPTED (rule 4's shape: an
+      already-opened PR is taken, never re-opened) or ESCALATED. There is no arm
+      that re-issues the bounded step — push and pr-create are not idempotent,
+      and the ceiling firing is precisely the case where you cannot know whether
+      the first attempt landed.
+
+ The two loops this file DELEGATES to carry their own caps + classification
+ and are documented in their own scripts, not restated here: ci-poll.sh's
+ gh_retry (CI_POLL_API_MAX_ATTEMPTS / _RETRY_BACKOFF / _DETERMINISTIC_PATTERN)
+ and quality-gates.sh's per-gate retry via workflows/scripts/lib/gate-retry.sh
+ (GATE_MAX_ATTEMPTS / GATE_RETRY_BACKOFF / GATE_DETERMINISTIC_PATTERN). The
+ 3e.5 acceptance gate itself does NOT retry: a GATE_FAIL escalates
+ `acceptance-gate-failed` on the first failure.
+```
+
+## THE WASTE THIS CLOSES. A `review-blocking` escalation loops the item b
+<a id="the-waste-this-closes-a-review-blocking-escalation-loops-the"></a>
+
+```text
+ THE WASTE THIS CLOSES. A `review-blocking` escalation loops the item back
+ through 3c → 3e. Sometimes the branch ALREADY carries the fix by the time the
+ continuation runs, so the re-spawned worker reads the finding, reads the code,
+ finds nothing to do, and returns "no source change" — a full implementation
+ agent spent to learn that. Four PRs in the 2026-09-18 dual-build epic
+ (#2096, #2100, #2101, #2102) had `-r2`/`-r3` branches that changed nothing at
+ all. temperloop#1934 closed the WORKER side of this for the join-key-registry
+ case (the worker recognising it has nothing to do); this is the ORCHESTRATOR
+ side — not spawning it in the first place.
+
+ WHAT IT CONSUMES, AND WHY THERE IS EXACTLY ONE SOURCE. The prior reviewed SHA
+ is the marker `reviewDiffCmd` writes beside `build-review-rounds` in the
+ worktree's own git dir (temperloop#2127, merged in level 0 — see that
+ function's comment for the durability contract and the two resolution checks).
+ This probe re-reads THAT marker with THAT file's own validation, never a
+ second SHA source: a parallel notion of "the commit the last round reviewed"
+ would drift against the one the continuation reviewer is already being handed.
+
+ FAIL CLOSED — THE ONLY DIRECTION THAT MATTERS. This predicate decides whether
+ to skip real work. A FALSE POSITIVE (claiming the fix is present when it is
+ not) silently drops the fix round and lets a branch that still carries a HIGH
+ reach the merge gate LOOKING reviewed, which is strictly worse than the waste
+ it is trying to avoid. A false NEGATIVE costs one worker spawn — exactly
+ today's behaviour. So every step below that cannot POSITIVELY establish "this
+ finding's line is gone from the tip" returns not-fixed:
+   - the escalation is not `review-blocking`, or carries no findings text
+   - no `**Where:** <path>:<line>` location parses out of the findings
+   - a `**Where:**` line is present but does NOT yield a usable path:line
+     (a function name, a prose locator like `build.md - Step 3`): one
+     unlocatable finding means the SET cannot be established
+   - fewer located findings than `### [HIGH` headings
+   - the machinery call is denied, times out, or returns anything other than
+     the single `ALREADY_FIXED` outcome
+ and the emitted shell applies the same rule to everything it alone can see
+ (no usable prior SHA, tip identical to the reviewed commit, a file unreadable
+ at either revision, a fingerprint too weak to be evidence).
+```
+
+## Drive every active item through 3a–3h. The items in one level are
+<a id="drive-every-active-item-through-3a-3h-the-items-in-one-level"></a>
+
+```text
+ Drive every active item through 3a–3h. The items in one level are
+ independent by construction (no merge edge between them), so we fan them
+ out with parallel() — the substrate caps concurrency (~cores-2). This
+ matches build.md's "express each item's pipeline as a parallel() over
+ the level's items" (within-level execution). parallel() returns the array
+ of per-item results in item order; a blocked/failed item escalates rather
+ than halting its siblings (the orchestrator batches escalations at the
+ boundary). On a continuation run only the named slugs enter parallel(); the
+ rest are already parked and are left untouched.
+ A thrown exception in driveItem must NOT vanish: parallel() drops a rejected
+ thunk to null, which would leave the item in NEITHER parked NOR escalations —
+ silently lost, violating the no-silent-stall invariant. Convert any throw into
+ a generic `worker-error` escalation so it always surfaces. (#437: a real run
+ hit item.acceptance.map on a string and the item was silently dropped.)
+ temperloop#2020: `.then(preserveOnEscalation)` is applied to the SETTLED
+ result — after the #437/#1819 catch above, so a THROWN item's synthesized
+ escalation gets the same work-preservation push a returned one does. This
+ is the single choke point for "an escalation is about to leave this
+ driver"; see preserveOnEscalation's own comment for why it lives here and
+ not at the ~30 individual escalate() call sites.
+
+ temperloop#2080 — the DUAL-BUILD fan-out is an alternative to this one, not
+ a flag inside it. A `dualBuild` input restructures the level into build →
+ barrier → judge → record (driveLevelDualBuild), which is a different
+ control flow, not a different parameter; keeping the two apart is what
+ makes "no dualBuild input → this exact fan-out, unchanged" true by reading
+ the code rather than by tracing a branch through it.
+```

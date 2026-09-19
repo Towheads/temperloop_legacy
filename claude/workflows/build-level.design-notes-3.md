@@ -994,3 +994,156 @@ added by a branch not yet on main is invisible to that derivation.
  run, carrying no findings, which is the same reads-like-a-clean-pass
  failure this whole item exists to end. Fail loudly instead.
 ```
+
+## Run the project's static gate SSOT against the worker's work. ABSENT (
+<a id="run-the-project-s-static-gate-ssot-against-the-worker-s-work"></a>
+
+```text
+ Run the project's static gate SSOT against the worker's work. ABSENT (the
+ script doesn't exist, e.g. foundation itself) → skip. FAIL → escalate
+ (do NOT push a known-red branch). The executor synthesizes GATE_PASS /
+ GATE_FAIL / GATE_ABSENT so the .mjs branches on a closed outcome.
+ temperloop#1241: SCRUB the pipeline's own build.config.sh settings from the
+ gate's environment before running the suite. Under pipeline-drive the session
+ exports ~40 build.config.sh settings; the config-precedence tests the gate runs
+ (test_config.sh / test_stranger_config.sh / test_pipeline_cron.sh) assert layer
+ precedence (env > machine-conf > repo-local > tracked-default), so an
+ inherited setting wins the env layer and false-FAILs a change CI's `checks`
+ passes green. `build-config-settings.sh` prints the (SSOT-derived) setting names;
+ unsetting them makes the gate hermetic — tracked defaults, matching CI.
+ temperloop#2142: A FAILING SCRUB MUST NEVER STOP THE GATE FROM RUNNING. The
+ scrub is best-effort environment hygiene, so its failure is not evidence the
+ branch under test is broken — yet, chained under `&&`, its exit status decides
+ whether quality-gates.sh runs at all. When it short-circuits, no
+ QUALITY_GATES_FAILED=/QUALITY_GATES_RESUME_AT= trailer is printed, `${__f:-1}`
+ floors to 1, and §3e.5 escalates `acceptance-gate-failed` — "this branch is
+ broken" — on a tree whose gates never executed.
+
+ The INSTANCE that bit: a missing/older helper prints NOTHING, and a bare
+ `unset $(…)` resolving to zero arguments is a silent no-op in bash but rc=1 in
+ zsh ("not enough arguments") — and the executor's Bash tool is zsh on macOS,
+ the same dialect premise the PIPESTATUS note relies on (temperloop#801). That
+ is the STRANGER case: every consuming repo on an older vendored toolkit.
+
+ `__qg_noop` alone closes only that one path, and a fix scoped to one instance
+ is a smell (kernel § Fix the real problem, not the symptom). The CLASS is ANY
+ failing `unset`, and it has three members — MEASURED, not reasoned about,
+ against bash 5 and zsh 5.9:
+   zero arguments        bash: no-op, rc=0      zsh: rc=1, CATCHABLE
+   invalid parameter name  bash: rc=1           zsh: FATAL — kills the shell
+   readonly parameter      bash: rc=1           zsh: FATAL — kills the shell
+ The zsh "FATAL" rows are the finding that shaped the form below: a fatal
+ parameter error is NOT an exit status, so `||`, `;`, a brace group and a
+ function wrapper are all powerless against it (all four measured). Only a
+ SUBSHELL contains it. So the scrub is three layers, each closing one row:
+   1. `grep -E '^[A-Za-z_][A-Za-z0-9_]*$'` drops anything that is not a shell
+      NAME before `unset` ever sees it — closes the invalid-name row at source,
+      including the day this helper's name parser is loosened.
+   2. A PROBE in a subshell: if unsetting this name set would kill the shell
+      (the readonly row), it kills the throwaway subshell instead and the real
+      scrub is skipped. Hygiene is forfeited for that run; the gate still runs,
+      which is the correct trade for a best-effort scrub.
+   3. `{ … || :; }` swallows whatever status survives, in a brace group rather
+      than a `;` terminator so `cd`'s OWN rc stays in the chain — a failed `cd`
+      must still stop the gate from running against the wrong tree.
+ `unset -v` restricts the scrub to VARIABLES so bash cannot fall through to
+ unsetting a same-named function; `-v` is accepted by bash, zsh and sh.
+ `__qg_noop` stays: it costs nothing and is what the K2142 guard anchors on.
+ The helper runs twice (probe + real) because the probe's effects cannot escape
+ its subshell; it is one short bash fork against a gate slice measured in
+ minutes. Sibling scrub sites (workflows/scripts/count-prose.sh,
+ workflows/scripts/build/tests/test_build_config_settings.sh) carry the same
+ shape. The K2142 guard scans THIS FILE only, so the repo-wide static lint that
+ would enforce the rule everywhere is temperloop#2157, not shipped here.
+```
+
+## RELAY ONLY THE DATA ROWS (temperloop#1982 round 3). The field crosses
+<a id="relay-only-the-data-rows-temperloop-1982-round-3-the-field-c"></a>
+
+```text
+ RELAY ONLY THE DATA ROWS (temperloop#1982 round 3). The field crosses a
+ machinery-executor agent, which is specified to return the command's JSON
+ line verbatim and has instead been observed omitting this one field
+ outright, and once replacing it with an English sentence describing the
+ table ("The reviewer-routing.tsv file contains 11 data rows routing files
+ to review subagents…"). Rounds 1 and 2 added receiving-end checks — a row
+ count, then a position-weighted checksum — which detect the substitution
+ but cannot prevent it: no check on this side stops a model on the other
+ side from paraphrasing. What CAN be reduced is the bait. The raw file is
+ 3,834 bytes of which 699 are data (11 rows); the other 82% is comment
+ prose, i.e. the executor was being handed ~4KB of mostly-English text and
+ asked to echo it. Sending `rowFilterAwk`'s output instead ships only the
+ rows the routing decision actually reads.
+
+ Invariant-neutral by construction, which is why this needs no JS or test
+ change: BOTH receiving-end readers already apply this same filter before
+ they compute anything — parseTsvRows() drops blank/`#` lines, and
+ tsvChecksum() canonicalises with the identical trimmed-emptiness rule —
+ so filtering here is idempotent and every gap check yields the same value
+ it did on the unfiltered text. The filter itself is `rowFilterAwk`, the
+ SAME expression the checksum below already uses, so this adds no second
+ implementation of the row rule to drift against.
+
+ MITIGATION, NOT A PROOF: a model can still paraphrase 699 bytes. The
+ structural fix — keeping the table out of the relay entirely, or emitting
+ parsed rows the executor has no prose reading of — stayed open on #1982
+ and is closed HERE (temperloop#2020, second half): the field is no longer
+ a `tsv` SCALAR holding a multi-line table, it is `tsv_lines`, a JSON
+ ARRAY OF ROW STRINGS built by the SAME
+ `jq -R -s -c 'split("\n") | map(select(length>0))'` idiom `files_json`
+ above already uses. The shape is chosen on evidence, not taste: across
+ every observed mangling (#1976 wf_cbc556f5-7be; #1982's three shapes;
+ #2020's own foundation#1869 reproduction, where BOTH retry agents
+ dropped it identically) `files` — a jq array of strings produced by this
+ exact idiom — arrived INTACT in the same JSON line whose `tsv` blob was
+ dropped, paraphrased, or double-encoded. An array of short opaque row
+ strings offers no English reading to paraphrase into and no "quote the
+ table" framing to re-encode; a ~700-byte tab-delimited blob offers both.
+
+ Invariant-neutral for the SECOND time by construction: the array's rows
+ joined on `\n` are byte-identical to the string this used to emit (see
+ reviewDiffTsvText), so `tsv_rows`, `tsv_checksum`, parseTsvRows() and
+ tsvChecksum() all yield exactly the values they did before — the
+ #1976/#1982 gap checks are untouched DETECTORS, not weakened ones.
+ `tsv` itself is no longer emitted; the reader still ACCEPTS it
+ (reviewDiffTsvText) so a relay or caller that yields the legacy scalar
+ keeps routing rather than degrading.
+```
+
+## See the STEP_CEILING_SECS block above for WHY the bound lives in the e
+<a id="see-the-step-ceiling-secs-block-above-for-why-the-bound-live"></a>
+
+```text
+ See the STEP_CEILING_SECS block above for WHY the bound lives in the emitted
+ shell rather than in this file's control flow (no Date.now(), no timer, and
+ the layer that failed to fire IS the tool-timeout layer). These three helpers
+ are the HOW.
+
+ stepBoundPreamble(slowSecs) — the prologue every bounded command carries: the
+ two budgets as plain shell variables, then `__lb`, which runs ONE step body
+ under them. `__lb` is the dependency-free fallback tier of
+ `workflows/scripts/lib/portable-timeout.sh`, reproduced here (that library's
+ preferred `timeout`/`gtimeout` backends `exec` a BINARY and cannot run a shell
+ FUNCTION, which is what a step body is). Two details are load-bearing and both
+ come straight from that file's header:
+   • the watchdog subshell is redirected AT THE SUBSHELL BOUNDARY
+     (`) </dev/null >/dev/null 2>&1 &`). Without it, its `sleep` grandchild
+     inherits the caller's `$( … )` pipe write-end and every FAST, successful
+     step stalls for the full ceiling waiting on EOF (foundation #861).
+   • the watchdog is killed AND reaped on the fast path, so a completed step
+     leaves nothing behind.
+ The kill is best-effort DEEP: direct children first (`pkill -P`, so the helper
+ script dies before the subshell that owns it), then the subshell itself. A
+ deeper grandchild (a `gh` inside a `pr.sh`) can still outlive the bound — which
+ is exactly why a timed-out step is disposed through the recover-probe rather
+ than blind-retried: the workflow stops WAITING on it without ever assuming it
+ did nothing.
+
+ The step body's own stdout is untouched — it flows to wherever the caller put
+ it (a `$( … )` capture in a batch, the script's stdout for a solo call), so the
+ machinery's "one JSON line per step" contract is preserved byte for byte on
+ every healthy run. `__lb` only ADDS a line, and only in the two abnormal cases:
+ STEP_TIMEOUT (replacing a result the kill destroyed) and STEP_SLOW (an advisory
+ riding alongside a real result — hence `slowSecs` is 0 on the SOLO path, whose
+ schema admits exactly one object).
+```

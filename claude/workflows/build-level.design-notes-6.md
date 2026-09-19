@@ -1216,4 +1216,3 @@ added by a branch not yet on main is invisible to that derivation.
  which list an ordinal indexed. Recording it makes the escalation
  self-describing AND gives the in-flight probe its oracle. Omitted, never
  empty-stringed, when a slice reported none.
-```
