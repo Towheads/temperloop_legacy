@@ -1049,13 +1049,23 @@ grep -q 'MERGE BLOCKED (arms-trailer-unstamped)' <<<"$out" \
   || fail "#2083 r3: the resumed gate roster does not name the hold — a blocked item with a green, OPEN PR reads identically to a merge-eligible one (got: $out)"
 grep -q 'held out of the merge set' <<<"$out" \
   || fail "#2083 r3: the resumed gate roster does not say the item is held OUT of the merge set (got: $out)"
-grep -E '^\[m\][[:space:]]+dual' <<<"$out" | grep -q 'in the merge set' \
-  && fail "#2083 r3: the resumed gate roster still reports the held item IN the merge set (got: $out)"
-# The merge COUNT is what a consenting operator reads. `plain` is [~], so a
-# correctly-excluded `dual` leaves ZERO items in the merge set.
-grep -qE 'merge set: 0|0 in the merge set|merging 0' <<<"$out" \
-  || grep -q 'MERGE BLOCKED' <<<"$out" \
-  || fail "#2083 r3: could not confirm the held item left the merge count (got: $out)"
+# Capture the held row FIRST. Asserting "no [m] row says 'in the merge set'"
+# straight off the pipeline would pass just as happily when there is NO [m] row
+# at all — a roster that dropped the item entirely would read as success.
+mb_row="$(grep -E '^\[m\][[:space:]]+dual' <<<"$out" || true)"
+[ -n "$mb_row" ] \
+  || fail "#2083 r3: the resumed gate roster has no [m] row for the held item — it was dropped from the roster rather than held out of the merge set (got: $out)"
+case "$mb_row" in
+  *'in the merge set'*)
+    fail "#2083 r3: the resumed gate roster still reports the held item IN the merge set (got: $mb_row)" ;;
+esac
+# The merge COUNT is what a consenting operator actually reads at the gate.
+# `plain` is [~] and `dual` is held, so BOTH sit outside and the count is ZERO.
+# Asserted on the rendered header ALONE, and on the exact rendered field: an
+# `|| grep 'MERGE BLOCKED'` fallback would make this vacuous, since assertion 4a
+# above has already proved that string present — the check could never go red.
+grep -F '2 items · 0 in the merge set · 2 outside it' <<<"$out" >/dev/null \
+  || fail "#2083 r3: the held item did not leave the merge COUNT — the gate header still offers it for merge (got: $out)"
 
 # 5. CLEARING is EXPLICIT — the one way out is landing the trailer.
 out="$(PATH="$TMP/bin:$PATH" PLAN_API_KEY_FILE="$TMP/keydir/data.json" \
