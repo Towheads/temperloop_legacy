@@ -23,6 +23,22 @@
 #          ... --labels --unattended    implies --apply, AND records the
 #                                       auto-taken apply to the pending-
 #                                       decisions surface (ask-at-checkin).
+#   reconcile.sh [--board N] --claims   DEAD-SESSION CLAIM STAMPS — an
+#                                       In-Progress item whose
+#                                       `fnd:host/session:*` stamp names a
+#                                       provably-dead session on THIS host.
+#                                       Dry-run report (zero writes) by
+#                                       default; every candidate carries its
+#                                       staleness AGE.
+#          ... --claims --apply         also strips the dead stamp — and ONLY
+#                                       the stamp. `fnd:status:*` is left
+#                                       byte-identical, the issue is never
+#                                       closed, the Status is never moved. A
+#                                       candidate with an OPEN PR is reported,
+#                                       never stripped (claim held until Done).
+#          ... --claims --unattended    implies --apply, AND records the
+#                                       auto-taken apply to the pending-
+#                                       decisions surface (ask-at-checkin).
 #
 # ─── Lens 1: marker drift (default) ──────────────────────────────────────────
 # Background. scripts/claim.sh stamps BOTH the board (Status=In Progress +
@@ -281,6 +297,99 @@
 # `ks_append` — best-effort: a missing/unavailable knowledge store degrades to
 # a stderr notice and never fails the sweep itself.
 #
+# ─── Lens 4: dead-session claim stamps (--claims) — temperloop#2069 ─────
+# Lens 2 class (d) DETECTS a stale same-host claim and is deliberately
+# report-only. That ratified default is about RELEASING a claim — moving the
+# item back to Ready — whose wrongful application costs another session its
+# work. It is unchanged, and this lens does not override it.
+#
+# This lens applies a STRICTLY SMALLER action the report-only ratification
+# never considered: it clears the OWNER STAMP and nothing else.
+#
+#   (n) dead-session claim stamp — an item that is In Progress whose
+#       `fnd:host/session:<host>:<sess8>` stamp names a session on THIS host
+#       proved dead (its Claude transcript is absent, or untouched beyond
+#       RECONCILE_STALE_AFTER_SECS). --apply removes ONLY that one label. The
+#       `fnd:status:*` label is left byte-identical, the issue is never
+#       closed, and the Status is never moved to Ready.
+#
+# Why this clears the auto-apply bar a release does not:
+#   * It asserts NOTHING about the work. In Progress survives — which is the
+#     CORRECT status for a genuinely unfinished epic whose driver simply died.
+#   * It restores CLAIMABILITY, which is the actual harm: claim.sh refuses a
+#     foreign-owned claim, so a dead stamp makes a live epic unclaimable and
+#     makes its open sub-issues read as someone else's in-flight work.
+#   * It is recoverable by ONE claim.sh — the same bar Lens 2's terminal→Done
+#     move and Lens 3's deletes/strips already clear.
+#   * The report-only loop demonstrably does not converge: two kernel epics
+#     (temperloop#1938, temperloop#1910) were filed at 2 days stale and were
+#     still standing at FOUR days — 4x the cutoff — when this lens was
+#     decided. A detector whose disposition never fires has no effect.
+# The full fork, and the alternatives rejected with it (converge via
+# /check-in; report-only plus age; auto-release to Ready), are recorded in the
+# knowledge store at `Decisions/temperloop - dead-session claim stamps are
+# auto-cleared, status untouched`.
+#
+# Four boundaries, deliberate and NOT negotiable:
+#
+#   * SAME HOST ONLY. A FOREIGN-host stamp is NEVER stripped — that session's
+#     liveness cannot be checked from this machine at all, so there is no
+#     proof to act on. Foreign claims get their own report-only bucket here,
+#     exactly as they do in Lens 2.
+#
+#   * A LIVE same-host session is NEVER stripped. Liveness is the transcript
+#     mtime, so the draining session's own held claims self-exclude for free
+#     (their mtime is "now") — the same property Lens 2's class (d) relies on.
+#
+#   * STAMP ONLY. This lens issues exactly ONE kind of write: a single
+#     `issue edit --remove-label <the stamp>` per candidate. It never closes
+#     an issue, never writes a Status, and never reads or touches any label
+#     outside the `fnd:host/session:` prefix.
+#
+#   * NO OPEN PR (temperloop#2069 round 2). A candidate whose issue is
+#     referenced by an OPEN PR is REPORTED in its own bucket, never stripped.
+#     An item parked `[m]` awaiting the merge gate has DELIVERED work, and its
+#     claim is one `claude/CLAUDE.md` § Task workflow → "Claim held until
+#     Done" (K#275) declares SANCTIONED rather than drift. Stripping it would
+#     also be SILENT: `board_claim_contended()` opens
+#     `[ -n "$existing" ] || return 1`, so with the stamp gone contention
+#     reports "not contended" and the next claim overwrites the owner
+#     unconditionally, with no warning anywhere.
+#
+#     This NARROWS the operator's auto-clear decision; it does NOT reverse it.
+#     A dead session's stamp on an item with NO open PR still auto-clears —
+#     the genuinely-dead-and-unfinished case the decision was about, which
+#     still covers both motivating epics (temperloop#1938, temperloop#1910 are
+#     parents; the PRs belong to their members, not to them).
+#
+#     The open-PR read is a FAILURE PATH, not a happy path. If it errors, or
+#     its result cannot be established at all, EVERY candidate is treated as
+#     NOT strippable and reported. An unknown PR state is never the permissive
+#     branch. The read routes through board.sh's `_board_gh` like every other
+#     board read here, so it is cached, counted, and test-stubbable, and it
+#     costs ONE flat repo-wide `pr list` for the whole sweep (not one per
+#     candidate) — and it is skipped entirely when the scan found no candidate.
+#
+# Each strip is preceded by an IMMEDIATE re-read of that one issue (a fresh
+# single-issue `api` call, never the scan's snapshot) that requires the issue
+# to be still OPEN, still carrying that EXACT stamp label, and still carrying
+# the In-Progress status label — so a re-claim, a park, a status write, or a
+# close landing in the scan→apply gap is never destroyed. It routes through
+# the SAME `_label_reconcile_strip_rows` implementation Lens 3's three strip
+# classes use, so there is exactly one label-stripping code path. The
+# session-liveness proof is re-taken from the filesystem at apply time too.
+# A second run reports zero candidates (idempotent): the stamp it removed is
+# gone, so the item no longer carries an owner stamp at all.
+#
+# The report carries each candidate's staleness AGE on BOTH paths (the report
+# section always prints, before any write), so a 4-day-dead stamp reads
+# differently from one that has only just crossed the cutoff.
+#
+# --unattended additionally (a) implies --apply and (b) records the auto-taken
+# apply to the pending-decisions surface (`claude/CLAUDE.md` § Unattended
+# pending-decisions surface) — best-effort, exactly as Lens 3 does, through
+# the shared `_reconcile_pending_decisions_doc` seam.
+#
 # Usage:
 #   scripts/reconcile.sh                       # marker drift report; exits 0
 #   scripts/reconcile.sh --fix                 # + clear EVERY window's marker
@@ -290,6 +399,9 @@
 #   scripts/reconcile.sh --board 7 --labels    # label hygiene report; exits 0
 #   scripts/reconcile.sh --board 7 --labels --apply         # + apply
 #   scripts/reconcile.sh --board 7 --labels --unattended    # apply + ledger
+#   scripts/reconcile.sh --board 7 --claims    # dead-session claim-stamp report
+#   scripts/reconcile.sh --board 7 --claims --apply         # + strip the stamps
+#   scripts/reconcile.sh --board 7 --claims --unattended    # apply + ledger
 #
 # Test seams (overridable AFTER sourcing, mirroring lib/claim_marker.sh and
 # lib/board.sh): board reads/writes route through board.sh's `_board_gh`; tmux
@@ -364,6 +476,13 @@ LABELS_APPLY=0
 # auto-taken apply to the pending-decisions surface. Set by the execute-guard
 # or by a sourcing test before it calls label_reconcile_main.
 LABELS_UNATTENDED=0
+# --claims --apply: perform the dead-session claim-stamp strips (default 0 =
+# report only, zero writes). --claims --unattended forces this to 1 (§ Lens 4).
+CLAIMS_APPLY=0
+# --claims --unattended: apply (forces CLAIMS_APPLY=1) AND record the
+# auto-taken apply to the pending-decisions surface. Set by the execute-guard
+# or by a sourcing test before it calls claims_reconcile_main.
+CLAIMS_UNATTENDED=0
 # Page size for the label-list / closed-issues bulk reads (§ Lens 3). A repo
 # with more than this many `fnd:` labels or closed issues would under-read;
 # label_reconcile_main warns when a list hits the cap (no silent cap).
@@ -396,13 +515,13 @@ _reconcile_tmux() { tmux "$@"; }
 # zero filesystem dependence (mirrors _reconcile_tmux). Returns 0 (live) / 1 (dead).
 # Self-exclusion falls out for free: the draining session's own transcript mtime
 # is "now", so its own claims are never flagged.
-_reconcile_session_live() {
-  local sess="$1" newest now
-  [ -n "$sess" ] || return 1
-  # Newest matching transcript's mtime (epoch), or empty if none. Contained in a
+_reconcile_session_mtime() {
+  local sess="$1"
+  [ -n "$sess" ] || { printf '0'; return 0; }
+  # Newest matching transcript's mtime (epoch), or 0 if none. Contained in a
   # subshell so `nullglob` (no-match → empty, not the literal pattern) and the
   # glob loop never leak shell state. Portable mtime: GNU `stat -c`, BSD `stat -f`.
-  newest="$(
+  (
     shopt -s nullglob
     dir="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"; max=0
     for f in "$dir"/*/"$sess"*.jsonl; do
@@ -410,7 +529,17 @@ _reconcile_session_live() {
       [ -n "$mt" ] && [ "$mt" -gt "$max" ] && max="$mt"
     done
     printf '%s' "$max"
-  )"
+  )
+}
+
+# The BOOLEAN projection of the seam above, kept as its own function because
+# Lens 1/2 (and their tests) only ever ask live-or-dead. Lens 4 needs the AGE
+# as well, which is why the mtime read is the primitive and this is derived
+# from it — one transcript scan, two questions.
+_reconcile_session_live() {
+  local sess="$1" newest now
+  [ -n "$sess" ] || return 1
+  newest="$(_reconcile_session_mtime "$sess")"
   [ "${newest:-0}" -gt 0 ] || return 1            # no transcript → dead
   now="$(_reconcile_now)"
   [ "$((now - newest))" -le "$RECONCILE_STALE_AFTER_SECS" ]
@@ -434,6 +563,21 @@ _reconcile_epoch_of() {
   TZ=UTC date -d "$iso" +%s 2>/dev/null && return 0
   TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$iso" +%s 2>/dev/null && return 0
   return 0
+}
+
+# Render an age in seconds as a compact two-unit human string ("4d 2h",
+# "3h 5m", "40m") for Lens 4's claim-age column (temperloop#2069). A report a
+# human reads to decide whether a 4-day-dead stamp is worth acting on needs
+# the magnitude, not the second — so two units is the right resolution.
+# A negative or unparseable input floors to 0 rather than printing nonsense.
+_reconcile_age_human() {
+  local s="${1:-0}" d h m
+  case "$s" in (*[!0-9]*|'') s=0 ;; esac
+  d=$(( s / 86400 )); h=$(( (s % 86400) / 3600 )); m=$(( (s % 3600) / 60 ))
+  if [ "$d" -gt 0 ]; then printf '%dd %dh' "$d" "$h"
+  elif [ "$h" -gt 0 ]; then printf '%dh %dm' "$h" "$m"
+  else printf '%dm' "$m"
+  fi
 }
 
 # Emit "<window_id>\t<@claimed_issue>" for every live window that HAS a marker
@@ -1058,34 +1202,60 @@ status_reconcile_main() {
 # preferring the new path when both do, and create at the legacy path when
 # neither exists yet.
 #   _label_reconcile_append_pending_decision <board#> <repo> <deleted> <stripped> [<backfilled>] [<cleared>] [<parked>]
-_label_reconcile_append_pending_decision() {
-  local board="$1" repo="$2" deleted="$3" stripped="$4" backfilled="${5:-0}" cleared="${6:-0}" parked="${7:-0}"
-  local ks_lib doc new_doc legacy_doc ts host decision_extra taken_extra
+# Source the SCRIPT-plane knowledge_store lib and resolve the pending-decisions
+# append target. Shared by Lens 3's label-hygiene entry and Lens 4's
+# dead-session claim-stamp entry (temperloop#2069) so the store plumbing, the
+# degradation contract, and the append-target resolution rule exist exactly
+# once. Implements the same rule named by claude/commands/check-in.md's "Path
+# fallback convention" section: pin the append to whichever of the new
+# (`Pipeline/…`) / legacy (`Context/pipeline - …`) paths already exists,
+# preferring the new path when both do, and create at the legacy path when
+# neither exists yet.
+#
+# Publishes the resolved path in $_RECONCILE_PENDING_DOC rather than echoing
+# it: `source` inside a command substitution would define ks_append only in
+# that subshell, leaving the caller unable to append at all. Returns 1 (after
+# a one-line stderr notice naming <what>) when the store is unavailable, so
+# every caller degrades to "not recorded" and NEVER fails its sweep.
+#   _reconcile_pending_decisions_doc <what>
+_RECONCILE_PENDING_DOC=""
+_reconcile_pending_decisions_doc() {
+  local what="$1" ks_lib new_doc legacy_doc
+  _RECONCILE_PENDING_DOC=""
 
   ks_lib="$SCRIPT_DIR/../lib/knowledge_store.sh"
   if [ ! -f "$ks_lib" ]; then
-    echo "reconcile.sh: label hygiene — knowledge_store.sh not found at $ks_lib; skipping pending-decision append" >&2
-    return 0
+    echo "reconcile.sh: $what — knowledge_store.sh not found at $ks_lib; skipping pending-decision append" >&2
+    return 1
   fi
   # shellcheck disable=SC1090,SC1091  # optional, guarded above — a synced consumer tree may not carry the lib
   source "$ks_lib" 2>/dev/null || {
-    echo "reconcile.sh: label hygiene — failed to source knowledge_store.sh; skipping pending-decision append" >&2
-    return 0
+    echo "reconcile.sh: $what — failed to source knowledge_store.sh; skipping pending-decision append" >&2
+    return 1
   }
   if ! declare -F ks_append >/dev/null 2>&1; then
-    echo "reconcile.sh: label hygiene — ks_append unavailable after sourcing knowledge_store.sh; skipping pending-decision append" >&2
-    return 0
+    echo "reconcile.sh: $what — ks_append unavailable after sourcing knowledge_store.sh; skipping pending-decision append" >&2
+    return 1
   fi
 
   new_doc="Pipeline/pending decisions.md"
   legacy_doc="Context/pipeline - pending decisions.md"
   if ks_read "$new_doc" >/dev/null 2>&1; then
-    doc="$new_doc"
+    _RECONCILE_PENDING_DOC="$new_doc"
   elif ks_read "$legacy_doc" >/dev/null 2>&1; then
-    doc="$legacy_doc"
+    _RECONCILE_PENDING_DOC="$legacy_doc"
   else
-    doc="$legacy_doc"   # neither exists yet — create at the legacy path
+    _RECONCILE_PENDING_DOC="$legacy_doc"   # neither exists yet: create at the legacy path
   fi
+  return 0
+}
+
+_label_reconcile_append_pending_decision() {
+  local board="$1" repo="$2" deleted="$3" stripped="$4" backfilled="${5:-0}" cleared="${6:-0}" parked="${7:-0}"
+  local doc ts host decision_extra taken_extra
+
+  _reconcile_pending_decisions_doc "label hygiene" || return 0
+  doc="$_RECONCILE_PENDING_DOC"
 
   # Human-facing heading stamp on the pending-decisions review surface renders in
   # the operator's display timezone (kernel doc § Communication conventions); %Z
@@ -1142,22 +1312,30 @@ _label_reconcile_append_pending_decision() {
 # label is removed; the issue's other labels (fnd: or not) are never read for
 # candidacy or touched.
 #
-# <want-state> defaults to "closed" and <forbid-label> to empty, so the two
-# pre-existing (h)/(j) call sites are byte-identical to before — including their
-# "skip (no longer closed+labeled)" notice, which the open arm renames rather
-# than reuses so a reader can tell WHICH re-check refused.
+# Lens 4's class (n) — a dead same-host session's claim stamp on an IN-PROGRESS
+# issue (temperloop#2069) — is the fourth caller, and the one that needs a label
+# to still be PRESENT rather than absent: <require-label> names a label the
+# re-read must still find (the In-Progress status label), so a stamp whose item
+# was PARKED or whose status was rewritten in the scan→apply gap is refused.
+#
+# <want-state> defaults to "closed", <forbid-label> and <require-label> to
+# empty, so the two pre-existing (h)/(j) call sites are byte-identical to before
+# — including their "skip (no longer closed+labeled)" notice, which the open
+# arms rename rather than reuse so a reader can tell WHICH re-check refused.
 #
 # Publishes the applied count in $_LABEL_STRIP_APPLIED rather than returning it,
 # because the loop must run in the CALLER's shell (its `echo`s are part of the
 # report, and a command-substitution subshell would swallow the counter anyway).
-#   _label_reconcile_strip_rows <owner/repo> <rows> [<want-state>] [<forbid-label>]
+#   _label_reconcile_strip_rows <owner/repo> <rows> [<want-state>] [<forbid-label>] [<require-label>]
 _LABEL_STRIP_APPLIED=0
 _label_reconcile_strip_rows() {
-  local repo="$1" rows="$2" want_state="${3:-closed}" forbid_label="${4:-}"
-  local n l issue_json state has_label has_forbid skip_why
+  local repo="$1" rows="$2" want_state="${3:-closed}" forbid_label="${4:-}" require_label="${5:-}"
+  local n l issue_json state has_label has_forbid has_require skip_why
   _LABEL_STRIP_APPLIED=0
   [ -n "$rows" ] || return 0
-  if [ "$want_state" = "closed" ]; then
+  if [ -n "$require_label" ]; then
+    skip_why="skip (no longer open+In-Progress+stamped)"
+  elif [ "$want_state" = "closed" ]; then
     skip_why="skip (no longer closed+labeled)"
   else
     skip_why="skip (no longer open+parked+labeled)"
@@ -1171,7 +1349,11 @@ _label_reconcile_strip_rows() {
     if [ -n "$forbid_label" ]; then
       has_forbid="$(printf '%s' "$issue_json" | jq -r --arg l "$forbid_label" '([.labels[]?.name] | index($l)) != null')"
     fi
-    if [ "$state" != "$want_state" ] || [ "$has_label" != "true" ] || [ "$has_forbid" = "true" ]; then
+    has_require=true
+    if [ -n "$require_label" ]; then
+      has_require="$(printf '%s' "$issue_json" | jq -r --arg l "$require_label" '([.labels[]?.name] | index($l)) != null')"
+    fi
+    if [ "$state" != "$want_state" ] || [ "$has_label" != "true" ] || [ "$has_forbid" = "true" ] || [ "$has_require" != "true" ]; then
       echo "  $skip_why: #$n $l"
       continue
     fi
@@ -1431,40 +1613,349 @@ label_reconcile_main() {
   return 0
 }
 
+
+# --- Lens 4: dead-session claim stamps (--claims, temperloop#2069) ----------
+# Best-effort append of an `ask-at-checkin` pending-decision entry recording an
+# UNATTENDED claim-stamp sweep. Same degradation contract as Lens 3's: a
+# missing/unavailable knowledge store degrades to a stderr notice and NEVER
+# fails the sweep. The store plumbing lives exactly once, in
+# _reconcile_pending_decisions_doc.
+# The held/unknown counts ride the entry alongside the cleared count, as THREE
+# separately-identifiable numbers (temperloop#2069 round 3). `held` is a correct,
+# designed refusal (the K#275 held claim, which clears itself on the merge
+# cascade); `unknown` is an unresolved READ FAILURE. Collapsing them into one
+# total is what would let a rising failure count hide inside a benign-looking
+# number: if the open-PR read starts failing for this host, every candidate
+# lands in `unknown` every night and the lens degrades to permanently inert
+# behind a green exit code. A one-night stdout line is not a surface for a
+# condition whose whole danger is that it PERSISTS, which is why the counts
+# reach this durable cross-run surface too — and why a non-zero `unknown`
+# records an entry even when nothing was cleared.
+#   _claims_reconcile_append_pending_decision <board#> <repo> <cleared> [<held>] [<unknown>]
+_claims_reconcile_append_pending_decision() {
+  local board="$1" repo="$2" cleared="$3" held="${4:-0}" unknown="${5:-0}"
+  local doc ts host taken_extra=""
+
+  _reconcile_pending_decisions_doc "dead-session claim stamps" || return 0
+  doc="$_RECONCILE_PENDING_DOC"
+
+  # Human-facing heading stamp renders in the operator's display timezone
+  # (kernel doc § Communication conventions); %Z names the zone explicitly so a
+  # reader never has to guess. The reconcile epoch math (_reconcile_now) stays
+  # UTC. Belt-and-suspenders default per § Named-setting convention, same as
+  # Lens 3 — this board script is vendored into consumer repos that may not
+  # carry build.config.sh.
+  ts="$(TZ="${DISPLAY_TZ:-America/Los_Angeles}" date '+%Y-%m-%d %H:%M %Z')"
+  host="$(board_host_label)"
+  # Name each carve-out bucket only when it actually held something back, so a
+  # sweep with nothing held and nothing unknown keeps its prior wording verbatim
+  # (the same convention _label_reconcile_append_pending_decision uses). The two
+  # clauses are always SEPARATE numbers — never summed.
+  [ "${held:-0}" -gt 0 ] && taken_extra+="$(printf '; %s held by an open PR (not stripped by design — the claim is held until Done)' "$held")"
+  [ "${unknown:-0}" -gt 0 ] && taken_extra+="$(printf '; %s with an UNESTABLISHED open-PR state (not stripped — this is a READ FAILURE, not a refusal: if it persists across runs the sweep is degrading to inert)' "$unknown")"
+  if {
+    printf '### %s · dead-session claim-stamp sweep · %s:board%s\n' "$ts" "$host" "$board"
+    # shellcheck disable=SC2016  # backticks below are literal markdown spans, not expansion
+    printf -- '- **Decision:** clear the `fnd:host/session:*` stamp from In-Progress items claimed by a provably-dead session on this host, leaving `fnd:status:*` untouched, on board %s (%s)\n' "$board" "$repo"
+    printf -- '- **Default taken:** applied — cleared %s dead-session claim stamp(s)%s; no status label changed, no item closed or moved to Ready\n' "$cleared" "$taken_extra"
+    printf -- '- **Disposition:** auto-taken (unattended; no live operator)\n'
+    printf -- '- **Status:** open\n'
+  } | ks_append "$doc" 2>/dev/null; then
+    return 0
+  fi
+  echo "reconcile.sh: dead-session claim stamps — ks_append to $doc failed; pending-decision entry not recorded" >&2
+  return 0
+}
+
+# The OPEN-PR carve-out read (temperloop#2069 round 2). Resolves, in ONE flat
+# repo-wide read, which issues an OPEN PR would close — so a candidate whose
+# work is already delivered and parked `[m]` at the merge gate keeps the claim
+# `claude/CLAUDE.md` § Task workflow → "Claim held until Done" (K#275) sanctions.
+#
+# Publishes three globals rather than returning them, the same convention
+# _label_reconcile_strip_rows uses for $_LABEL_STRIP_APPLIED (a
+# command-substitution subshell would swallow them):
+#   $_CLAIMS_PR_MAP      {"<issue#>": [<pr#>, …]} — meaningful only when OK=1
+#   $_CLAIMS_PR_READ_OK  1 = the open-PR state was ESTABLISHED; 0 = unknown
+#   $_CLAIMS_PR_WHY      why it could not be established (empty when OK=1)
+#
+# OK=0 is the SAFE direction by construction: the caller treats an
+# unestablished PR state as "do not strip", so an error, an unparseable body,
+# or a capped (hence UNDER-read) list can never become the permissive branch.
+# Never returns non-zero — the sweep degrades to reporting, it never fails.
+#   _claims_reconcile_open_pr_map <owner/repo>
+_CLAIMS_PR_MAP='{}'
+_CLAIMS_PR_READ_OK=1
+_CLAIMS_PR_WHY=""
+_claims_reconcile_open_pr_map() {
+  local repo="$1" prs_json="" map=""
+  _CLAIMS_PR_MAP='{}'; _CLAIMS_PR_READ_OK=1; _CLAIMS_PR_WHY=""
+
+  # Same dialect as status_reconcile_main's PR read: through _board_gh (cached,
+  # counted, stubbable), one flat list call, capped by $STATE_LIMIT.
+  if ! prs_json="$(_board_gh pr list -R "$repo" --state open --limit "$STATE_LIMIT" \
+                     --json number,closingIssuesReferences 2>/dev/null)"; then
+    _CLAIMS_PR_READ_OK=0; _CLAIMS_PR_WHY="the open-PR list read failed"; return 0
+  fi
+  if [ -z "$prs_json" ] || ! printf '%s' "$prs_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    _CLAIMS_PR_READ_OK=0; _CLAIMS_PR_WHY="the open-PR list returned no parseable array"; return 0
+  fi
+  # A CAPPED read is an under-read: a PR past the cap reads as absent, which is
+  # exactly the permissive direction. Refuse to establish rather than guess.
+  if [ "$(printf '%s' "$prs_json" | jq 'length')" -ge "$STATE_LIMIT" ]; then
+    _CLAIMS_PR_READ_OK=0
+    _CLAIMS_PR_WHY="the open-PR list hit the ${STATE_LIMIT}-item cap, so it is an under-read"
+    return 0
+  fi
+  if ! map="$(printf '%s' "$prs_json" | jq -c '
+        reduce .[] as $p ({};
+          reduce ($p.closingIssuesReferences[]?.number) as $i
+            (.; .[$i | tostring] = ((.[$i | tostring] // []) + [$p.number])))' 2>/dev/null)"; then
+    _CLAIMS_PR_READ_OK=0
+    _CLAIMS_PR_WHY="the open-PR list carried no readable closing-issue references"
+    return 0
+  fi
+  _CLAIMS_PR_MAP="$map"
+  return 0
+}
+
+# The Lens 4 report+apply, wrapped like reconcile_main / status_reconcile_main /
+# label_reconcile_main so a test can source this file, override _board_gh and
+# the session/clock seams, set $CLAIMS_APPLY / $CLAIMS_UNATTENDED, and drive it
+# offline. Always exits 0.
+claims_reconcile_main() {
+  local repo HOST hs_prefix inprogress_label rows
+  local now candidates="" foreign="" strip_rows="" fresh_rows=""
+  local dead_rows="" held="" unknown="" prs
+  local num stamp title shost ssess mt age_secs age n l cleared=0
+  local held_n=0 unknown_n=0
+
+  board_resolve "$PROJECT_NUMBER"
+  repo="$(board_repo "$PROJECT_NUMBER")" || {
+    echo "reconcile.sh: dead-session claim stamps — could not resolve repo for board $PROJECT_NUMBER" >&2
+    return 0
+  }
+  # Host identity must match claim.sh's stamp host-part (the shared
+  # board_host_label helper), exactly as Lens 2's liveness check does.
+  HOST="$(board_host_label)"
+  # Both label names are DERIVED from the same helpers the write path uses,
+  # never hardcoded, so they stay in lockstep with the fnd: vocabulary.
+  hs_prefix="$(_board_issues_label_prefix "$BOARD_FIELD_HOSTSESSION")"
+  inprogress_label="$(_board_issues_label_prefix "$BOARD_FIELD_STATUS")$(_board_issues_slug "$BOARD_OPT_INPROGRESS")"
+
+  # Every In-Progress board item carrying a NON-EMPTY owner stamp, as TSV
+  # "<number>TAB<stamp>TAB<title>". Liveness is decided in the bash loop below,
+  # which jq cannot do (it has to stat a transcript). An item with an EMPTY
+  # stamp is Lens 2 class (c) orphaned-In-Progress, not this class, and is
+  # deliberately not a candidate here: there is no stamp to clear.
+  rows="$(
+    printf '%s' "$BOARD_ITEMS_JSON" | jq -r --arg ip "$BOARD_OPT_INPROGRESS" '
+      .items[]
+      | select(.content.number != null)
+      | select((.status // "") == $ip)
+      | ((.["host/Session"]) // "") as $stamp
+      | select($stamp != "")
+      | [ (.content.number | tostring), $stamp, (.content.title // "") ]
+      | @tsv'
+  )"
+
+  now="$(_reconcile_now)"
+  while IFS=$'\t' read -r num stamp title; do
+    [ -n "$num" ] || continue
+    shost="${stamp%%:*}"; ssess="${stamp#*:}"
+    if [ "$shost" != "$HOST" ]; then
+      # FOREIGN: unverifiable from here, so there is no proof to act on. Never a
+      # strip candidate under any flag — report-only, like Lens 2.
+      foreign+="  #$num — stamped '$stamp' (host '$shost' is not this host '$HOST') — liveness unverifiable from here — $title"$'\n'
+      continue
+    fi
+    mt="$(_reconcile_session_mtime "$ssess")"
+    if [ "${mt:-0}" -gt 0 ]; then
+      age_secs=$(( now - mt ))
+      # LIVE — including this very session's own held claims, whose transcript
+      # mtime is "now". Never a candidate, never reported as drift.
+      [ "$age_secs" -le "$RECONCILE_STALE_AFTER_SECS" ] && continue
+      age="stale for $(_reconcile_age_human "$age_secs") (cutoff $(_reconcile_age_human "$RECONCILE_STALE_AFTER_SECS"))"
+    else
+      age="no transcript for session '$ssess' on this host (dead)"
+    fi
+    # Staged, not yet classified: the OPEN-PR carve-out below decides which of
+    # these are strippable, and it must not pay its read when there are none.
+    dead_rows+="$num"$'\t'"$stamp"$'\t'"$age"$'\t'"$title"$'\n'
+  done < <(printf '%s\n' "$rows")
+
+  # ── the open-PR carve-out (temperloop#2069 round 2) ──────────────────────
+  # One flat repo-wide read, skipped entirely when the scan found no candidate.
+  # A candidate an OPEN PR would close is parked `[m]` at the merge gate with
+  # its work DELIVERED, so its claim is held-until-Done (K#275), not drift; and
+  # a PR state that cannot be ESTABLISHED is never read as "no PR". Both land
+  # in their own report bucket instead of the strip list.
+  if [ -n "$dead_rows" ]; then
+    _claims_reconcile_open_pr_map "$repo"
+    while IFS=$'\t' read -r num stamp age title; do
+      [ -n "$num" ] || continue
+      if [ "$_CLAIMS_PR_READ_OK" != 1 ]; then
+        unknown+="  #$num — stamped '$stamp' — $age — open-PR state UNKNOWN ($_CLAIMS_PR_WHY) — $title"$'\n'
+        continue
+      fi
+      prs="$(printf '%s' "$_CLAIMS_PR_MAP" | jq -r --arg n "$num" \
+               '((.[$n] // []) | map("#" + (. | tostring)) | join(", "))')"
+      if [ -n "$prs" ]; then
+        held+="  #$num — stamped '$stamp' — $age — open PR $prs — $title"$'\n'
+        continue
+      fi
+      candidates+="  #$num — stamped '$stamp' — $age — $title"$'\n'
+      strip_rows+="$num"$'\t'"$hs_prefix$stamp"$'\n'
+    done <<<"$dead_rows"
+  fi
+
+  # Counted ONCE, here, and reused by every surface below — the emitted summary
+  # line and the durable pending-decision entry alike — so the two can never
+  # disagree about how many were held back or why (temperloop#2069 round 3).
+  # They stay two numbers, never one sum: `held` is a designed refusal that
+  # clears itself on the merge cascade, `unknown` is an unresolved read failure.
+  held_n="$(printf '%s' "$held" | grep -c '^  #' || true)"
+  unknown_n="$(printf '%s' "$unknown" | grep -c '^  #' || true)"
+
+  echo "Dead-session claim stamps — board $PROJECT_NUMBER ($repo)"
+  echo
+
+  if [ -n "$candidates" ]; then
+    echo "dead-session claim stamps (In Progress, stamped to a provably-dead session on this host '$HOST' — stamp only; fnd:status:* untouched):"
+    printf '%s' "$candidates"
+    echo
+  fi
+  if [ -n "$held" ]; then
+    echo "held by an OPEN PR (DELIBERATELY NOT STRIPPED — the work is delivered and the claim is held until Done, K#275; it clears on the merge cascade):"
+    printf '%s' "$held"
+    echo
+  fi
+  if [ -n "$unknown" ]; then
+    echo "open-PR state UNESTABLISHED (NOT STRIPPED — an unknown PR state is never the permissive branch; re-run once the read succeeds):"
+    printf '%s' "$unknown"
+    echo
+  fi
+  if [ -n "$foreign" ]; then
+    echo "foreign claims (another host — REPORT-ONLY, never stripped from here; verify on the owning host):"
+    printf '%s' "$foreign"
+    echo
+  fi
+  if [ -z "$candidates" ]; then
+    if [ -n "$held" ] || [ -n "$unknown" ]; then
+      echo "Nothing to strip: every dead-session claim stamp on this host is held by an open PR, or its PR state could not be established."
+      # The same count line the apply path prints, so a fold of this lens's
+      # verdict line carries the two buckets on the zero-strip path too — which
+      # is exactly the path a failing open-PR read pins the sweep to.
+      echo "not stripped by design: $held_n held by an open PR, $unknown_n with an unestablished PR state."
+    else
+      echo "In sync: no In-Progress item on this host carries a claim stamp from a dead session (nothing to strip)."
+    fi
+    # An all-held board is a benign steady state; a non-zero UNKNOWN count is a
+    # read failure that must reach the durable cross-run surface even though
+    # nothing was cleared — otherwise a permanently-inert sweep is visible only
+    # in one night's stdout.
+    if [ "$CLAIMS_UNATTENDED" = 1 ] && [ "$unknown_n" -gt 0 ]; then
+      _claims_reconcile_append_pending_decision "$PROJECT_NUMBER" "$repo" 0 "$held_n" "$unknown_n"
+    fi
+    return 0
+  fi
+
+  if [ "$CLAIMS_UNATTENDED" = 1 ]; then
+    CLAIMS_APPLY=1
+  fi
+
+  if [ "$CLAIMS_APPLY" != 1 ]; then
+    echo "(dry-run — no writes; pass --apply, or --unattended, to clear these stamps)"
+    return 0
+  fi
+
+  echo "--apply: clearing dead-session claim stamps (the stamp label ONLY — status is never written, the issue is never closed)…"
+
+  # Re-take the LIVENESS proof from the filesystem immediately before the write.
+  # The scan above may be seconds or minutes old; a session that resumed in that
+  # gap owns its claim again and must not lose it. Cheap (a stat, no network),
+  # and it composes with the per-issue GitHub re-read below rather than
+  # replacing it — the two prove different things.
+  while IFS=$'\t' read -r n l; do
+    [ -n "$n" ] || continue
+    ssess="${l##*:}"
+    if _reconcile_session_live "$ssess"; then
+      echo "  skip (session is live again): #$n $l"
+      continue
+    fi
+    fresh_rows+="$n"$'\t'"$l"$'\n'
+  done <<<"$strip_rows"
+
+  # The GitHub-side re-check + strip, through the SAME one implementation Lens
+  # 3's three strip classes use: the issue must still be OPEN, must still carry
+  # that EXACT stamp label, and must still carry the In-Progress status label
+  # (the <require-label> arm). A re-claim, a park, a status rewrite, or a close
+  # landing in the scan-to-apply gap is therefore refused, not destroyed.
+  _label_reconcile_strip_rows "$repo" "$fresh_rows" open "" "$inprogress_label"
+  cleared="$_LABEL_STRIP_APPLIED"
+
+  echo
+  echo "applied: cleared $cleared dead-session claim stamp(s); 0 status label(s) written, 0 item(s) closed or moved."
+  # The carve-out counts ride the apply summary too, so a Step-6 fold of this
+  # one line still shows that something was deliberately left alone.
+  if [ -n "$held" ] || [ -n "$unknown" ]; then
+    echo "not stripped by design: $held_n held by an open PR, $unknown_n with an unestablished PR state."
+  fi
+
+  if [ "$CLAIMS_UNATTENDED" = 1 ] && { [ "$cleared" -gt 0 ] || [ "$unknown_n" -gt 0 ]; }; then
+    _claims_reconcile_append_pending_decision "$PROJECT_NUMBER" "$repo" "$cleared" "$held_n" "$unknown_n"
+  fi
+  return 0
+}
+
 # Execute-guard: run a report only when this file is RUN, not SOURCED. When
 # sourced (BASH_SOURCE[0] != $0), a test sets $PROJECT_NUMBER / $FIX /
-# $LABELS_APPLY / $LABELS_UNATTENDED, defines its _board_gh / _reconcile_tmux
-# overrides, and calls reconcile_main / status_reconcile_main /
-# label_reconcile_main itself — keeping these defaults untouched.
+# $LABELS_APPLY / $LABELS_UNATTENDED / $CLAIMS_APPLY / $CLAIMS_UNATTENDED,
+# defines its _board_gh / _reconcile_tmux overrides, and calls reconcile_main /
+# status_reconcile_main / label_reconcile_main / claims_reconcile_main itself —
+# keeping these defaults untouched.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   MODE=markers
+  # --apply/--unattended are shared by the two APPLYING lenses (--labels, and
+  # --claims since temperloop#2069), so the parser collects them mode-agnostically
+  # and routes them to the selected lens's own switches below. That keeps flag
+  # order free: `--apply --claims` and `--claims --apply` mean the same thing.
+  APPLY=0
+  UNATTENDED=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --board)       PROJECT_NUMBER="$(board_resolve_name "${2:?--board needs a value}")" || exit 2; shift 2 ;;
       --status)      MODE=status; shift ;;
       --fix)         FIX=1; shift ;;
       --labels)      MODE=labels; shift ;;
-      --apply)       LABELS_APPLY=1; shift ;;
-      --unattended)  LABELS_UNATTENDED=1; shift ;;
-      *) echo "usage: reconcile.sh [--board 3|4] [--fix | --status [--fix] | --labels [--apply|--unattended]]" >&2; exit 2 ;;
+      --claims)      MODE=claims; shift ;;
+      --apply)       APPLY=1; shift ;;
+      --unattended)  UNATTENDED=1; shift ;;
+      *) echo "usage: reconcile.sh [--board N] [--fix | --status [--fix] | --labels [--apply|--unattended] | --claims [--apply|--unattended]]" >&2; exit 2 ;;
     esac
   done
-  # --fix now applies to BOTH repair-bearing lenses — the default marker lens
-  # (every window's provably-terminal stale marker, temperloop#748/#1037) and --status
-  # (terminal→Done). It is still meaningless on --labels, whose apply verb is
-  # --apply/--unattended, so that combination stays a hard error rather than a
+  # --fix applies to the two repair-bearing lenses that own it — the default
+  # marker lens (every window's provably-terminal stale marker,
+  # temperloop#748/#1037) and --status (terminal→Done). It is meaningless on the
+  # two APPLYING lenses, --labels and --claims, whose apply verb is
+  # --apply/--unattended, so either combination stays a hard error rather than a
   # silently-ignored flag.
-  if [ "$FIX" = 1 ] && [ "$MODE" = labels ]; then
-    echo "reconcile.sh: --fix does not apply to --labels (use --apply or --unattended there)" >&2
+  if [ "$FIX" = 1 ] && { [ "$MODE" = labels ] || [ "$MODE" = claims ]; }; then
+    echo "reconcile.sh: --fix does not apply to --$MODE (use --apply or --unattended there)" >&2
     exit 2
   fi
-  if { [ "$LABELS_APPLY" = 1 ] || [ "$LABELS_UNATTENDED" = 1 ]; } && [ "$MODE" != labels ]; then
-    echo "reconcile.sh: --apply/--unattended require --labels (they drive the label-hygiene sweep)" >&2
+  if { [ "$APPLY" = 1 ] || [ "$UNATTENDED" = 1 ]; } && [ "$MODE" != labels ] && [ "$MODE" != claims ]; then
+    echo "reconcile.sh: --apply/--unattended require --labels or --claims (they drive the applying lenses)" >&2
     exit 2
   fi
+  case "$MODE" in
+    labels) LABELS_APPLY="$APPLY"; LABELS_UNATTENDED="$UNATTENDED" ;;
+    claims) CLAIMS_APPLY="$APPLY"; CLAIMS_UNATTENDED="$UNATTENDED" ;;
+  esac
   case "$MODE" in
     markers) reconcile_main ;;
     status)  status_reconcile_main ;;
     labels)  label_reconcile_main ;;
+    claims)  claims_reconcile_main ;;
   esac
 fi

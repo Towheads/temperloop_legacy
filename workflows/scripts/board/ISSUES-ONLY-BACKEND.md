@@ -566,6 +566,35 @@ Two halves, both shipped:
   workflows/scripts/board/reconcile.sh --board 7 --labels --apply  # + strip
   ```
 
+- **The IN-PROGRESS residue — a fourth lens, `--claims` (temperloop#2069).**
+  Classes (j) and (m) both stop short of the one open-issue case that matters
+  most: an item that is **In Progress** whose stamp names a session that is
+  **dead**. (j) is scoped to CLOSED issues; (m) deliberately excludes
+  In-Progress because there a stamp is a LIVE claim held until Done (K#275).
+  That exclusion is right for a LIVE claim and is exactly what `--claims`
+  narrows: when the stamp names a **same-host** session proved dead (its
+  Claude transcript absent, or untouched beyond `RECONCILE_STALE_AFTER_SECS`),
+  the stamp is dead information — and because `claim.sh` refuses a
+  foreign-owned claim, it makes a live epic **unclaimable**. `--claims` strips
+  that ONE label and nothing else: `fnd:status:*` is left byte-identical, the
+  issue is never closed, and the Status is never moved to Ready. A
+  FOREIGN-host stamp is never stripped (liveness is uncheckable from the
+  sweeping machine) and stays report-only; a LIVE same-host session's own
+  claim self-excludes. Candidates are reported with their staleness AGE.
+
+  One further carve-out NARROWS that auto-apply (it does not reverse it): a
+  candidate an **OPEN PR** would close is reported, never stripped — its work
+  is delivered and its claim is held until Done (K#275), and `board.sh`'s
+  `board_claim_contended()` opens `[ -n "$existing" ] || return 1`, so a
+  stripped stamp lets the next claim overwrite the owner with no warning. The
+  open-PR read is a failure path: if it errors or cannot be established, every
+  candidate is reported rather than stripped.
+
+  ```sh
+  workflows/scripts/board/reconcile.sh --board 7 --claims          # report
+  workflows/scripts/board/reconcile.sh --board 7 --claims --apply  # + strip
+  ```
+
 ## Read cache staleness bound (cache-read-dispatch item)
 
 The claim above — "this path has no cache at all" — was true before this
