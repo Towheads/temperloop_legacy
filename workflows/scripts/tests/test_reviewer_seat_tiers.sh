@@ -21,14 +21,21 @@
 # declaration is the only place it can be checked, so it is checked here.
 #
 # WHAT IT ASSERTS (each case is one property, not one file):
-#   1. architecture-reviewer declares an explicit tier — never `inherit`.
+#   1. architecture-reviewer declares an explicit tier — never `inherit` — and
+#      specifically `opus`, the pinned strong tier its own prose promises.
 #   2. Its charter prose names the tier its frontmatter actually declares, and
 #      no longer claims the session model (the doc-vs-mechanism disagreement,
 #      restated as the property rather than as a banned string).
-#   3. The three sibling §3e reviewers still declare `sonnet` — the no-op
+#   3. The §3e reviewers that remain cheap still declare `sonnet` — the no-op
 #      assertion: whatever fixes case 1 must not move them.
 #   4. runReviewers() passes no `model` override anywhere in its body, so
-#      frontmatter remains the single tier authority for all four seats.
+#      frontmatter remains the single tier authority for every routed seat.
+#   5. The two GATE-BEARING seats temperloop#2132 moved — `workflow-reviewer`
+#      and `typescript-reviewer` — declare `model: inherit`, AND each charter's
+#      prose states that tier rather than still claiming the `sonnet` it used
+#      to declare. That is case 2's doc-vs-mechanism property applied to the
+#      seats this item moved: the same disagreement, in mirror image, is
+#      exactly what an edit to one half and not the other would recreate.
 #
 # WHY CASE 4 ANCHORS ON THE FUNCTION, NOT ON ONE SPAWN SITE INSIDE IT. It
 # originally located the spawn by its `for (const route of routes)` loop header.
@@ -41,10 +48,15 @@
 # locator is the function's own declaration line and its closing brace, which no
 # internal restructure changes.
 #
-# Scope: the four seats /build §3e routes. The `claude/agents/reviewers/**`
-# language catalog is deliberately NOT covered — those seats are inert,
-# opted-in per adopter repo, and their tiers were dispositioned separately
-# (docs/model-fanout-inventory.md § B3).
+# Scope: the seats /build §3e routes, PLUS `claude/agents/reviewers/
+# typescript-reviewer.md` (temperloop#2132). The rest of the
+# `claude/agents/reviewers/**` language catalog stays deliberately NOT covered
+# — those seats are inert, opted-in per adopter repo, and their tiers were
+# dispositioned separately (docs/model-fanout-inventory.md § B3).
+# `typescript-reviewer` is the exception because it is NOT inert here:
+# `workflows/scripts/config/reviewer-routing.tsv` routes `.ts`/`.js`/`.mjs`
+# straight to it, so every diff touching the build engine itself is gated on
+# that seat in THIS repo, not only in an adopter's.
 #
 # No network, no HOME mutation, no tmpdir: every assertion reads a tracked file.
 #
@@ -69,12 +81,22 @@ frontmatter_model() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 1: architecture-reviewer declares an explicit tier, never `inherit`.
+# Test 1: architecture-reviewer declares an explicit tier, never `inherit`,
+# and specifically `opus`.
 #
 # The seat's output IS the gate (nothing downstream mechanically checks a
-# boundary call), so under the tier-by-verification policy no cheaper tier is
-# admissible — and `inherit` is not a tier at all, it is a deferral to whoever
-# spawned the seat.
+# boundary call), so under `/build` 3c § Model tiering — *tier by measured
+# rounds, not by an assumed gate* — no cheaper tier is admissible without a
+# paired measurement, and `inherit` is not a tier at all, it is a deferral to
+# whoever spawned the seat.
+#
+# The `opus` half is asserted on top of the generic not-inherit property rather
+# than in place of it, because the two guard different things: not-inherit
+# guards the temperloop#1456 deferral defect, while naming `opus` guards the
+# PIN itself — the seat's charter promises a FLOOR ("never down-tiered"), and
+# only a specific strong tier delivers one. temperloop#2132 moved two sibling
+# seats to `inherit`, so the difference between the two mechanisms is now load-
+# bearing here and is checked, not assumed.
 # ---------------------------------------------------------------------------
 ARCH="${AGENTS_DIR}/architecture-reviewer.md"
 [ -f "$ARCH" ] || fail "1: charter not found at $ARCH"
@@ -84,7 +106,10 @@ arch_model="$(frontmatter_model "$ARCH")"
 if [ "$arch_model" = "inherit" ]; then
   fail "1: architecture-reviewer declares 'model: inherit' — the seat its own charter calls 'never down-tiered' would take the CALLING context's tier, so an autonomous drive on \$PIPELINE_DRIVE_MODEL silently down-tiers it (temperloop#1456). Declare an explicit tier."
 fi
-pass "1: architecture-reviewer declares an explicit tier (model: ${arch_model}), not inherit"
+if [ "$arch_model" != "opus" ]; then
+  fail "1: architecture-reviewer declares 'model: ${arch_model}', expected 'opus' — this seat PINS the strong tier so its 'never down-tiered' promise is a floor rather than a deferral to the caller (temperloop#1456). temperloop#2132 moved workflow-reviewer/typescript-reviewer to 'inherit' deliberately; this seat is the one that must not follow."
+fi
+pass "1: architecture-reviewer pins the strong tier (model: ${arch_model}), not inherit"
 
 # ---------------------------------------------------------------------------
 # Test 2: the charter prose agrees with the frontmatter.
@@ -109,20 +134,22 @@ fi
 pass "2: architecture-reviewer's prose states its declared tier and no longer claims the session model"
 
 # ---------------------------------------------------------------------------
-# Test 3: the three sibling §3e reviewers are untouched — still `sonnet`.
+# Test 3: the §3e reviewers that stay cheap are untouched — still `sonnet`.
 #
-# Their findings are advisory inputs the orchestrator and a human filter, so a
-# mechanical gate stands behind them and a cheaper tier is correct. This is the
-# no-op assertion: it fails if fixing case 1 moved a seat it had no business
-# moving.
+# This is the no-op assertion: it fails if a tier change elsewhere in this file
+# moved a seat it had no business moving. `workflow-reviewer` LEFT this roster
+# at temperloop#2132 and is asserted in case 5 instead; `docs-reviewer` and
+# `requirements-auditor` stay, and `docs-reviewer` stays deliberately — its
+# known gap is severity CALIBRATION, owned by temperloop#2128, not recall, so
+# a stronger model is not the instrument for it.
 # ---------------------------------------------------------------------------
-for seat in workflow-reviewer docs-reviewer requirements-auditor; do
+for seat in docs-reviewer requirements-auditor; do
   charter="${AGENTS_DIR}/${seat}.md"
   [ -f "$charter" ] || fail "3: charter not found at $charter"
   got="$(frontmatter_model "$charter")"
-  [ "$got" = "sonnet" ] || fail "3: ${seat} declares 'model: ${got:-<none>}', expected 'sonnet' — the temperloop#1456 tier fix must be a no-op for this seat"
+  [ "$got" = "sonnet" ] || fail "3: ${seat} declares 'model: ${got:-<none>}', expected 'sonnet' — the temperloop#1456 tier fix, and the temperloop#2132 move of its two gate-bearing siblings, must both be a no-op for this seat"
 done
-pass "3: workflow-reviewer, docs-reviewer and requirements-auditor still declare model: sonnet"
+pass "3: docs-reviewer and requirements-auditor still declare model: sonnet"
 
 # ---------------------------------------------------------------------------
 # Test 4: runReviewers() passes no `model` override.
@@ -152,5 +179,44 @@ if printf '%s\n' "$spawn_block" | grep -vE '^[[:space:]]*(//|\*|/\*)' | grep -E 
   fail "4: runReviewers() passes a 'model' override — the reviewer frontmatter is no longer the single tier authority (temperloop#1456)"
 fi
 pass "4: runReviewers() passes no model override; frontmatter remains the single tier authority"
+
+# ---------------------------------------------------------------------------
+# Test 5: the two gate-bearing seats declare `inherit`, and say so.
+#
+# temperloop#2132 moved `workflow-reviewer` and `typescript-reviewer` off
+# `sonnet` onto `model: inherit` — the session model — under the CURRENT rule
+# in `/build` 3c § Model tiering as rewritten by temperloop#2140: *tier by
+# measured rounds, not by an assumed gate*. A seat moves to a cheaper model
+# only on a paired measurement showing it costs less PER MERGED ITEM, and a
+# seat whose output IS the gate stays on the session model without needing
+# one. Both of these are gates: a HIGH from either at §3e loops the item back
+# to 3c for another build round (build.md, "Blocking — HIGH severity only")
+# rather than being filtered by a human, and no paired measurement was run
+# (it is parked to temperloop#2134).
+#
+# The prose half is asserted for the same reason case 2 asserts it on
+# `architecture-reviewer`: the original defect was the DISAGREEMENT between a
+# charter and its frontmatter, not either value alone. These two charters each
+# carried a paragraph justifying `sonnet`; moving the frontmatter and leaving
+# that paragraph would recreate temperloop#1456 in mirror image.
+#
+# `inherit` is NOT the same guarantee as `architecture-reviewer`'s pin, and
+# this file asserts both precisely so the difference stays visible: `inherit`
+# buys parity with the calling context, a pin buys a floor. A cheap autonomous
+# drive that reached §3e would run these two seats cheap. That residual is
+# accepted for them and NOT accepted for `architecture-reviewer` (case 1).
+# ---------------------------------------------------------------------------
+INHERIT_SEATS="${AGENTS_DIR}/workflow-reviewer.md ${AGENTS_DIR}/reviewers/typescript-reviewer.md"
+for charter in $INHERIT_SEATS; do
+  seat="$(basename "$charter" .md)"
+  [ -f "$charter" ] || fail "5: charter not found at $charter"
+  got="$(frontmatter_model "$charter")"
+  [ "$got" = "inherit" ] || fail "5: ${seat} declares 'model: ${got:-<none>}', expected 'inherit' — a §3e HIGH from this seat loops the item back to 3c, so its output IS the gate and § Model tiering keeps it on the session model absent a paired measurement (temperloop#2132)"
+  grep -qF '`model: inherit`' "$charter" || fail "5: ${seat}.md declares 'model: inherit' in frontmatter but its prose never states that tier — the charter must name the tier it actually runs on (temperloop#2132, the temperloop#1456 property in mirror image)"
+  if grep -q 'seat runs on \*\*`sonnet`\*\*' "$charter"; then
+    fail "5: ${seat}.md's prose still claims the seat runs on \`sonnet\` while its frontmatter declares 'inherit' — the doc and the mechanism disagree (temperloop#2132)"
+  fi
+done
+pass "5: workflow-reviewer and typescript-reviewer declare model: inherit, and their prose states that tier"
 
 echo "All reviewer seat-tier tests passed."

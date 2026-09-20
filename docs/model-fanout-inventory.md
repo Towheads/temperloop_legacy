@@ -160,6 +160,33 @@ noting the asymmetry cuts both ways: an adopter driving them from a cheap
 autonomous session gets the same silent down-tier, with even less visibility
 into it than the kernel had.
 
+**Update (temperloop#2132) — two corrections to the paragraph above.** First,
+the roster changed: `typescript-reviewer` moved from `sonnet` to `model:
+inherit`, alongside `workflow-reviewer`, so the catalog is no longer
+"kernel-native inherit, adopter-catalog sonnet". The basis for that move is
+**not** the kernel-native argument — it is that a §3e HIGH now loops the item
+back to 3c rather than reaching a human filter, so those seats' output *is* the
+gate, and `/build` 3c § Model tiering (as rewritten by temperloop#2140 — *tier
+by measured rounds, not by an assumed gate*) keeps a gate-bearing seat on the
+session model unless a **paired measurement** shows a cheaper one costs less
+per merged item. No such measurement exists yet; it is parked to
+temperloop#2134, and the issue's own caveat stands — seat and surface are
+confounded, so this is a lead to measure, not a proven win.
+
+Second, and more consequentially for this section's reasoning: the premise that
+these are "**inert** catalog entries that run only in an adopter repo that
+opted in" **does not hold in this repo**. `workflows/scripts/config/
+reviewer-routing.tsv` routes `.sh`, `**/Makefile` and `**/build-level.mjs` to
+`shell-reviewer`, `.py` to `python-reviewer`, and `.ts`/`.js`/`.mjs` to
+`typescript-reviewer` — so all three are live §3e seats here, gating the
+kernel's own machinery, not dormant files awaiting an adopter. The "somebody
+else's spend" framing that justified leaving them as-is was therefore resting
+on a factual error about where they run. The open question this section raises
+is unchanged and still open — whether a **pin** is owed where `inherit` only
+buys parity with the caller — but it should be re-argued on the correct
+premise, and it applies to `shell-reviewer`/`python-reviewer` for the same
+reason it now applies to `typescript-reviewer`.
+
 ## C. Headless `claude -p` seats under `bin/` — the find
 
 **These are what this item actually discovered.** Three seats outside the batch

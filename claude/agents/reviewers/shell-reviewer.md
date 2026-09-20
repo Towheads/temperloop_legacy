@@ -6,8 +6,13 @@ model: inherit
 ---
 
 This seat deliberately runs on the **session model** (`model: inherit`), unlike
-the five adopter-catalog language reviewers beside it (`go`/`java`/`rust`/
-`swift`/`typescript`), which declare `sonnet`. The split is the kernel-native
+the four adopter-catalog language reviewers beside it (`go`/`java`/`rust`/
+`swift`), which declare `sonnet`. (`typescript-reviewer` declared `sonnet` too
+until temperloop#2132 moved it to `inherit` — on a *different* basis than this
+seat's: not that TS is a kernel implementation language, but that
+`workflows/scripts/config/reviewer-routing.tsv` routes `.mjs` to it, so the
+build engine's own diffs are gated on it in this repo and the seat is not
+inert here.) The split is the kernel-native
 vs. adopter-catalog distinction this file's own description already draws:
 shell is the kernel's **own** implementation language — the board adapter, the
 build machinery, the install and quality-gate scripts are all `.sh` — so this
