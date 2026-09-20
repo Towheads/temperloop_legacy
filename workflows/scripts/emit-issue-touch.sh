@@ -26,10 +26,29 @@
 # already covers them and is unioned at read time with this stream. Capture
 # touches are likewise emitted separately, by scripts/board/capture.sh's own
 # issue_touch_log_emit (same record shape, `kind:"capture"`), not by this
-# script — this script only ever emits `kind` in {pr-open, merge}.
+# script — this script only ever emits `kind` in {pr-open, merge, review-round}.
+#
+# `review-round` (temperloop#2131) is the THIRD kind this script emits: one
+# record per §3e review round an item spent, written by
+# claude/workflows/build-level.mjs at 3h (see its emitReviewRounds()). It rides
+# THIS stream rather than a new one on purpose — rounds-to-merge is a join
+# against the very pr-open/merge touches already here, so a rollup needs one
+# file and no GitHub call. Extending this script was likewise the point rather
+# than forking a sibling emitter: before temperloop#2131 the `kind` case below
+# matched only `pr-open|merge` and WARNed-then-exited-0 on anything else, so an
+# unextended script would have dropped every review-round record SILENTLY, on a
+# SUCCESS exit — the exact absent-record failure this whole stream exists to
+# prevent. The case arm, the usage line and the invariant sentence above are
+# therefore one change, never three.
 #
 # Usage:
 #   emit-issue-touch.sh --repo <owner/repo> --issue <N> --kind pr-open|merge
+#   emit-issue-touch.sh --repo <owner/repo> --issue <N> --kind review-round \
+#     [--round <N>] [--round-kind <k>] [--pr <N>] [--sha <hex>] \
+#     [--wall-ms <N>] [--tokens <N>] [--reviewers <json-array>]
+#
+# The seven per-round flags are accepted ONLY as `review-round` detail; they are
+# ignored (with a WARN) on a pr-open/merge record, whose shape is unchanged.
 #
 # Appends ONE JSONL line to:
 #   ${ISSUE_TOUCHES_RAW_DIR:-$(raw_lake_dir)}/issue-touches-YYYY-MM.jsonl
@@ -54,8 +73,38 @@
 #                     (deliberately NOT the truncated host:sess8 board stamp)
 #   host             $SUBSET_HOST_LABEL if set, else `hostname -s` — same
 #                     derivation as scripts/board/claim.sh's claim_main
-#   kind             "pr-open" | "merge" (verbatim from --kind; a `capture`
-#                     record is emitted by capture.sh itself, never here)
+#   kind             "pr-open" | "merge" | "review-round" (verbatim from
+#                     --kind; a `capture` record is emitted by capture.sh
+#                     itself, never here)
+#
+# Additional fields, present ONLY on a `kind:"review-round"` record
+# (temperloop#2131) — a pr-open/merge record carries none of them, so every
+# pre-existing consumer reads byte-identical lines:
+#   round            integer round ordinal (the worktree's DURABLE
+#                     build-review-rounds counter, so a continuation round
+#                     reports 3, not 1), null when not supplied/unparseable
+#   round_kind       the round's bucket in build-level.mjs's
+#                     escalationRoundKind() vocabulary (temperloop#2135) —
+#                     one of review | gate-timeout | gate-fail | activation |
+#                     ci | other. THAT function is the one place the mapping is
+#                     stated; this script only validates membership and never
+#                     re-derives a kind, so the two cannot drift. An
+#                     unrecognised value is recorded as "other".
+#   pr               integer PR number the round belongs to, null when absent
+#   sha              the commit the round reviewed (7-64 hex), null otherwise
+#   wall_ms          the round's measured wall-clock in ms, null when unknown
+#   tokens           the round's token cost, null when unknown — and it IS
+#                     null today by construction: the Workflow runtime's
+#                     agent() returns no usage envelope, the same honest
+#                     degrade worker-usage.sh documents. Never a guess.
+#   reviewers        JSON array of {name, model, highs, mediums, lows} — one
+#                     entry per reviewer that RAN in the round. `model` is the
+#                     RESOLVED model that reviewer ran as, self-reported by the
+#                     reviewer itself, NOT the seat file's declared value: a
+#                     seat declaring `model: inherit` resolves per session, so
+#                     the declared string cannot answer "what actually reviewed
+#                     this". Unknown reads null, never the declared value.
+#                     Defaults to [] when absent or not parseable as an array.
 #
 # WARN, DON'T DROP: any failure here (bad args, jq missing, sink unwritable,
 # disk full) warns to stderr and exits 0. A telemetry emit must never fail or
@@ -73,6 +122,15 @@ self="$(basename "$0")"
 repo=""
 issue=""
 kind=""
+# temperloop#2131 — the `review-round` detail flags. All optional, all empty by
+# default, all serialized ONLY under that kind (see the record builder below).
+round=""
+round_kind=""
+pr=""
+sha=""
+wall_ms=""
+tokens=""
+reviewers=""
 
 # ARG LOOP — the shift is deliberately TWO steps (temperloop#1342). Bash's
 # `shift 2` FAILS (count out of range) when the flag is the LAST argument, and
@@ -88,6 +146,16 @@ while [ $# -gt 0 ]; do
     --repo) repo="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     --issue) issue="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     --kind) kind="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    # temperloop#2131 review-round detail. Every arm uses the SAME two-step
+    # shift the three arms above use, for the same reason the ARG LOOP comment
+    # gives: a `shift 2` on a trailing flag fails, does not shift, and spins.
+    --round) round="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    --round-kind) round_kind="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    --pr) pr="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    --sha) sha="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    --wall-ms) wall_ms="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    --tokens) tokens="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    --reviewers) reviewers="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     *)
       printf '%s: WARN unknown argument %s (ignored)\n' "$self" "$1" >&2
       shift
@@ -108,12 +176,58 @@ case "$issue" in
 esac
 
 case "$kind" in
-  pr-open|merge) : ;;
+  pr-open|merge|review-round) : ;;
   *)
-    printf '%s: WARN --kind must be pr-open or merge, got %s — no record emitted\n' "$self" "$kind" >&2
+    printf '%s: WARN --kind must be pr-open, merge or review-round, got %s — no record emitted\n' "$self" "$kind" >&2
     exit 0
     ;;
 esac
+
+# --- temperloop#2131: normalise the review-round detail ----------------------
+# Every field VALIDATES to a known shape or degrades to the JSON null the record
+# builder below emits — never to a plausible-but-wrong value. Same reasoning as
+# build-level.mjs's own marker reads: a filter that merely strips bad bytes
+# yields something well-shaped and false, which is worse than an honest gap.
+if [ "$kind" = "review-round" ]; then
+  for _f in round pr wall_ms tokens; do
+    _v="${!_f}"
+    case "$_v" in
+      '') : ;;
+      *[!0-9]*)
+        printf '%s: WARN --%s must be a number, got %s — recording null for it\n' "$self" "$_f" "$_v" >&2
+        printf -v "$_f" '%s' ''
+        ;;
+    esac
+  done
+  case "$round_kind" in
+    ''|review|gate-timeout|gate-fail|activation|ci|other) : ;;
+    *)
+      printf '%s: WARN --round-kind %s is outside the closed vocabulary — recording "other"\n' "$self" "$round_kind" >&2
+      round_kind="other"
+      ;;
+  esac
+  # 7-64 hex, the same floor build-level.mjs applies to a relayed sha: 7 is
+  # git's own minimum abbreviation length, and anything shorter is residue.
+  if [ -n "$sha" ]; then
+    case "$sha" in
+      *[!0-9a-fA-F]*) _sha_ok="" ;;
+      *) _sha_ok="1" ;;
+    esac
+    if [ -n "$_sha_ok" ] && [ "${#sha}" -ge 7 ] && [ "${#sha}" -le 64 ]; then
+      :
+    else
+      printf '%s: WARN --sha %s is not a 7-64 char hex commit — recording null for it\n' "$self" "$sha" >&2
+      sha=""
+    fi
+  fi
+else
+  # The detail flags are meaningless on a pr-open/merge record; say so rather
+  # than serialising them, so that record shape stays byte-identical for every
+  # consumer that predates this kind.
+  if [ -n "$round$round_kind$pr$sha$wall_ms$tokens$reviewers" ]; then
+    printf '%s: WARN review-round detail flags ignored on --kind %s\n' "$self" "$kind" >&2
+  fi
+fi
 
 if ! command -v jq >/dev/null 2>&1; then
   printf '%s: WARN jq not found — no record emitted (repo=%s issue=%s kind=%s)\n' "$self" "$repo" "$issue" "$kind" >&2
@@ -180,6 +294,25 @@ raw_file="$raw_dir/issue-touches-${month}.jsonl"
 
 mkdir -p "$raw_dir" 2>/dev/null || true
 
+# temperloop#2131 — `reviewers` is the one field that arrives as JSON rather
+# than a scalar, so it is PARSED before the record is built and falls back to
+# `[]` when it is absent, malformed, or not an array. Parsing it here (rather
+# than passing it to --argjson and letting a malformed value fail the whole jq
+# invocation) keeps the fail-open contract: a garbled reviewers list costs the
+# reviewer detail, never the record.
+reviewers_json="[]"
+if [ "$kind" = "review-round" ] && [ -n "$reviewers" ]; then
+  if _parsed="$(printf '%s' "$reviewers" | jq -c 'if type == "array" then . else error("not an array") end' 2>/dev/null)" \
+     && [ -n "$_parsed" ]; then
+    reviewers_json="$_parsed"
+  else
+    printf '%s: WARN --reviewers is not a JSON array — recording [] (repo=%s issue=%s)\n' "$self" "$repo" "$issue" >&2
+  fi
+fi
+
+# The base record is IDENTICAL to the pre-temperloop#2131 shape; the
+# review-round detail is merged on top only for that kind, so a pr-open/merge
+# line is byte-for-byte what it always was.
 record="$(jq -nc \
   --arg ts "$ts" \
   --arg repo "$repo" \
@@ -187,15 +320,34 @@ record="$(jq -nc \
   --arg session_id "$session_id" \
   --arg host "$host" \
   --arg kind "$kind" \
-  '{
-    schema_version: "1",
-    ts: $ts,
-    repo: $repo,
-    issue: $issue,
-    session_id: (if $session_id == "" then null else $session_id end),
-    host: $host,
-    kind: $kind
-  }' 2>/dev/null)"
+  --arg round "$round" \
+  --arg round_kind "$round_kind" \
+  --arg pr "$pr" \
+  --arg sha "$sha" \
+  --arg wall_ms "$wall_ms" \
+  --arg tokens "$tokens" \
+  --argjson reviewers "$reviewers_json" \
+  '
+    def num($s): if $s == "" then null else ($s | tonumber? // null) end;
+    {
+      schema_version: "1",
+      ts: $ts,
+      repo: $repo,
+      issue: $issue,
+      session_id: (if $session_id == "" then null else $session_id end),
+      host: $host,
+      kind: $kind
+    }
+    + (if $kind == "review-round" then {
+        round: num($round),
+        round_kind: (if $round_kind == "" then "other" else $round_kind end),
+        pr: num($pr),
+        sha: (if $sha == "" then null else $sha end),
+        wall_ms: num($wall_ms),
+        tokens: num($tokens),
+        reviewers: $reviewers
+      } else {} end)
+  ' 2>/dev/null)"
 
 if [ -z "$record" ]; then
   printf '%s: WARN failed to build JSON record (repo=%s issue=%s kind=%s) — no record emitted\n' "$self" "$repo" "$issue" "$kind" >&2

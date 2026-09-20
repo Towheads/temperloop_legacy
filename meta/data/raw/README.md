@@ -192,7 +192,9 @@ Emitted by two sites that both write the same record shape into the same
 stream (foundation #916/#919):
 
 - `workflows/scripts/emit-issue-touch.sh` — emits `kind:"pr-open"` (build.md
-  Step 3f) and `kind:"merge"` (build.md Step 4d).
+  Step 3f), `kind:"merge"` (build.md Step 4d) and `kind:"review-round"`
+  (`claude/workflows/build-level.mjs`'s `emitReviewRounds()`, at 3h —
+  temperloop#2131).
 - `workflows/scripts/board/capture.sh`'s own `issue_touch_log_emit` — emits
   `kind:"capture"` at the moment a noticed-but-not-now item is captured.
 
@@ -206,7 +208,7 @@ Record shape: `{schema_version, ts, repo, issue, session_id, host, kind}`
 | `issue` | integer | issue number |
 | `session_id` | string \| null | raw, untruncated `$CLAUDE_CODE_SESSION_ID` — same join-key convention as `command-run`; deliberately NOT the truncated `host:sess8` board stamp |
 | `host` | string | `$SUBSET_HOST_LABEL` if set, else `hostname -s` |
-| `kind` | string | `"pr-open"` \| `"merge"` \| `"capture"` |
+| `kind` | string | `"pr-open"` \| `"merge"` \| `"capture"` \| `"review-round"` |
 
 Example record:
 
@@ -214,9 +216,67 @@ Example record:
 {"schema_version":"1","ts":"2026-07-05T14:07:22Z","repo":"acme/widgets","issue":42,"session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","host":"mini","kind":"pr-open"}
 ```
 
+#### `kind:"review-round"` — the §3e round history (temperloop#2131)
+
+One record per §3e review round a `/build` item spent, appended at 3h from the
+same per-round objects the item's parked record carries in `review.rounds` —
+one producer, two sinks, so the lake and the parked record cannot disagree.
+
+It rides **this** stream rather than a new one because rounds-to-merge is a
+join against the `pr-open`/`merge` touches already here: the round records sit
+in the same file, keyed on the same `issue`, so a rollup needs one file and no
+GitHub call. A `review-round` record carries the seven fields below **in
+addition to** the base shape; every other `kind` carries none of them, so a
+consumer that predates this kind reads byte-identical lines.
+
+| field | type | notes |
+|---|---|---|
+| `round` | integer \| null | the round ordinal, from the worktree's **durable** `build-review-rounds` counter — so a continuation round reports `3`, not `1` |
+| `round_kind` | string | `"review"` \| `"gate-timeout"` \| `"gate-fail"` \| `"activation"` \| `"ci"` \| `"other"` — the closed vocabulary owned by `build-level.mjs`'s `escalationRoundKind()` (temperloop#2135), **the one place that mapping is stated**. An unrecognised value is recorded as `"other"`; nothing is re-derived here. |
+| `pr` | integer \| null | the PR the round belongs to |
+| `sha` | string \| null | the commit the round actually reviewed (7–64 hex); `null` rather than a plausible-but-wrong value when the relay dropped or garbled it |
+| `wall_ms` | integer \| null | the round's measured §3e fanout wall-clock, in ms |
+| `tokens` | integer \| null | the round's token cost. **`null` today by construction** — the Workflow runtime's `agent()` returns no usage envelope, the same honest degrade `worker-usage.sh` documents for the worker seat. Never a guess. |
+| `reviewers` | array | one `{name, model, highs, mediums, lows}` object per reviewer that **ran** in the round (`[]` when none did) |
+
+`reviewers[].model` is the **resolved** model that reviewer ran as —
+self-reported by the reviewer itself — **not** the seat file's declared value: a
+seat declaring `model: inherit` resolves per *session*, so the declared string
+answers a different question than "what actually reviewed this". Unknown reads
+`null`, never the declared value. `highs`/`mediums`/`lows` count that
+reviewer's `### [HIGH] …` / `[MEDIUM]` / `[LOW]` findings in that round.
+
+Example record:
+
+```json
+{"schema_version":"1","ts":"2026-09-19T22:18:23Z","repo":"acme/widgets","issue":42,"session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","host":"mini","kind":"review-round","round":3,"round_kind":"ci","pr":1207,"sha":"deadbeefcafe","wall_ms":12000,"tokens":null,"reviewers":[{"name":"shell-reviewer","model":"claude-opus-5","highs":1,"mediums":2,"lows":0}]}
+```
+
+**Rollup: rounds-per-PR for a week, with no GitHub call.** This is the query
+temperloop#2131 exists to make possible, and it reads the lake alone:
+
+```sh
+# Rounds per PR for the week of 2026-09-14 (UTC bounds on the stored `ts`).
+jq -s -c '
+    map(select(.kind == "review-round"
+               and .ts >= "2026-09-14T00:00:00Z"
+               and .ts <  "2026-09-21T00:00:00Z"))
+    | group_by(.pr)
+    | map({pr: .[0].pr, issue: .[0].issue, rounds: length,
+           kinds: (group_by(.round_kind) | map({(.[0].round_kind): length}) | add)})
+    | sort_by(.pr)' meta/data/raw/issue-touches-2026-09.jsonl
+```
+
+`workflows/scripts/build/tests/test_workflow.sh` executes this exact query
+against a fixture lake, so the recipe above is a tested surface rather than an
+illustration. Dates rendered for a human go in `America/Los_Angeles`; the `ts`
+values stored here are UTC by design (the stored/parsed carve-out), so convert
+at display time, never in the file.
+
 **Sibling: `claims` — `claims-<YYYY-MM>.jsonl`.** `workflows/scripts/board/claim.sh`'s
 `claim_log_emit` writes claim touches (deliberately *not* emitted by
-`emit-issue-touch.sh`, which only ever emits `pr-open`/`merge`) into their own
+`emit-issue-touch.sh`, which only ever emits
+`pr-open`/`merge`/`review-round`) into their own
 `claims-<YYYY-MM>.jsonl` file, unioned at read time with `issue-touches` to
 give the full touch history for an issue. Its record shape (documented in
 full at `claim_log_emit`'s own header comment):

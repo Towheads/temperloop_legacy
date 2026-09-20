@@ -2939,6 +2939,12 @@ function park(slug, pr, pushedSha, acceptanceResults, noCi, recovery, discrimina
   // `routed_not_run` (temperloop#1984) names every reviewer the routing
   // resolved that did not run, mandatory or not, so the tally cannot read
   // fully clean while a tsv-routed reviewer was skipped. See reviewTally().
+  // `rounds` (temperloop#2131) is the un-flattened round history beside them —
+  // one entry per round this item spent, each naming the round ordinal, its
+  // kind in escalationRoundKind()'s vocabulary, the reviewers that ran with
+  // their RESOLVED model and HIGH/MEDIUM/LOW counts, the reviewed sha and the
+  // round's wall-clock — so rounds-to-merge is read off the record rather than
+  // reconstructed from PR-body section headings.
   if (review) parked.review = review;
   // temperloop#2065 "worker-cost-capture" (epic #2062's dual-build ledger) —
   // per-item worker cost: tokens, wall-clock, retry cost and a `recovery`
@@ -3149,13 +3155,19 @@ function reviewDiffCmd(wt, bump = true) {
     `  since_json="$(git diff --name-only "$review_prior_sha..HEAD" 2>/dev/null | jq -R -s -c 'split("\\n") | map(select(length>0))')"`,
     `fi`,
     `[ -n "$since_json" ] || since_json='[]'`,
+    // temperloop#2131 — THIS round's HEAD, hoisted OUT of the bump arm below so
+    // it is emitted on both arms. It is the commit the round about to run will
+    // actually review, which is what the round-telemetry record's `sha` names;
+    // the bump arm still writes it to the marker for the NEXT round to read as
+    // its prior. A pure read (`git rev-parse`) with no side effect, so the
+    // non-bumping #1976 re-fetch and the #2046 no-write guard are unaffected.
+    `__k2127_head="$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)"`,
     ...(bump
       ? [
           `if [ -n "$rounds_file" ]; then`,
           `  { printf '%s\\n' "$((review_rounds + 1))" > "$rounds_file"; } 2>/dev/null || true`,
           `fi`,
           // Record THIS round's HEAD for the NEXT round to read as its prior — see build-level.design-notes-3.md#record-this-round-s-head-for-the-next-round-to-read-as-its-p
-          `__k2127_head="$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)"`,
           `if [ -n "$sha_file" ] && [ -n "$__k2127_head" ]; then`,
           `  { printf '%s\\n' "$__k2127_head" > "$sha_file"; } 2>/dev/null || true`,
           `fi`,
@@ -3182,7 +3194,7 @@ function reviewDiffCmd(wt, bump = true) {
     `  tsv_rows=0`,
     `  tsv_checksum=0`,
     `fi`,
-    `printf '{"outcome":"REVIEW_DIFF","files":%s,"files_since_prior":%s,"tsv_lines":%s,"tsv_rows":%s,"tsv_checksum":%s,"review_rounds":%s,"review_prior_sha":"%s"}\\n' "$files_json" "$since_json" "$tsv_json" "$tsv_rows" "$tsv_checksum" "$review_rounds" "$review_prior_sha"`,
+    `printf '{"outcome":"REVIEW_DIFF","files":%s,"files_since_prior":%s,"tsv_lines":%s,"tsv_rows":%s,"tsv_checksum":%s,"review_rounds":%s,"review_prior_sha":"%s","review_head_sha":"%s"}\\n' "$files_json" "$since_json" "$tsv_json" "$tsv_rows" "$tsv_checksum" "$review_rounds" "$review_prior_sha" "$__k2127_head"`,
   ].join('\n');
 }
 
@@ -3436,6 +3448,23 @@ function reviewPrompt(item, wt, route, files, priorContext) {
     ...principlesSection(item),
     '',
     "Follow your own agent definition's checklist and output format exactly.",
+    '',
+    // temperloop#2131 — THE RESOLVED MODEL, self-reported. A round record's
+    // `model` must say what ACTUALLY reviewed that round, and the seat file's
+    // declared value cannot: a seat declaring `model: inherit` resolves per
+    // SESSION, so the declared string answers a different question. This
+    // driver cannot supply it either — the Workflow runtime's `agent()`
+    // reports no per-spawn model back (the same reporting gap worker-usage.sh
+    // exists to work around for tokens/wall-clock) and the runtime has no
+    // filesystem to read an installed seat from (DESIGN NOTE 1). The reviewer
+    // itself is the only party that knows, so it is asked. Parsed by
+    // reviewSelfReportedModel() and stripped back out by reviewBodySuffix()
+    // before any section is rendered, so a PR body is byte-identical whether
+    // the reviewer emitted the line or not. Absent/unparseable reads `null`,
+    // NEVER the declared value — an honest gap, never a wrong answer.
+    `On its own final line, emit exactly: ${REVIEW_MODEL_MARK_EXAMPLE}`,
+    'substituting the exact model ID you are running as (your own environment names it).',
+    'That line is machinery-only telemetry and is stripped before anything is rendered.',
   ];
   return [...header, ...continuation, ...footer].join('\n');
 }
@@ -3443,6 +3472,137 @@ function reviewPrompt(item, wt, route, files, priorContext) {
 // reviewHasBlockingFinding — this repo's reviewer catalog (workflow-revi — see build-level.design-notes-3.md#reviewhasblockingfinding-this-repo-s-reviewer-catalog-workfl
 function reviewHasBlockingFinding(text) {
   return /^\s*###\s*\[\s*HIGH\b/im.test(String(text ?? ''));
+}
+
+// --- §3e ROUND TELEMETRY (temperloop#2131) -----------------------------------
+// The §3e round history, put where it can be QUERIED: park()'s `review.rounds`
+// (the parked record the merge gate reads), the issue-touches raw lake (one
+// `kind:"review-round"` record per round, so rounds-to-merge is a jq rollup
+// rather than an archaeology exercise over PR bodies), and the PR body's own
+// §3e line. All three read the SAME per-round record built by
+// reviewRoundRecord() below, so they cannot disagree.
+
+// REVIEW_MODEL_MARK_EXAMPLE / _RE — the reviewer's self-reported resolved
+// model (see reviewPrompt's footer for WHY it is self-reported). Deliberately
+// an HTML comment: it is invisible in rendered Markdown even on the path where
+// a stripper is bypassed, and it cannot be confused with a findings heading.
+const REVIEW_MODEL_MARK_EXAMPLE = '<!-- 3e-model: your-exact-model-id -->';
+const REVIEW_MODEL_MARK_RE = /^[ \t]*<!--[ \t]*3e-model:[ \t]*([^\s>][^>]{0,119}?)[ \t]*-->[ \t]*$/im;
+
+// reviewSelfReportedModel — the model string the reviewer named, or null. The
+// example placeholder is REJECTED: a reviewer that echoed the instruction
+// verbatim reported nothing, and recording the placeholder would be exactly
+// the wrong-answer-instead-of-a-gap failure this field exists to avoid.
+function reviewSelfReportedModel(text) {
+  const m = REVIEW_MODEL_MARK_RE.exec(String(text ?? ''));
+  if (!m) return null;
+  const v = String(m[1]).trim();
+  return v && v !== 'your-exact-model-id' ? v : null;
+}
+
+// stripReviewModelMark — remove the telemetry line before rendering. Applied
+// at the ONE render seam (reviewBodySuffix), never to the stored section text,
+// so parsing and rendering read the same object and no round-trip can lose it.
+function stripReviewModelMark(text) {
+  return String(text ?? '').replace(new RegExp(REVIEW_MODEL_MARK_RE.source, 'gim'), '').replace(/\n{3,}$/, '\n');
+}
+
+// reviewSeverityCounts — per-reviewer HIGH/MEDIUM/LOW tallies, read off the
+// SAME heading grammar reviewHasBlockingFinding() already keys on
+// (`### [HIGH] …`), so "this round had a blocking finding" and "this round had
+// 1 high" can never disagree about what a HIGH looks like.
+function reviewSeverityCounts(text) {
+  const counts = { highs: 0, mediums: 0, lows: 0 };
+  const re = /^[ \t]*###\s*\[\s*(HIGH|MEDIUM|LOW)\b/gim;
+  let m;
+  while ((m = re.exec(String(text ?? ''))) !== null) {
+    const sev = m[1].toUpperCase();
+    if (sev === 'HIGH') counts.highs += 1;
+    else if (sev === 'MEDIUM') counts.mediums += 1;
+    else counts.lows += 1;
+  }
+  return counts;
+}
+
+// REVIEW_ROUND_KINDS — the IMAGE of escalationRoundKind() (temperloop#2135),
+// which is THE ONE PLACE THE MAPPING IS STATED. This set is a MEMBERSHIP CHECK
+// on a round record's own `round_kind`, never a second mapping: every value
+// that reaches it was produced either by escalationRoundKind() itself (the
+// CI-fix round, stamped at its producing site in ciPollLoop) or is the
+// vocabulary's own `review` member (the §3e pass, which IS a review round).
+// Anything else — a relay garble, a future producer that forgot to stamp —
+// reads `other`, the same catch-all that keeps escalationRoundKind() bounded.
+const REVIEW_ROUND_KINDS = new Set(['review', 'gate-timeout', 'gate-fail', 'activation', 'ci', 'other']);
+
+function reviewRoundKind(r) {
+  const k = r && typeof r.round_kind === 'string' ? r.round_kind : '';
+  return REVIEW_ROUND_KINDS.has(k) ? k : 'other';
+}
+
+// reviewRoundBuckets — the PR-body summary's three buckets, grouped over
+// escalationRoundKind()'s vocabulary exactly as temperloop#2131 specifies:
+// `gate` = gate-timeout + gate-fail, `other` = activation + ci + other. This is
+// a DISPLAY grouping over that vocabulary, not a second classifier — no round's
+// kind is decided here, only which column it is counted in.
+function reviewRoundBuckets(rounds) {
+  const b = { n: 0, review: 0, gate: 0, other: 0 };
+  for (const r of rounds) {
+    if (!r) continue;
+    b.n += 1;
+    const k = reviewRoundKind(r);
+    if (k === 'review') b.review += 1;
+    else if (k === 'gate-timeout' || k === 'gate-fail') b.gate += 1;
+    else b.other += 1;
+  }
+  return b;
+}
+
+// reviewRoundRecord — ONE round, as the parked record, the lake and the PR
+// body all see it. Every field fails SOFT to null rather than to a plausible
+// wrong value, matching every other marker read in this pipeline:
+//   round     the DURABLE ordinal (the worktree's build-review-rounds counter,
+//             so a continuation round reports 3, not 1)
+//   kind      escalationRoundKind()'s vocabulary — see reviewRoundKind()
+//   reviewers one entry per reviewer that RAN, with the resolved (self-reported)
+//             model and this round's HIGH/MEDIUM/LOW counts
+//   sha       the commit this round actually reviewed (reviewDiffCmd's
+//             review_head_sha), null when the relay dropped or garbled it
+//   wall_ms   the §3e fanout's measured wait for this round
+//   tokens    null until the Workflow runtime reports a usage envelope — the
+//             SAME honest degrade worker-usage.sh documents, never a guess
+function reviewRoundRecord(r) {
+  const sections = Array.isArray(r.sections) ? r.sections : [];
+  const textFor = new Map();
+  for (const s of sections) {
+    if (s && s.reviewer && !textFor.has(s.reviewer)) textFor.set(s.reviewer, String(s.text ?? ''));
+  }
+  const reviewers = (Array.isArray(r.ran) ? r.ran : []).map((e) => {
+    const text = textFor.get(e.reviewer) ?? '';
+    const c = reviewSeverityCounts(text);
+    return {
+      name: e.reviewer,
+      model: reviewSelfReportedModel(text),
+      highs: c.highs,
+      mediums: c.mediums,
+      lows: c.lows,
+    };
+  });
+  // `Number(null)` and `Number('')` are both 0 — FINITE, so a bare
+  // Number.isFinite() guard silently turns "not reported" into a fabricated
+  // zero, which is the one thing every field here is supposed not to do. The
+  // absent cases are rejected BEFORE the numeric read.
+  const num = (v) =>
+    v === null || v === undefined || v === '' || !Number.isFinite(Number(v))
+      ? null
+      : Math.max(0, Math.round(Number(v)));
+  return {
+    round: num(r.round),
+    kind: reviewRoundKind(r),
+    reviewers,
+    sha: typeof r.sha === 'string' && /^[0-9a-fA-F]{7,64}$/.test(r.sha) ? r.sha : null,
+    wall_ms: num(r.wall_ms),
+    tokens: num(r.tokens),
+  };
 }
 
 // reviewDiffTsvGap — temperloop#1976 (row-count), extended by temperloop — see build-level.design-notes.md#reviewdifftsvgap-temperloop-1976-row-count-extended-by-tempe
@@ -3525,6 +3685,14 @@ async function runReviewers(item, wt, priorFindingsText) {
     typeof diffOut.review_prior_sha === 'string' && /^[0-9a-fA-F]{7,64}$/.test(diffOut.review_prior_sha)
       ? diffOut.review_prior_sha
       : null;
+  // temperloop#2131 — THIS round's reviewed commit, read from the same relay
+  // and validated by the same hex/floor rule as priorSha above (that rule's
+  // rationale applies unchanged: `tr -cd` on the producing side is a filter,
+  // not a validator, so the receiving end never trusts its shape alone).
+  const headSha =
+    typeof diffOut.review_head_sha === 'string' && /^[0-9a-fA-F]{7,64}$/.test(diffOut.review_head_sha)
+      ? diffOut.review_head_sha
+      : null;
   // `priorContext` — null on round 1 (the ONLY thing that keeps reviewProm — see build-level.design-notes-3.md#priorcontext-null-on-round-1-the-only-thing-that-keeps-revie
   const isContinuationRound = round > 1;
   const priorContext = isContinuationRound
@@ -3594,6 +3762,15 @@ async function runReviewers(item, wt, priorFindingsText) {
       ran: [],
       skipped: degradedSkip ? [degradedSkip] : [],
       round,
+      // temperloop#2131 round telemetry. `round_kind: 'review'` is not a
+      // classification DECISION — this IS the §3e review pass, so it carries
+      // escalationRoundKind()'s own `review` member (temperloop#2135 owns that
+      // vocabulary; nothing is re-derived here). No fanout ran on this arm, so
+      // `wall_ms` is null rather than a fabricated zero.
+      round_kind: 'review',
+      sha: headSha,
+      wall_ms: null,
+      tokens: null,
       ...(routingDegraded ? { routing_degraded: routingDegraded } : {}),
     };
   }
@@ -3714,6 +3891,18 @@ async function runReviewers(item, wt, priorFindingsText) {
     ran,
     skipped,
     round,
+    // temperloop#2131 round telemetry — see the early-return arm above for why
+    // `round_kind` is the vocabulary's own `review` member and not a second
+    // mapping. `wall_ms` is awaitReviewFanout's MEASURED wait for this round
+    // (temperloop#2049's real elapse, the same figure the #2003 ceiling
+    // escalation reports as `waited_secs`), in ms. `tokens` is null: the
+    // Workflow runtime's agent() returns no usage envelope, so a number here
+    // could only be invented — the same honest degrade worker-usage.sh
+    // documents for the worker seat.
+    round_kind: 'review',
+    sha: headSha,
+    wall_ms: Number.isFinite(Number(waitedSecs)) ? Math.max(0, Math.round(Number(waitedSecs) * 1000)) : null,
+    tokens: null,
     ...(routingDegraded ? { routing_degraded: routingDegraded } : {}),
   };
   // temperloop#2003 — the MANDATORY half of the timeout disposition. An advisory
@@ -3978,12 +4167,40 @@ function reviewBodySuffix(rounds) {
     for (const sec of r.sections ?? []) {
       const heading = i === 0 ? sec.reviewer : `${sec.reviewer} (ci-fix round ${i})`;
       sectionParts.push(
-        `${reviewBlockMarker(sec.reviewer, i)}\n### ${heading}\n${neutralizeReviewBlockMark(sec.text)}`,
+        // temperloop#2131 — strip the reviewer's self-reported-model telemetry
+        // line HERE, at the one render seam, so the stored section text stays
+        // the reviewer's verbatim return (what reviewTally parses the model
+        // out of) while the PR body is byte-identical to a reviewer that never
+        // emitted the line.
+        `${reviewBlockMarker(sec.reviewer, i)}\n### ${heading}\n${neutralizeReviewBlockMark(stripReviewModelMark(sec.text))}`,
       );
     }
   });
   const parts = [];
   if (ranNames.length) parts.push(`§3e review — ran: ${ranNames.join(', ')}`);
+  // temperloop#2131 — the ROUND HISTORY on the §3e line itself, so
+  // rounds-to-merge is readable off the PR at the merge gate instead of
+  // reconstructed from `-r2`/`-r3` section headings. Buckets per
+  // reviewRoundBuckets(): gate = gate-timeout + gate-fail, other = activation +
+  // ci + other, over escalationRoundKind()'s vocabulary (temperloop#2135).
+  // Attached to the `ran:` line, and ONLY when there is one: an item whose §3e
+  // routed no reviewer at all has no review line to hang a round count on, and
+  // synthesising one would change every such PR body for no reader gain.
+  //
+  // EVIDENCE-BEARING ROUNDS ONLY, on THIS surface. The count here is scoped to
+  // rounds that actually ran a reviewer, for two reasons. (1) Coherence: this
+  // is the `ran:` line, so a round that routed nobody has nothing to say on it.
+  // (2) Cost: temperloop#1846's no-op rule skips the 3g.5 body re-render when a
+  // CI-fix round adds no evidence, by comparing this very suffix against 3f's —
+  // counting an evidence-free round here would make those two differ and force
+  // a machinery spawn on the common CI-failure path for a number nobody can act
+  // on. The COMPLETE history is not lost by this: park()'s `review.rounds` and
+  // the issue-touches lake carry EVERY round, evidence-bearing or not, and they
+  // are the surfaces a rounds-to-merge query reads.
+  const buckets = reviewRoundBuckets(rounds.filter((r) => r && (r.ran ?? []).length > 0));
+  if (ranNames.length && buckets.n > 0) {
+    parts.push(`rounds: ${buckets.n} (review ${buckets.review}, gate ${buckets.gate}, other ${buckets.other})`);
+  }
   if (skippedNotes.length) parts.push(skippedNotes.join('; '));
   const line = parts.join(' · ');
   return (
@@ -4017,9 +4234,89 @@ function reviewTally(...rounds) {
     skipped,
     mandatory_ok: !skipped.some((s) => s.mandatory),
     routed_not_run: Array.from(new Set(skipped.map((s) => s.reviewer))),
+    // temperloop#2131 — the ROUND HISTORY, one entry per round this item spent
+    // (a 3-round item lists three, a 1-round item lists one). Present on every
+    // tally, never conditionally omitted: `ran`/`skipped` flatten every round
+    // into one list, which is exactly what made rounds-to-merge an archaeology
+    // exercise — a flattened tally cannot say whether two reviewer entries were
+    // one round with two reviewers or two rounds with one. Same reasoning as
+    // park()'s cost ledger: honest nulls beat silently-missing rows.
+    rounds: rounds.filter(Boolean).map(reviewRoundRecord),
     ...(residual.length > 0 ? { residual_blocking: residual } : {}),
     ...(routingDegraded ? { routing_degraded: routingDegraded } : {}),
   };
+}
+
+// reviewRoundEmitCmd — the round history into the APPEND-ONLY raw lake
+// (temperloop#2131), one `kind:"review-round"` record per round, through
+// workflows/scripts/emit-issue-touch.sh — the same writer build.md's §3f/§4d
+// already use for this stream, extended (never forked) with the new kind. That
+// is what makes rounds-to-merge a QUERY: `issue-touches-YYYY-MM.jsonl` is
+// already the join surface for pr-open/merge touches, so rounds land beside the
+// PR's own open and merge timestamps and a rollup needs no GitHub call at all.
+//
+// The parked record (`review.rounds`) and this stream carry the SAME
+// reviewRoundRecord() objects — one producer, two sinks, so they cannot drift.
+//
+// FAIL-OPEN, like every other telemetry emit in this pipeline: each invocation
+// is `|| true`, the script itself never exits non-zero by contract (its own
+// WARN-DON'T-DROP header), and the count reported back is derived from what the
+// script actually PRINTED — a WARN-and-skip prints nothing, so a silently
+// dropped record is visible here as a `records` short of `rounds` rather than
+// laundered into a success.
+function reviewRoundEmitCmd(repo, issue, pr, rounds) {
+  const bin = machineryBin(input.repoRoot, '../emit-issue-touch.sh');
+  const lines = ['n=0'];
+  for (const rec of rounds) {
+    // ONE CONTIGUOUS `--kind review-round` in this source text, deliberately:
+    // workflows/scripts/validate-issue-touch-emit.sh reads THIS FILE as its
+    // second target and greps the flag/value pair as written, so splitting the
+    // flag from its value across array elements would leave the presence-lint
+    // structurally unable to see the wiring it exists to guard.
+    const args =
+      `--repo ${sq(repo)} --issue ${sq(String(issue))} --kind review-round ` +
+      `--round ${sq(String(rec.round ?? ''))} --round-kind ${sq(String(rec.kind ?? 'other'))} ` +
+      `--pr ${sq(String(pr ?? ''))} --sha ${sq(String(rec.sha ?? ''))} ` +
+      `--wall-ms ${sq(String(rec.wall_ms ?? ''))} --tokens ${sq(String(rec.tokens ?? ''))} ` +
+      `--reviewers ${sq(JSON.stringify(rec.reviewers ?? []))}`;
+    lines.push(`__rr="$(${bin} ${args} 2>/dev/null || true)"`);
+    lines.push('if [ -n "$__rr" ]; then n=$((n+1)); fi');
+  }
+  lines.push(
+    `printf '{"outcome":"REVIEW_ROUNDS_EMITTED","records":%s,"rounds":%s}\\n' "$n" ${sq(String(rounds.length))}`,
+  );
+  return lines.join('\n');
+}
+
+// emitReviewRounds — the call seam. Skipped entirely for an item with no
+// tracker issue (the stream is issue-keyed; a record with nothing to join on is
+// worse than no record) or with no rounds, so an un-issued item's drive is
+// byte-identical to before this feature. Never throws and never blocks the
+// park: a cost/telemetry ledger must not be the thing that stalls a build.
+async function emitReviewRounds(item, review, pr) {
+  const rounds = review && Array.isArray(review.rounds) ? review.rounds : [];
+  const repo = input.ownerRepo || '';
+  if (rounds.length === 0 || !item.ghIssue || !repo) return null;
+  try {
+    const out = await runMachinery(reviewRoundEmitCmd(repo, item.ghIssue, pr, rounds), {
+      label: `review-round:${item.slug}`,
+      slug: item.slug,
+      phase: stagePhase(STAGE_CI),
+    });
+    if (out && out.outcome === 'REVIEW_ROUNDS_EMITTED' && Number(out.records) === rounds.length) {
+      log(`[${item.slug}] §3e round telemetry — ${rounds.length} review-round record(s) appended to the issue-touch lake (temperloop#2131)`);
+    } else {
+      log(
+        `[${item.slug}] §3e round telemetry — DEGRADED: expected ${rounds.length} review-round record(s), ` +
+          `the emit reported ${JSON.stringify(out?.records ?? out?.outcome ?? out)}; the rounds still ride ` +
+          `the parked record's review.rounds (temperloop#2131)`,
+      );
+    }
+    return out;
+  } catch (err) {
+    log(`[${item.slug}] §3e round telemetry — emit threw, ignored (temperloop#2131): ${String((err && err.message) || err)}`);
+    return null;
+  }
 }
 
 // --- 3e.6. Class-A activation gate (temperloop#1219) -------------------------
@@ -6952,6 +7249,12 @@ async function driveItemPr(ctx) {
   }
   // temperloop#1450 — merge the ORIGINAL 3e pass with any CI-fix re-review — see build-level.design-notes-6.md#temperloop-1450-merge-the-original-3e-pass-with-any-ci-fix-r
   const reviewSummary = reviewTally(review, ...(ciResult.fixReviewRounds ?? []));
+  // temperloop#2131 — the round history into the raw lake, from the SAME
+  // reviewRoundRecord() objects the parked record below carries. Placed after
+  // the tally and before park() so the record set is final; fail-open, so a
+  // missing emit script or an unwritable lake degrades to a log line and the
+  // rounds still reach the merge gate on the parked record.
+  await emitReviewRounds(item, reviewSummary, pr);
   // temperloop#2065 — assemble the per-item cost ledger park() carries. Wa — see build-level.design-notes-6.md#temperloop-2065-assemble-the-per-item-cost-ledger-park-carri
   const cost = {
     tokens_in: mainCost.tokensIn,
@@ -7218,6 +7521,11 @@ async function ciPollLoop(item, ownerRepo, pr, initialSha, wt) {
             `(temperloop#1970): pushing the fix with them carried in ## Review notes instead of escalating again`,
         );
       }
+      // temperloop#2131 — the ROUND KIND for a CI-fix re-review round, decided
+      // by escalationRoundKind() (temperloop#2135, the ONE place the mapping is
+      // stated) rather than by a literal here: this round exists because CI
+      // failed, so it classifies exactly as the `ci-failed` escalation does.
+      fixReview.round_kind = escalationRoundKind('ci-failed');
       fixReviewRounds.push(fixReview);
       // Push the fixed SHA and pin the re-poll to it. This is a plain push — n — see build-level.design-notes-6.md#push-the-fixed-sha-and-pin-the-re-poll-to-it-this-is-a-plain
       const prBin = machineryBin(input.repoRoot, 'pr.sh');
