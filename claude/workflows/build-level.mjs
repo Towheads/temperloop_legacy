@@ -2420,7 +2420,28 @@ function preserveCommittedWorkCmd(wt, branch) {
     `    unique="$(git rev-list --count --cherry-pick --right-only --no-merges "HEAD...$remote_sha" 2>/dev/null || true)"`,
     `  fi`,
     `  case "$unique" in ''|*[!0-9]*) unique="" ;; esac`,
-    `  if [ "$unique" = 0 ]; then`,
+    // temperloop#2095 — the SECOND oracle, kept symmetric with pr.sh's
+    // content_superseded(). Patch-id equivalence cannot tell a genuine drop from
+    // a rebase, because a rebase shifts context lines and so changes the
+    // patch-id of a commit it replayed intact — and this rescue push runs on an
+    // escalation, i.e. after §3e.5 has just rebased. So a non-zero count hands
+    // off to a content test: merge the remote tip into HEAD in memory and ask
+    // whether the tree moved. Unchanged tree ⇒ the remote holds nothing HEAD
+    // lacks ⇒ the lease may be taken. A drop, an unrelated collision or a
+    // conflicting merge all still refuse, and a probe that cannot RUN (git
+    // without `merge-tree --write-tree`) keeps the patch-equivalence verdict.
+    `  contained=unknown`,
+    `  if [ -n "$unique" ] && [ "$unique" != 0 ]; then`,
+    `    __mt_rc=0`,
+    `    __mt="$(git merge-tree --write-tree HEAD "$remote_sha" 2>/dev/null)" || __mt_rc=$?`,
+    `    __ours="$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"`,
+    `    if [ "$__mt_rc" = 0 ] && [ -n "$__ours" ] && [ "$(printf '%s\\n' "$__mt" | awk 'NR==1 {print $1}')" = "$__ours" ]; then`,
+    `      contained=yes`,
+    `    else`,
+    `      contained=no`,
+    `    fi`,
+    `  fi`,
+    `  if [ "$unique" = 0 ] || [ "$contained" = yes ]; then`,
     `    if git push --force-with-lease="refs/heads/$branch:$remote_sha" origin "HEAD:refs/heads/$branch" >/dev/null 2>&1; then`,
     `      pushed=true; forced=true`,
     `    fi`,

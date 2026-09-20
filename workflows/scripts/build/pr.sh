@@ -416,6 +416,65 @@ pr_head_confirm() {
   jq -r '(.[0].number // "") | tostring' <<<"$out" 2>/dev/null || printf '%s\n' '?'
 }
 
+# content_superseded <worktree> <remote-sha> — the CONTENT-CONTAINMENT oracle
+# (temperloop#2095). Echoes `yes`, `no` or `unknown`; never fails its caller.
+#
+# WHY A SECOND ORACLE EXISTS AT ALL. The patch-equivalence probe below
+# (`rev-list --cherry-pick`) decides "is this remote commit already in our
+# history?" by PATCH-ID, and `git patch-id` hashes the diff BODY — context lines
+# included. A rebase onto a newer origin/<default> rewrites those context lines
+# whenever the advance touched anything within three lines of the item's own
+# hunk, so the rebased commit gets a DIFFERENT patch-id from the pre-rebase
+# commit the engine itself pushed one round earlier. `--cherry-pick` then counts
+# the engine's own work as unique remote work and the rewrite is refused. The
+# engine rebases on EVERY continuation round (§3e.5's pre-gate freshness step),
+# so this misfires on the COMMON path, not a rare one: the live sighting was
+# /fix 1650 round 2, where the "remote-only" commit's rebased equivalent changed
+# the same four files with the same +377/-1 and not one changed line differed.
+#
+# THE ORACLE. Patch-id asks about COMMITS; the question the gate actually needs
+# answered is about CONTENT: does HEAD already contain everything the remote tip
+# has? Merge the remote tip into HEAD in memory and compare trees. If the merge
+# adds nothing — the resulting tree IS HEAD's tree — then the remote holds no
+# content HEAD lacks, and rewriting the ref destroys nothing. That is invariant
+# under rebase, because a replayed commit's CONTENT is unchanged even when its
+# patch-id is not. `merge-tree --write-tree` does this with no index, no
+# checkout and no worktree mutation.
+#
+# WHAT IT STILL REFUSES, deliberately — the narrowing cmd_push's own comment
+# documents is preserved, not traded away:
+#   * a genuine DROP (round 2 rebases without a commit round 1 pushed): the
+#     merge re-introduces that commit's content, so the tree DIFFERS ⇒ `no`.
+#   * an unrelated branch-name collision: the merge brings in the foreign work,
+#     so the tree DIFFERS ⇒ `no`.
+#   * a merge that CONFLICTS (rc 1): the remote carries content that cannot even
+#     be reconciled with HEAD, which is the opposite of superseded ⇒ `no`.
+# Only a clean merge that changes nothing answers `yes`.
+#
+# `unknown` is reserved for a probe that could not RUN — a git too old for
+# `merge-tree --write-tree` (<2.38), unrelated histories with no merge base, an
+# unreadable tree. It is never an assertion either way; the caller keeps the
+# patch-equivalence verdict in that case, which is exactly the pre-#2095
+# behaviour, so an old git degrades to today's conservatism rather than to a
+# force it could not justify.
+content_superseded() {
+  local wt="$1" remote="$2" ours merged rc=0
+  ours="$(git -C "$wt" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+  case "$ours" in ''|*[!0-9a-f]*) printf '%s\n' unknown; return 0 ;; esac
+  merged="$(git -C "$wt" merge-tree --write-tree HEAD "$remote" 2>/dev/null)" || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    printf '%s\n' no
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' unknown
+    return 0
+  fi
+  merged="$(printf '%s\n' "$merged" | awk 'NR==1 {print $1}')"
+  case "$merged" in ''|*[!0-9a-f]*) printf '%s\n' unknown; return 0 ;; esac
+  if [ "$merged" = "$ours" ]; then printf '%s\n' yes; else printf '%s\n' no; fi
+}
+
 # --- push: 3f step 1 — push-by-SHA ---------------------------------------------
 # Push the worktree's HEAD to the plan branch by SHA, honoring the plan's
 # `branch:` name regardless of the worktree's throwaway build/<slug> local
@@ -500,7 +559,7 @@ pr_head_confirm() {
 cmd_push() {
   local wt branch force="$1" sha out effective_force lease_arg lease_sha rc
   local survey lookup match_pr sibling_pr sibling_ref sibling_url confirm forced_json msg
-  local unique refused_reason refusal
+  local unique refused_reason refusal contained supersede_basis
   wt="$(resolve_worktree "$2")"
   branch="$3"
   validate_branch "$branch"
@@ -510,6 +569,7 @@ cmd_push() {
   lease_sha=""
   unique=""
   refused_reason=""
+  supersede_basis=""
   if [ -n "$force" ]; then
     # READ the remote ref's current value first — the lease's expected value.
     # The fetch is preferred because it also brings the object local, which is
@@ -595,11 +655,36 @@ cmd_push() {
       # human decision and is fully recoverable; the overwrite it replaces is not.
       unique="$(git -C "$wt" rev-list --count --cherry-pick --right-only --no-merges "HEAD...$lease_sha" 2>/dev/null || true)"
       case "$unique" in ''|*[!0-9]*) unique="" ;; esac
+      #
+      # temperloop#2095 — AND THE SECOND ORACLE, because patch-id alone cannot
+      # tell a genuine drop from a REBASE. `--cherry-pick` compares patch-ids,
+      # and a rebase onto a newer origin/<default> shifts context lines, which
+      # changes the patch-id of a commit it replayed intact. The engine rebases
+      # on EVERY continuation round, so the pre-rebase commit the engine ITSELF
+      # pushed last round is counted as unique remote work and this gate refuses
+      # the push it exists to allow — on the common path, not the rare one.
+      # So a non-zero count is no longer the last word: it hands off to
+      # content_superseded() above, which answers the question the gate actually
+      # needs — does HEAD already CONTAIN the remote tip's content? — by merging
+      # the remote tip into HEAD in memory and asking whether the tree moved.
+      # A genuine drop, an unrelated collision and a conflicting remote all still
+      # answer `no` and still refuse; only a clean merge that changes nothing
+      # opens the gate. `unknown` (a git too old for `merge-tree --write-tree`,
+      # unrelated histories) keeps the patch-equivalence verdict, i.e. the
+      # pre-#2095 refusal — an unanswerable second probe never widens the gate.
       if [ "$unique" = 0 ]; then
         effective_force=1
         lease_arg="--force-with-lease=refs/heads/$branch:$lease_sha"
+        supersede_basis="patch-equivalence"
       elif [ -n "$unique" ]; then
-        refused_reason="remote_not_superseded"
+        contained="$(content_superseded "$wt" "$lease_sha")"
+        if [ "$contained" = yes ]; then
+          effective_force=1
+          lease_arg="--force-with-lease=refs/heads/$branch:$lease_sha"
+          supersede_basis="content-containment"
+        else
+          refused_reason="remote_not_superseded"
+        fi
       else
         refused_reason="supersede_probe_failed"
       fi
@@ -645,10 +730,17 @@ cmd_push() {
     # `lease` records the remote value the force was leased against, so the
     # rewrite is auditable after the fact (temperloop#2103); null on every
     # non-forced push, where nothing was leased.
+    # `supersede_basis` (temperloop#2095) names WHICH oracle let the rewrite
+    # through — `patch-equivalence` (the remote's commits are patch-identical to
+    # ours) or `content-containment` (they are not, but merging the remote tip
+    # into HEAD moves no tree, the rebased-continuation case). Null on every
+    # non-forced push, where no supersede question was asked.
     jq -cn --arg sha "$sha" --arg branch "$branch" --argjson forced "$forced_json" \
        --arg lookup "$lookup" --arg pr "$match_pr" --arg lease "$lease_sha" \
+       --arg basis "$supersede_basis" \
       '{outcome:"PUSHED", sha:$sha, branch:$branch, forced:$forced,
         lease:(if $forced then $lease else null end),
+        supersede_basis:(if $forced and $basis != "" then $basis else null end),
         pr_lookup:$lookup, pr_number:(if $pr == "" then null else ($pr|tonumber) end)}'
   else
     # `forced`/`lease`/`refused_reason` on the rejection too, so a reader can
@@ -675,6 +767,16 @@ cmd_push() {
         refusal="${refusal} this worktree's history does not, so the local history does NOT supersede it."
         refusal="${refusal} This is a genuine content collision — a leftover branch, a reused slug or a planning bug —"
         refusal="${refusal} NOT the stale pre-rebase copy of this same work that --allow-rewrite exists to land."
+        # Say which of the two oracles carried the refusal (temperloop#2095), so
+        # a reader is never told a containment claim that was never established.
+        if [ "$contained" = no ]; then
+          refusal="${refusal} BOTH oracles agree: the commits are not patch-equivalent, AND merging origin's tip into"
+          refusal="${refusal} this worktree's HEAD would change the tree — so origin carries content HEAD does not,"
+          refusal="${refusal} which a rebase alone can never produce."
+        else
+          refusal="${refusal} The content-containment cross-check could not RUN here (an unsupported git, or no common"
+          refusal="${refusal} history), so this rests on patch-equivalence alone — which a rebase can invalidate."
+        fi
       else
         refusal="REFUSED to rewrite refs/heads/${branch}: could not establish whether this worktree's history"
         refusal="${refusal} supersedes origin's tip ${lease_sha} (its object is not available locally, so the"
