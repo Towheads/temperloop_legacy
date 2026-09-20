@@ -3083,6 +3083,43 @@ function reviewHasBlockingFinding(text) {
   return /^\s*###\s*\[\s*HIGH\b/im.test(String(text ?? ''));
 }
 
+// --- §3e.5 PROSE-ONLY GATE SKIP (temperloop#2138) ----------------------------
+// THE WASTE THIS CLOSES. A §3e round whose ONLY blocking findings came from
+// docs-reviewer changed prose and nothing else, so re-running the parent-side
+// acceptance gate re-pays ~20 minutes of suite wall time for an input set that
+// did not move. This is the GATE half only; the roster half — re-running only
+// the seats whose routed files actually changed — is reviewCarryForward()'s
+// (temperloop#2129), and nothing here re-derives seat selection beside it.
+//
+// FAIL CLOSED, DELIBERATELY. This predicate decides whether an acceptance gate
+// is SKIPPED, so a false positive is strictly worse than the waste it saves: a
+// branch that needed the gate reaches the merge gate looking verified. It
+// therefore reads true ONLY from a POSITIVELY ESTABLISHED docs-reviewer-only
+// blocking set. Every uncertain shape — no review object, a `blocking` that is
+// not an array, an EMPTY blocking set (nothing was established about this
+// round at all), a non-object entry, an entry with no `reviewer` string, a
+// blank seat name, or any seat that is not exactly PROSE_ONLY_REVIEWER —
+// returns false and the gate runs exactly as it does today.
+//
+// It reads `blocking[]` — the `{ reviewer, findings }` records runReviewers()
+// already builds per seat — rather than re-deriving seat attribution from the
+// findings TEXT a second way: a substring match over prose is precisely the
+// loose test that would turn a mention of `docs-reviewer` inside a shell
+// reviewer's finding into a skipped gate.
+const PROSE_ONLY_REVIEWER = 'docs-reviewer';
+function proseOnlyRound(review) {
+  if (!review || typeof review !== 'object') return false;
+  const blocking = review.blocking;
+  if (!Array.isArray(blocking) || blocking.length === 0) return false;
+  return blocking.every(
+    (b) =>
+      b !== null &&
+      typeof b === 'object' &&
+      typeof b.reviewer === 'string' &&
+      b.reviewer.trim() === PROSE_ONLY_REVIEWER,
+  );
+}
+
 // --- §3e ROUND TELEMETRY (temperloop#2131) -----------------------------------
 // The §3e round history, put where it can be QUERIED: park()'s `review.rounds`
 // (the parked record the merge gate reads), the issue-touches raw lake (one
@@ -6036,7 +6073,23 @@ async function driveItemBuildPhase(item, arm, box) {
   // gateSliceCeiling — the EFFECTIVE loop bound, starting at GATE_MAX_SLIC — see build-level.design-notes-5.md#gatesliceceiling-the-effective-loop-bound-starting-at-gate-m
   let gateSliceCeiling = GATE_MAX_SLICES;
   let gateExtensionsUsed = 0;
-  for (; gateSlices < gateSliceCeiling; gateSlices++) {
+  // temperloop#2138 — THE PROSE-ONLY SKIP. Decided ONCE, before the first
+  // slice, off this round's own blocking set (see proseOnlyRound above for the
+  // fail-closed rule). `gateSkipped` short-circuits the slice loop itself, so
+  // `scripts/quality-gates.sh` is never invoked at all — not invoked and
+  // discarded — and it is the ONLY way this run reaches the verdict below with
+  // `gateOut` still null, which is why every reader of `gateOut` past this
+  // point is guarded on it.
+  const gateSkipped = proseOnlyRound(review);
+  if (gateSkipped) {
+    log(
+      `[${item.slug}] 3e.5 acceptance gate SKIPPED (temperloop#2138) — every blocking finding in §3e round ` +
+        `${review.round} came from ${PROSE_ONLY_REVIEWER} ` +
+        `(${review.blocking.length} finding(s)), so the gate's inputs did not change. The findings themselves ` +
+        `are carried to the PR body's ## Review notes exactly as they would be had the gate run.`,
+    );
+  }
+  for (; !gateSkipped && gateSlices < gateSliceCeiling; gateSlices++) {
     gateOut = await runMachinery(gateCmd(gateStartAt, gateSelection), {
       label: `gate:${item.slug}`,
       slug: item.slug,
@@ -6105,8 +6158,22 @@ async function driveItemBuildPhase(item, arm, box) {
   }
 
   // ONE verdict, derived once from the ledger (temperloop#1587), and ONE — see build-level.design-notes-5.md#one-verdict-derived-once-from-the-ledger-temperloop-158
-  const gateReport = gateVerdict(gateOut.outcome, gateSliceLedger);
-  const gatePayload = {
+  // temperloop#2138 — a skipped gate reports SKIPPED, never GREEN. Claiming a
+  // pass for a suite that did not run is the fail-open shape this whole item is
+  // written against; `finished: false` keeps it out of every "the suite passed"
+  // read, and the RED/UNKNOWN escalation arms below match neither verdict, so a
+  // skipped run proceeds to 3e.6 without inventing an outcome.
+  const gateReport = gateSkipped
+    ? {
+      verdict: 'SKIPPED',
+      finished: false,
+      failedGates: 0,
+      failedInSlices: [],
+      reason: `the acceptance gate did not run: §3e round ${review.round}'s blocking findings were all ` +
+        `${PROSE_ONLY_REVIEWER}'s, so the gate's inputs did not change (temperloop#2138)`,
+    }
+    : gateVerdict(gateOut.outcome, gateSliceLedger);
+  const gatePayload = gateSkipped ? null : {
     // `verdict` is the field to trust: RED / UNKNOWN / GREEN. `outcome` is t — see build-level.design-notes-5.md#verdict-is-the-field-to-trust-red-unknown-green-outcome-is-t
     verdict: gateReport.verdict,
     outcome: gateOut.outcome,
@@ -6127,7 +6194,7 @@ async function driveItemBuildPhase(item, arm, box) {
     workerGate: workerGateState(gateOut),
   };
   // temperloop#865 — THE LOUD HALF. A worker that backgrounded its gate an — see build-level.design-notes-5.md#temperloop-865-the-loud-half-a-worker-that-backgrounded-its-
-  const wgState = gatePayload.workerGate;
+  const wgState = gatePayload?.workerGate;
   if (wgState === 'running') {
     log(
       `[${item.slug}] WORKER GATE NEVER FINISHED (temperloop#865) — the worker's own scoped-gate sentinel at ` +
@@ -6182,7 +6249,7 @@ async function driveItemBuildPhase(item, arm, box) {
     return escalate(item.slug, 'acceptance-gate-failed', gatePayload);
   }
   // GATE_PASS or GATE_ABSENT → proceed. Report the MARGIN, not just the ve — see build-level.design-notes-5.md#gate-pass-or-gate-absent-proceed-report-the-margin-not-
-  if (gateOut.outcome === 'GATE_PASS') {
+  if (!gateSkipped && gateOut.outcome === 'GATE_PASS') {
     // temperloop#1698 — render an unknown total as `?`, never as a number. T — see build-level.design-notes-6.md#temperloop-1698-render-an-unknown-total-as-never-as-a-n
     const marginNote = gateSlices > 0 || (!gateElapsedUnknown && gateElapsed >= GATE_SLICE_SECS * GATE_MARGIN_WARN_RATIO)
       ? ` — NOTE: approaching the per-slice budget; raise BUILD_GATE_SLICE_SECS or split the gate list before it costs a re-slice`
@@ -6219,7 +6286,10 @@ async function driveItemBuildPhase(item, arm, box) {
     wtBase,
     wtGuard,
     gateReport,
-    gateElapsedSecs: gateElapsedUnknown ? null : gateElapsed,
+    // temperloop#2138 — a SKIPPED gate spent no wall time; report that as the
+    // same honest `null` temperloop#1698 uses for an unknown figure, never 0,
+    // which would read as "the suite ran and was instant".
+    gateElapsedSecs: (gateSkipped || gateElapsedUnknown) ? null : gateElapsed,
   };
   return null;
 }
