@@ -18,8 +18,8 @@ A comment is not automatically prose. Derive the exclusion set mechanically from
 `grep ... "$MJS"` literals in `test_workflow.sh`, and note its blind spot: a pin
 added by a branch not yet on main is invisible to that derivation.
 
-> **Part 3 of 6.** Split to stay under the per-file prose cap
-> (`PROSE_BUDGET_TIER2_FILE_CAP`). Other parts: [`build-level.design-notes.md`](build-level.design-notes.md), [`build-level.design-notes-2.md`](build-level.design-notes-2.md), [`build-level.design-notes-4.md`](build-level.design-notes-4.md), [`build-level.design-notes-5.md`](build-level.design-notes-5.md), [`build-level.design-notes-6.md`](build-level.design-notes-6.md).
+> **Part 3 of 7.** Split to stay under the per-file prose cap
+> (`PROSE_BUDGET_TIER2_FILE_CAP`). Other parts: [`build-level.design-notes.md`](build-level.design-notes.md), [`build-level.design-notes-2.md`](build-level.design-notes-2.md), [`build-level.design-notes-4.md`](build-level.design-notes-4.md), [`build-level.design-notes-5.md`](build-level.design-notes-5.md), [`build-level.design-notes-6.md`](build-level.design-notes-6.md), [`build-level.design-notes-7.md`](build-level.design-notes-7.md).
 
 ## Bring the remote tip's objects local so the supersede test can run at
 <a id="bring-the-remote-tip-s-objects-local-so-the-supersede-test-c"></a>

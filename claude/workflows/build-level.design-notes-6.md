@@ -18,8 +18,8 @@ A comment is not automatically prose. Derive the exclusion set mechanically from
 `grep ... "$MJS"` literals in `test_workflow.sh`, and note its blind spot: a pin
 added by a branch not yet on main is invisible to that derivation.
 
-> **Part 6 of 6.** Split to stay under the per-file prose cap
-> (`PROSE_BUDGET_TIER2_FILE_CAP`). Other parts: [`build-level.design-notes.md`](build-level.design-notes.md), [`build-level.design-notes-2.md`](build-level.design-notes-2.md), [`build-level.design-notes-3.md`](build-level.design-notes-3.md), [`build-level.design-notes-4.md`](build-level.design-notes-4.md), [`build-level.design-notes-5.md`](build-level.design-notes-5.md).
+> **Part 6 of 7.** Split to stay under the per-file prose cap
+> (`PROSE_BUDGET_TIER2_FILE_CAP`). Other parts: [`build-level.design-notes.md`](build-level.design-notes.md), [`build-level.design-notes-2.md`](build-level.design-notes-2.md), [`build-level.design-notes-3.md`](build-level.design-notes-3.md), [`build-level.design-notes-4.md`](build-level.design-notes-4.md), [`build-level.design-notes-5.md`](build-level.design-notes-5.md), [`build-level.design-notes-7.md`](build-level.design-notes-7.md).
 
 ## The surface-file flag is DROPPED on a recovery whose probe saw no
 <a id="the-surface-file-flag-is-dropped-on-a-recovery-whose-probe-s"></a>
