@@ -62,7 +62,32 @@
 # checksum implementations to a byte-accurate encoding together.
 #
 # Two rows may name the SAME reviewer for different extensions (.ts and .js
-# both -> typescript-reviewer) — that is not a duplicate claim.
+# both -> typescript-reviewer) — that is not a duplicate claim. The converse
+# also holds and is now used: TWO rows may name DIFFERENT reviewers for keys
+# that both match the SAME file. `.mjs` -> typescript-reviewer and
+# `**/build-level.mjs` -> shell-reviewer both match
+# claude/workflows/build-level.mjs, and build.md 3e's run-both multi-match
+# rule runs each of them. That is the intended shape, not a collision: the
+# duplicate-claim invariant above is about one KEY claimed twice, never about
+# one FILE routed to two reviewers.
+#
+# WHY build-level.mjs CARRIES A SECOND, SHELL SEAT (temperloop#2129). That
+# file is the /build driver, and a large fraction of what it *produces* is
+# shell: reviewDiffCmd(), the gate/PR/CI machinery commands, the activation
+# proof wrapper are all bash emitted as JS template strings and executed
+# verbatim by a machinery executor. Every shell defect class shell-reviewer
+# owns (quoting, `set -e` blind spots, BSD-vs-GNU dialect drift, pipe
+# exit-code loss) is reachable in that emitted text, and the typescript seat
+# reviews it as JavaScript string literals — which is exactly what it is, and
+# exactly why it does not read the shell. Both seats are therefore routed.
+# The key is a BASENAME row rather than a `.mjs` extension row on purpose:
+# the evidence (churn + blast radius) is about THIS file, and routing every
+# `.mjs` in the fleet to a shell reviewer would be the over-match the
+# one-file-at-a-time rule above forbids. shell-reviewer's own definition
+# (claude/agents/reviewers/shell-reviewer.md § Scope) states the emitted-shell
+# case and tells the seat to review the emitted strings, not the host
+# language — the row and that scope paragraph are a pair; neither is
+# correct alone.
 #
 # The seven-language roster (ADR 0007) ships as an INERT kernel catalog —
 # claude/agents/reviewers/<name>.md is the planned catalog location; an
@@ -79,3 +104,4 @@
 .swift	swift-reviewer	claude/agents/reviewers/swift-reviewer.md
 docs/**	docs-reviewer	claude/agents/docs-reviewer.md
 **/Makefile	shell-reviewer	claude/agents/reviewers/shell-reviewer.md
+**/build-level.mjs	shell-reviewer	claude/agents/reviewers/shell-reviewer.md

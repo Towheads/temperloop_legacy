@@ -12,7 +12,26 @@
 # silently drift apart:
 #
 #   1. Structural: no extension/glob key in the tsv is claimed by two rows
-#      (the tsv's own internal duplicate-claim invariant).
+#      (the tsv's own internal duplicate-claim invariant). NOTE what this
+#      is NOT: two DIFFERENT keys that both match the same FILE are legal,
+#      and are now in use — `.mjs` -> typescript-reviewer alongside
+#      `**/build-level.mjs` -> shell-reviewer (temperloop#2129), which
+#      build.md 3e's run-both multi-match rule runs together. The invariant
+#      is one KEY claimed twice, never one FILE routed twice, so this check
+#      compares key STRINGS and deliberately never computes key overlap.
+#   1b. ASCII: every DATA row is pure ASCII (every byte below 0x80). The tsv
+#      header states this constraint in prose and, until temperloop#2129,
+#      nothing checked it. It is load-bearing, not cosmetic:
+#      claude/workflows/build-level.mjs's review-diff relay guard compares a
+#      checksum computed TWICE over these same rows -- once in bash over
+#      od-reported UTF-8 BYTE values, once in JS over UTF-16 code units via
+#      charCodeAt -- and the two agree only while every character is below
+#      0x80. One accented name or smart quote in a data row silently desyncs
+#      them and can fire a spurious content_mismatch escalation on a
+#      perfectly faithful relay copy, which then reads as routing-table
+#      corruption rather than as the typo it is. Comment lines are excluded
+#      here exactly as they are from both checksums (the header already
+#      carries em dashes safely, for that reason).
 #   2. Citation: build.md's 3e section names reviewer-routing.tsv by path,
 #      so a reader lands on the real source of truth.
 #   3. Set-membership (the ADR 0008 D3-shaped check, `check-setting-prose.sh`
@@ -102,6 +121,23 @@ for i in "${!keys[@]}"; do
   done
 done
 
+# --- 1b. ASCII: every DATA row is pure ASCII (see header, check 1b) --------
+# BYTE-exact and dialect-free on purpose: strip every byte in the ASCII
+# range and see whether anything survives. Under LC_ALL=C (exported at the
+# top of this script) `tr -d` is a byte filter on BSD and GNU alike, so this
+# needs no `grep -P`, no locale-dependent character class, and no
+# `[^\x00-\x7F]` escape BSD basic-regex would read literally. Checked per
+# row rather than over the whole file so the message can name the offender.
+for i in "${!keys[@]}"; do
+  ascii_residue="$(printf '%s\t%s\t%s' "${keys[$i]}" "${reviewers[$i]}" "${agent_paths[$i]}" \
+    | LC_ALL=C tr -d '\000-\177')"
+  if [ -n "$ascii_residue" ]; then
+    printf 'NON-ASCII: row %s (-> %s) carries a non-ASCII character — the bash and JS relay checksums disagree above 0x7F, so this can fire a spurious content_mismatch on a faithful relay copy\n' \
+      "${keys[$i]}" "${reviewers[$i]}"
+    violations=$((violations + 1))
+  fi
+done
+
 # --- isolate build.md's 3e section (from "#### 3e." to the next "#### ") ---
 section_file="$(mktemp)"
 trap 'rm -f "$section_file"' EXIT
@@ -139,4 +175,4 @@ if [ "$violations" -gt 0 ]; then
   echo "FAIL: $violations reviewer-routing violation(s)" >&2
   exit 1
 fi
-echo "OK — reviewer-routing.tsv (${#keys[@]} extension/glob row(s)) and build.md's 3e prose agree: no duplicate keys, tsv cited, no route restated in prose"
+echo "OK — reviewer-routing.tsv (${#keys[@]} extension/glob row(s)) and build.md's 3e prose agree: no duplicate keys, all data rows ASCII, tsv cited, no route restated in prose"
