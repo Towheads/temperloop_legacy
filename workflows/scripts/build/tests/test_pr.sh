@@ -448,6 +448,111 @@ esac
   || fail "#2103: THE COLLIDING BRANCH WAS OVERWRITTEN — unrelated work on origin/fix/collide was destroyed"
 echo "PASS: a branch-name collision with unrelated content REFUSES and leaves origin untouched, distinguishably (#2103)"
 
+# --- push: a CONTEXT-SHIFTING rebase is still superseded (temperloop#2095) --------
+# THE FALSE POSITIVE THIS BLOCK PINS. The rebased-continuation block above passes
+# only because its round-1 commit and the sibling that advanced main touch
+# DIFFERENT files, so the rebase replays the commit byte-identically and its
+# patch-id survives. That is the lucky case. `git patch-id` hashes the diff
+# BODY — context lines included — so the moment the sibling's change lands within
+# three lines of the item's own hunk, the rebased commit's patch-id CHANGES even
+# though it applied cleanly and dropped nothing. `rev-list --cherry-pick` then
+# counts the engine's OWN round-1 commit as unique remote work and refuses the
+# push it is supposed to allow. The engine rebases on EVERY continuation round,
+# so this fires on the common path, not the rare one (live: /fix 1650 round 2 —
+# remote tip carried 1 "remote-only" commit whose rebased equivalent changed the
+# same 4 files with the same +377/-1, and the refusal was pure false positive).
+#
+# The fixture makes the context shift explicit: round 1 edits the LAST line of a
+# shared file, the sibling that merges into main edits a line three above it, and
+# the rebase therefore rewrites round 1's context. Nothing is dropped.
+git -C "$REPO" fetch -q origin
+git -C "$REPO" checkout -q -B ctx-seed origin/main
+printf 'L1\nL2\nL3\nL4\nL5\nL6\n' > "$REPO/shared.txt"
+git -C "$REPO" add -A -- shared.txt
+git -C "$REPO" commit -q -m "seed the shared file"
+git -C "$REPO" push -q origin HEAD:main
+git -C "$REPO" fetch -q origin
+git -C "$REPO" checkout -q -B ctxcont origin/main
+printf 'L1\nL2\nL3\nL4\nL5\nL6 ROUND1\n' > "$REPO/shared.txt"
+git -C "$REPO" commit -q -am "continuation round 1 — edits the tail of shared.txt"
+out="$(PATH="$NOGH:$PATH" bash "$SCRIPT" push "$REPO" fix/ctxcont)"
+[ "$(jq -r .outcome <<<"$out")" = "PUSHED" ] || fail "fixture setup: ctx round-1 push (got: $out)"
+ctx_round1="$(git -C "$REPO" rev-parse HEAD)"
+# origin/main advances with a change INSIDE round 1's context window.
+git -C "$REPO" checkout -q -B ctxadvancer origin/main
+printf 'L1\nL2\nL3\nL4 SIBLING\nL5\nL6\n' > "$REPO/shared.txt"
+git -C "$REPO" commit -q -am "sibling item edits shared.txt inside round 1's context"
+git -C "$REPO" push -q origin HEAD:main
+git -C "$REPO" checkout -q ctxcont
+out="$(PATH="$NOGH:$PATH" bash "$SCRIPT" rebase "$REPO")"
+[ "$(jq -r .outcome <<<"$out")" = "REBASED" ] || fail "fixture setup: ctx 3f-0a rebase (got: $out)"
+ctx_rebased="$(git -C "$REPO" rev-parse HEAD)"
+# Fixture assertion, so a future git that preserved patch-ids across a context
+# shift would fail LOUDLY here rather than silently turn this block vacuous.
+[ "$(git -C "$REPO" rev-list --count --cherry-pick --right-only --no-merges "HEAD...$ctx_round1")" != "0" ] \
+  || fail "#2095: fixture no longer produces a patch-id shift — this block would prove nothing"
+# Nothing was dropped: every line round 1 added is still in the rebased tree.
+grep -q 'L6 ROUND1' "$REPO/shared.txt" \
+  || fail "#2095: fixture error — the rebase did not preserve round 1's work"
+rc=0; out="$(PATH="$NOGH:$PATH" bash "$SCRIPT" push "$REPO" fix/ctxcont --allow-rewrite)" || rc=$?
+[ "$rc" -eq 0 ] \
+  || fail "#2095: a rebase that PRESERVED every pushed commit must be allowed to push (got: $out)"
+[ "$(jq -r .outcome <<<"$out")" = "PUSHED" ] \
+  || fail "#2095: a context-shifting but fully-preserving rebase must be PUSHED, not refused (got: $out)"
+[ "$(jq -r .refused_reason <<<"$out")" = "null" ] \
+  || fail "#2095: a preserved rebase must carry NO refusal reason (got: $out)"
+[ "$(jq -r .forced <<<"$out")" = "true" ] \
+  || fail "#2095: the preserved rebase must land as a LEASED force (got: $out)"
+[ "$(jq -r .lease <<<"$out")" = "$ctx_round1" ] \
+  || fail "#2095: the force must be leased against the value read from origin (got: $out)"
+[ "$(jq -r .supersede_basis <<<"$out")" = "content-containment" ] \
+  || fail "#2095: the payload must name WHICH oracle allowed the rewrite (got: $out)"
+[ "$(git -C "$BARE" rev-parse refs/heads/fix/ctxcont)" = "$ctx_rebased" ] \
+  || fail "#2095: the rebased tip did not land on origin"
+echo "PASS: a context-shifting rebase that preserved every pushed commit is allowed to push (#2095)"
+
+# --- push: a GENUINE drop is still refused (temperloop#2095) ----------------------
+# The other half, and the one that keeps the fix from being a regression. The
+# probe's own comment documents the conservative narrowing deliberately: a
+# continuation round that DROPS a commit an earlier round pushed must not rewrite
+# unattended — it refuses and escalates for triage. Loosening the oracle for the
+# rebase case must not loosen it for this one, so the same fixture shape is run
+# with one of round 1's commits genuinely dropped.
+git -C "$REPO" fetch -q origin
+git -C "$REPO" checkout -q -B dropcont origin/main
+printf 'keep me\n' > "$REPO/keep.txt"
+git -C "$REPO" add -A -- keep.txt
+git -C "$REPO" commit -q -m "round 1 commit A — kept"
+drop_keep="$(git -C "$REPO" rev-parse HEAD)"
+printf 'do not lose me\n' > "$REPO/dropped.txt"
+git -C "$REPO" add -A -- dropped.txt
+git -C "$REPO" commit -q -m "round 1 commit B — the one round 2 drops"
+out="$(PATH="$NOGH:$PATH" bash "$SCRIPT" push "$REPO" fix/dropcont)"
+[ "$(jq -r .outcome <<<"$out")" = "PUSHED" ] || fail "fixture setup: drop round-1 push (got: $out)"
+drop_round1="$(git -C "$REPO" rev-parse HEAD)"
+# origin/main advances, then round 2 rebases only commit A — commit B is gone.
+git -C "$REPO" checkout -q -B dropadvancer origin/main
+printf 'another sibling\n' > "$REPO/sibling2.txt"
+git -C "$REPO" add -A -- sibling2.txt
+git -C "$REPO" commit -q -m "sibling item 2"
+git -C "$REPO" push -q origin HEAD:main
+git -C "$REPO" fetch -q origin
+git -C "$REPO" checkout -q -B dropcont "$drop_keep"
+git -C "$REPO" rebase -q origin/main
+[ ! -e "$REPO/dropped.txt" ] || fail "#2095: fixture error — commit B was not actually dropped"
+rc=0; out="$(PATH="$NOGH:$PATH" bash "$SCRIPT" push "$REPO" fix/dropcont --allow-rewrite)" || rc=$?
+[ "$rc" -ne 0 ] \
+  || fail "#2095: a continuation that DROPS a pushed commit must NOT rewrite unattended (got: $out)"
+[ "$(jq -r .outcome <<<"$out")" = "PUSH_REJECTED" ] \
+  || fail "#2095: a genuine drop must stay a structured PUSH_REJECTED (got: $out)"
+[ "$(jq -r .forced <<<"$out")" = "false" ] \
+  || fail "#2095: a refused drop must issue NO force at all (got: $out)"
+[ "$(jq -r .refused_reason <<<"$out")" = "remote_not_superseded" ] \
+  || fail "#2095: a genuine drop must still be refused as remote_not_superseded (got: $out)"
+[ "$(git -C "$BARE" rev-parse refs/heads/fix/dropcont)" = "$drop_round1" ] \
+  || fail "#2095: THE DROPPED COMMIT WAS OVERWRITTEN — origin/fix/dropcont lost work"
+echo "PASS: a continuation that genuinely drops a pushed commit is STILL refused and escalated (#2095)"
+
 # --- push: the lease is LOAD-BEARING — a moved remote is rejected, not clobbered ---
 # The discriminating test for temperloop#2103's "lease-guarded, never unguarded"
 # bar. A bare `--force` would land here and destroy whatever the remote gained
@@ -565,6 +670,25 @@ echo "PASS: pr.sh forces only through --force-with-lease=<ref>:<sha> over a valu
 grep -q -- '--cherry-pick --right-only --no-merges' "$SCRIPT" \
   || fail "#2103: cmd_push must gate a requested rewrite on the patch-equivalence supersede probe (git cherry's own test), not on the lease alone"
 echo "PASS: a requested rewrite is gated on the supersede probe, symmetric with the rescue push (#2103)"
+
+# --- push: the supersede gate carries BOTH oracles, at both sites (#2095) --------
+# The functional blocks above prove the behaviour; this is the static floor under
+# them. Patch-equivalence alone cannot distinguish a genuine drop from a rebase,
+# and a future edit that removes the content-containment cross-check restores a
+# refusal on the pipeline's COMMON path while every #2103 fixture still passes.
+# The rescue push in build-level.mjs must carry the same second oracle for the
+# same reason — the asymmetry between the two push sites is exactly what
+# temperloop#2103 review round 2 caught, and it must not re-open here.
+grep -q 'merge-tree --write-tree' "$SCRIPT" \
+  || fail "#2095: cmd_push must cross-check a non-zero patch-equivalence count against the content-containment oracle (merge-tree --write-tree), or a rebase reads as a dropped commit"
+grep -q 'content_superseded()' "$SCRIPT" \
+  || fail "#2095: pr.sh must define content_superseded() — the one place the containment oracle's tri-state (yes/no/unknown) is decided"
+MJS_PRESERVE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)/claude/workflows/build-level.mjs"
+if [ -f "$MJS_PRESERVE" ]; then
+  awk '/^function preserveCommittedWorkCmd\(/,/^}$/' "$MJS_PRESERVE" | grep 'merge-tree --write-tree' >/dev/null \
+    || fail "#2095: build-level.mjs's rescue push must carry the SAME content-containment oracle — an escalated, already-rebased item would otherwise report WORK_PRESERVE_FAILED over fully superseded work"
+fi
+echo "PASS: both push sites cross-check patch-equivalence against content containment (#2095)"
 
 # --- push: the open-PR survey (temperloop#1688) -----------------------------------
 # The live 2026-08-21 shape: the worktree's local branch is `build/<slug>` while

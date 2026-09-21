@@ -9703,7 +9703,7 @@ console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
 #   name — the round-3 MEDIUM: pushing HEAD under its local name mints a second,
 #   PR-less `build/<slug>` ref on every post-3f escalation.
 # ============================================================================
-run_node_case "K2020/K2103 preserve bash: the REAL generated shell (executed, not mocked) preserves an unpushed commit to origin under the PLAN's branch, skips a clean tree, reports a failed push, handles a missing worktree, resolves default without origin/HEAD, pushes rather than skipping when the base is unresolvable, is idempotent, LANDS a rebased branch already on origin under a lease over a value it read first, REFUSES to overwrite a remote carrying work this worktree does not have, and REFUSES WITHOUT CLAIMING A CONFLICT when the supersede probe cannot be answered" "
+run_node_case "K2020/K2103 preserve bash: the REAL generated shell (executed, not mocked) preserves an unpushed commit to origin under the PLAN's branch, skips a clean tree, reports a failed push, handles a missing worktree, resolves default without origin/HEAD, pushes rather than skipping when the base is unresolvable, is idempotent, LANDS a rebased branch already on origin under a lease over a value it read first, REFUSES to overwrite a remote carrying work this worktree does not have, and REFUSES WITHOUT CLAIMING A CONFLICT when the supersede probe cannot be answered, PRESERVES a context-shifting rebase whose patch-ids all changed but which dropped nothing, and STILL REFUSES a continuation that genuinely dropped a pushed commit" "
 $PREAMBLE
 const { execFileSync } = await import('node:child_process');
 const { mkdtempSync, rmSync, writeFileSync, chmodSync } = await import('node:fs');
@@ -9947,6 +9947,73 @@ if (internalsSrc === MJS_SRC) {
       else if (j.remote_sha !== theirsJ) reason = 'J: the refusal must still report the remote value it read, got ' + JSON.stringify(j);
       else if (sh(G + ' --git-dir=' + root + '/origin.git rev-parse refs/heads/fix/wtj').trim() !== theirsJ) reason = 'J: THE REFUSAL DID NOT HOLD — origin fix/wtj was overwritten on a probe that never answered';
     }
+
+    // --- K: A CONTEXT-SHIFTING REBASE IS STILL SUPERSEDED (temperloop#2095) --
+    // Arm H's rebase is the LUCKY one: its item commit and the sibling that
+    // advanced main touch different files, so the replay is byte-identical and
+    // the commit's patch-id survives. \`git patch-id\` hashes the diff BODY,
+    // context lines included, so the moment the advance lands within three lines
+    // of the item's own hunk the rebased commit gets a NEW patch-id although it
+    // dropped nothing — and the supersede probe counts the engine's OWN
+    // round-1 commit as unique remote work and refuses. §3e.5 rebases on EVERY
+    // continuation round, so this is the common path: the item reports
+    // WORK_PRESERVE_FAILED / preserved:false over work that is fully superseded.
+    if (!reason) {
+      writeFileSync(root + '/seed/shared.txt', 'L1\\nL2\\nL3\\nL4\\nL5\\nL6\\n');
+      sh('cd seed && ' + G + ' add -A && ' + G + ' commit -q -m seed-shared && ' + G + ' push -q origin HEAD:main');
+      clone('wtK');
+      sh('cd wtK && ' + G + ' checkout -q -b build/wtk');
+      writeFileSync(root + '/wtK/shared.txt', 'L1\\nL2\\nL3\\nL4\\nL5\\nL6 ROUND1\\n');
+      sh('cd wtK && ' + G + ' add -A && ' + G + ' commit -q -m round1');
+      const k1 = run(root + '/wtK', 'fix/wtk');
+      if (k1.outcome !== 'WORK_PRESERVED') reason = 'K: fixture setup — the round-1 preserve must land, got ' + JSON.stringify(k1);
+      else {
+        const kpre = sh(G + ' --git-dir=' + root + '/origin.git rev-parse refs/heads/fix/wtk').trim();
+        writeFileSync(root + '/seed/shared.txt', 'L1\\nL2\\nL3\\nL4 SIBLING\\nL5\\nL6\\n');
+        sh('cd seed && ' + G + ' add -A && ' + G + ' commit -q -m sibling-inside-the-context-window && ' + G + ' push -q origin HEAD:main');
+        sh('cd wtK && ' + G + ' fetch -q origin && ' + G + ' rebase -q origin/main');
+        const khead = sh('cd wtK && ' + G + ' rev-parse HEAD').trim();
+        const kunique = sh('cd wtK && ' + G + ' rev-list --count --cherry-pick --right-only --no-merges HEAD...' + kpre).trim();
+        const kbody = sh('cat ' + root + '/wtK/shared.txt');
+        if (kunique === '0') reason = 'K: fixture no longer produces a patch-id shift — a git that survived the context change would make this arm vacuous, so it must fail LOUDLY here instead';
+        else if (!/L6 ROUND1/.test(kbody)) reason = 'K: fixture error — the rebase did not preserve round 1 work, so this arm is not testing preservation';
+        else {
+          const k = run(root + '/wtK', 'fix/wtk');
+          if (k.outcome !== 'WORK_PRESERVED') reason = 'K: a rebase that PRESERVED every pushed commit must still be preserved — patch-id inequality after a context shift is not a dropped commit, and reporting FAILED leaves the worktree as the only copy, got ' + JSON.stringify(k);
+          else if (k.forced_with_lease !== true) reason = 'K: the rewrite must be recorded as a LEASED force, got ' + JSON.stringify(k);
+          else if (k.rewrote_remote !== kpre) reason = 'K: the lease must name the pre-rebase remote value it was taken against, got ' + JSON.stringify(k);
+          else if (k.remote_sha !== khead) reason = 'K: preserved must be READ BACK from origin — remote_sha must be this worktree HEAD, got ' + JSON.stringify(k);
+          else if (sh(G + ' --git-dir=' + root + '/origin.git rev-parse refs/heads/fix/wtk').trim() !== khead) reason = 'K: origin must really carry the rebased tip, not the pre-rebase copy';
+        }
+      }
+    }
+
+    // --- L: A GENUINE DROP IS STILL REFUSED (temperloop#2095) ---------------
+    // The half that keeps arm K from being a regression. Arm I refuses over
+    // UNRELATED remote work; this refuses over the case the probe's own comment
+    // singles out as the deliberate narrowing — a continuation round that drops
+    // a commit an earlier round pushed. Widening the oracle for the rebase case
+    // must not widen it for this one.
+    if (!reason) {
+      clone('wtL');
+      sh('cd wtL && ' + G + ' checkout -q -b build/wtl');
+      writeFileSync(root + '/wtL/keep.txt', 'keep me\\n');
+      sh('cd wtL && ' + G + ' add -A && ' + G + ' commit -q -m round1-commit-A');
+      const lkeep = sh('cd wtL && ' + G + ' rev-parse HEAD').trim();
+      writeFileSync(root + '/wtL/dropped.txt', 'do not lose me\\n');
+      sh('cd wtL && ' + G + ' add -A && ' + G + ' commit -q -m round1-commit-B');
+      const l1 = run(root + '/wtL', 'fix/wtl');
+      if (l1.outcome !== 'WORK_PRESERVED') reason = 'L: fixture setup — the round-1 preserve must land both commits, got ' + JSON.stringify(l1);
+      else {
+        const lpre = sh(G + ' --git-dir=' + root + '/origin.git rev-parse refs/heads/fix/wtl').trim();
+        sh('cd wtL && ' + G + ' reset -q --hard ' + lkeep + ' && ' + G + ' fetch -q origin && ' + G + ' rebase -q origin/main');
+        const l = run(root + '/wtL', 'fix/wtl');
+        if (l.outcome !== 'WORK_PRESERVE_FAILED') reason = 'L: a continuation that DROPS a pushed commit must STILL refuse to rewrite unattended — that is the conservative narrowing the probe exists for, got ' + JSON.stringify(l);
+        else if (l.stale_remote_not_superseded !== true) reason = 'L: the drop refusal must stay NAMED as an unsuperseded remote, got ' + JSON.stringify(l);
+        else if (l.remote_sha !== lpre) reason = 'L: the refusal must report the remote value it read, got ' + JSON.stringify(l);
+        else if (sh(G + ' --git-dir=' + root + '/origin.git rev-parse refs/heads/fix/wtl').trim() !== lpre) reason = 'L: THE REFUSAL DID NOT HOLD — the dropped commit was overwritten on origin';
+      }
+    }
   } catch (err) {
     reason = 'the REAL generated shell (or its git fixture) threw: ' + ((err && err.message) || err);
   } finally {
@@ -9985,6 +10052,8 @@ if printf '%s\n' "$PRESERVE_BODY" | grep 'git push -u ' >/dev/null; then
 fi
 grep -q 'preserveCommittedWorkCmd(wt, preserveBranch)' "$MJS" \
   || fail "#2020: preserveOnEscalation must hand preserveCommittedWorkCmd the PLAN's item.branch — the ref 3f pushes — not let the step read the worktree's local HEAD name"
+printf '%s\n' "$PRESERVE_BODY" | grep 'merge-tree --write-tree' >/dev/null \
+  || fail "#2095: the rescue push must cross-check a non-zero patch-equivalence count against the content-containment oracle — \`rev-list --cherry-pick\` compares PATCH-IDs, and the \xc2\xa73e.5 rebase this path runs after changes the patch-id of every commit whose context moved, so patch-id alone reads a preserving rebase as a dropped commit and refuses to preserve work that exists nowhere else"
 printf '%s\n' "$PRESERVE_BODY" | grep 'base_resolved' >/dev/null \
   || fail "#2020: the preservation step must split 'zero commits ahead' from 'could not resolve a base' — a rev-list that failed because origin/\$default does not exist must never read as a genuine zero and take the WORK_PRESERVE_SKIP arm, which is the one outcome that suppresses the 'the worktree may be the ONLY copy' warning"
 # Anchored at a template-literal backtick so it reads the emitted SHELL, not the
