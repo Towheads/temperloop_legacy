@@ -383,11 +383,39 @@ fi
 # false failure (temperloop#1144). Scope the assertion to the kernel's own
 # checkout; every other check in this section is a genuinely shared invariant
 # and keeps running in a consumer.
+#
+# WHAT IS ASSERTED, AND WHY IT IS NO LONGER A JOB COUNT (temperloop#2165). The
+# old form proxied "one job" by counting top-level job keys and requiring <= 2.
+# That proxy broke the moment a SECOND job appeared — `runner-preflight`, which
+# resolves a dynamic `runs-on` for `checks` — even though adding it cannot move
+# the context: GitHub renders a matrix job's check-run name from the JOB ID plus
+# its `strategy.matrix` VALUES and never from `runs-on`, and a non-matrix
+# sibling job reports under its own separate, non-required name. Counting jobs
+# therefore false-failed on a safe change while still passing a genuinely unsafe
+# one (adding a second matrix dimension keeps the job count at 1 and renames the
+# context to `checks (ubuntu-latest, <x>)`). So assert the thing itself: job id
+# `checks`, exactly ONE matrix dimension, exactly ONE value, and that value the
+# `ubuntu-latest` token the required context is spelled with.
 if [ -f "$CI" ] && [ ! -f "$REPO_ROOT/.kernel-pin" ]; then
-  if grep -q 'os: \[ubuntu-latest\]' "$CI" && [ "$(grep -c '^  [a-z-]*:$' "$CI")" -le 2 ]; then
-    pass "CI still runs ONE job on a single-entry matrix (required context unchanged)"
+  # The `checks:` job block — from its 2-space job header to the next one.
+  ci_checks_block="$(awk '/^  checks:$/{f=1;next} f && /^  [a-z_-]+:$/{exit} f' "$CI")"
+  # ...and, within it, the body of `matrix:` (stops at the next same-or-shallower key).
+  ci_matrix_block="$(printf '%s\n' "$ci_checks_block" |
+    awk '/^ +matrix:$/{f=1;next} f && /^ +[a-z_-]+:$/{exit} f')"
+  ci_matrix_dims="$(printf '%s\n' "$ci_matrix_block" | grep -cE '^ +[a-z_-]+: \[' || true)"
+  ci_ctx_token="$(printf '%s\n' "$ci_matrix_block" | grep -cE '^ +os: \[ubuntu-latest\]$' || true)"
+  # The preflight's HOSTED fallback is a SEPARATE literal from the matrix token
+  # above. They must agree, or a fallback run lands on an image the required
+  # context name does not describe. Only assert it when a preflight exists.
+  ci_hosted_ok=1
+  if grep -q '^  runner-preflight:$' "$CI"; then
+    grep -qE "^ +HOSTED='\"ubuntu-latest\"'\$" "$CI" || ci_hosted_ok=0
+  fi
+  if grep -q '^  checks:$' "$CI" &&
+     [ "$ci_matrix_dims" -eq 1 ] && [ "$ci_ctx_token" -eq 1 ] && [ "$ci_hosted_ok" -eq 1 ]; then
+    pass "CI's \`checks\` job still renders the required context \`checks (ubuntu-latest)\` (one matrix dimension, one value; preflight fallback agrees)"
   else
-    fail "CI's job/matrix shape changed — the required 'checks (ubuntu-latest)' context may have moved"
+    fail "CI's \`checks\` job/matrix shape changed (dims=$ci_matrix_dims token=$ci_ctx_token hosted_ok=$ci_hosted_ok) — the required 'checks (ubuntu-latest)' context may have moved"
   fi
 elif [ -f "$CI" ]; then
   skip "CI job/matrix shape — required-context shape is a per-repo contract (vendoring consumer, .kernel-pin present)"
