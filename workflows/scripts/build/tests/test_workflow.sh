@@ -16531,5 +16531,236 @@ grep -qF 'No implementation worker ran on this round (temperloop#2137)' "$MJS" \
   || fail "#2137: the skipped-worker verdict must state IN THE PR BODY that no worker ran; a silent skip is indistinguishable from a review that passed on a worker's fix"
 echo "PASS: #2137 static lockstep guards — the predicate exists AND is called, the worker spawn is gated on its verdict, the skip arm is pinned to the single positively-established ALREADY_FIXED outcome, all three outcomes are schema-declared, the prior SHA comes from the #2127 marker, and the PR body carries the no-worker notice"
 
+# ============================================================================
+# TEST (K2138): the PROSE-ONLY acceptance-gate skip.
+#
+#   THE WASTE. Roughly 8 of the 35 blocking review rounds reconstructed from the
+#   2026-09-05 -> 09-19 transcripts were triggered only by a docs-reviewer HIGH
+#   on a changelog fragment or a one-line prose edit, and each one re-paid the
+#   full parent-side acceptance gate (about 20 minutes) for an input set the
+#   prose fix could not have moved.
+#
+#   THE TRAP, AND WHY A PLAIN RED-BEFORE TEST IS VACUOUS HERE. The predicate
+#   decides whether a gate is SKIPPED. Its old behaviour is "always run the
+#   gate", so every fail-CLOSED assertion below passes against unmodified main
+#   by construction. Arm C therefore proves discrimination the only way it can:
+#   it builds a deliberately fail-OPEN mutant of proseOnlyRound() (one where
+#   uncertainty SKIPS) out of the real source and asserts the same fixtures go
+#   RED against it. A false positive means an acceptance gate silently does not
+#   run on a branch that needed it and the item reaches the merge gate looking
+#   verified, which is strictly worse than the wasted run this item exists to
+#   save.
+#
+#   ARM A — a round whose ONLY blocking findings are docs-reviewer's does NOT
+#           invoke scripts/quality-gates.sh at all, and still carries those
+#           findings to the pull-request body.
+#   ARM B — a round carrying ANY non-docs blocking finding runs the gate exactly
+#           as today (its own fixture, deliberately MIXED: docs-reviewer AND
+#           shell-reviewer both blocking, which is the shape a naive
+#           "some finding is docs-reviewer's" predicate would wrongly skip).
+#   ARM C — every uncertain shape reads false (gate runs), plus the fail-open
+#           mutant that proves those assertions discriminate.
+#
+#   Both end-to-end arms set reviewBlockingMaxRounds to 1 so the FIRST blocking
+#   round is the convergence bound (temperloop#1970): that is the reachable path
+#   on which a round carrying blocking findings proceeds to the gate at all.
+# ============================================================================
+run_node_case "K2138 arm A: a round whose only blocking findings are docs-reviewer's SKIPS the acceptance gate — quality-gates.sh is never invoked, and the findings still reach the PR body" "
+$PREAMBLE
+
+// No GATE_PASS entry in this queue ON PURPOSE: the per-slug machinery FIFO is
+// shared with the push/PR steps, so a gate call that should not happen would
+// desync every later step and fail loudly rather than pass unnoticed.
+setMachinery('proseonly-skip',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/proseonly-skip' },
+  { outcome: 'REVIEW_DIFF', files: ['docs/plain.md'], tsv: '', tsv_rows: 0, tsv_checksum: 0 },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'a2138a' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'a2138a', branch: 'build/proseonly-skip' },
+  { outcome: 'PR_OPENED', pr_number: 2138 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('proseonly-skip');
+setReview('proseonly-skip', '## Findings\\n### [HIGH] PROSE-ONLY-HIGH: unexplained shorthand in the changelog fragment\\n');
+
+globalThis.args = { ...baseArgs, reviewBlockingMaxRounds: 1, items: [
+  { slug: 'proseonly-skip', branch: 'build/proseonly-skip', title: 'Touch a doc', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+let reason = null;
+const reviewCalls = callLog.filter(c => isReviewCall(c.opts));
+if (reviewCalls.length !== 1 || reviewCalls[0].opts.agentType !== 'docs-reviewer')
+  reason = 'fixture precondition: docs-reviewer alone must be the routed seat, got ' + JSON.stringify(reviewCalls.map(c => c.opts.agentType));
+else if ((result.escalations ?? []).length !== 0)
+  reason = 'at the bound a blocking round must not escalate: ' + JSON.stringify(result.escalations);
+else if ((result.parked ?? []).length !== 1)
+  reason = 'expected the item to park: ' + JSON.stringify(result);
+// THE POINT: no gate step was ever issued for this slug.
+const gateCalls = callLog.filter(c => (c.opts.label || '').indexOf('gate:proseonly-skip') === 0);
+if (!reason && gateCalls.length !== 0)
+  reason = 'a prose-only round must not invoke the acceptance gate at all, got ' + gateCalls.length + ' gate call(s)';
+// CARRIED, NOT SUPPRESSED — skipping the gate must not also swallow the finding.
+const rec = (result.parked ?? [])[0];
+if (!reason && !(rec.review && Array.isArray(rec.review.residual_blocking) && rec.review.residual_blocking.length === 1))
+  reason = 'the parked tally must still carry review.residual_blocking: ' + JSON.stringify(rec.review);
+else if (!reason && !JSON.stringify(rec.review.residual_blocking[0].findings).includes('PROSE-ONLY-HIGH'))
+  reason = 'the residual findings themselves must survive the skip: ' + JSON.stringify(rec.review.residual_blocking[0]);
+const prBatch = callLog.find(c => (c.opts.label || '').indexOf('pr-batch:proseonly-skip') === 0);
+if (!reason && !prBatch) reason = 'the item must still reach 3f with the gate skipped — no pr-batch call was made';
+if (!reason && prBatch.promptFull.indexOf('PROSE-ONLY-HIGH') === -1)
+  reason = 'the PR body must still carry the finding text: ' + prBatch.promptFull.slice(0, 400);
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+run_node_case "K2138 arm B: a round carrying ANY non-docs blocking finding runs the acceptance gate exactly as today (docs-reviewer AND shell-reviewer both blocking)" "
+$PREAMBLE
+const tsv = readFileSync('$REPO_ROOT/workflows/scripts/config/reviewer-routing.tsv', 'utf8');
+
+setMachinery('proseonly-mixed',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/proseonly-mixed' },
+  { outcome: 'REVIEW_DIFF', files: ['workflows/scripts/thing.sh', 'CONTRIBUTING.md'], tsv, tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv) },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'b2138b' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'b2138b', branch: 'build/proseonly-mixed' },
+  { outcome: 'PR_OPENED', pr_number: 2139 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('proseonly-mixed');
+// One queued response per routed seat, in determineReviewers() order. BOTH are
+// blocking, so the round is a mixed set, never a docs-only one.
+setReview('proseonly-mixed',
+  '## Findings\\n### [HIGH] MIXED-HIGH-ONE: a blocking finding\\n',
+  '## Findings\\n### [HIGH] MIXED-HIGH-TWO: a blocking finding\\n');
+
+globalThis.args = { ...baseArgs, reviewBlockingMaxRounds: 1, items: [
+  { slug: 'proseonly-mixed', branch: 'build/proseonly-mixed', title: 'Touch a script and a doc', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+let reason = null;
+const types = callLog.filter(c => isReviewCall(c.opts)).map(c => c.opts.agentType).sort();
+if (JSON.stringify(types) !== JSON.stringify(['docs-reviewer', 'shell-reviewer']))
+  reason = 'fixture precondition: BOTH seats must be routed and blocking, got ' + JSON.stringify(types);
+else if ((result.parked ?? []).length !== 1)
+  reason = 'expected the item to park: ' + JSON.stringify(result);
+// THE POINT: the gate ran, unchanged.
+const gateCalls = callLog.filter(c => (c.opts.label || '').indexOf('gate:proseonly-mixed') === 0);
+if (!reason && gateCalls.length !== 1)
+  reason = 'a round with a non-docs blocking finding must run the gate exactly once, got ' + gateCalls.length;
+if (!reason && gateCalls[0].promptFull.indexOf('quality-gates.sh') === -1)
+  reason = 'the gate step must still be the real quality-gates.sh invocation: ' + gateCalls[0].promptFull.slice(0, 300);
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+run_node_case "K2138 arm C: proseOnlyRound() fails CLOSED on every uncertain shape — and a deliberately fail-OPEN mutant of it flips those same assertions RED, proving they discriminate" "
+$PREAMBLE
+let reason = null;
+const internalsSrc = MJS_SRC.replace(/return await buildLevel\(\);\s*\$/, 'return { proseOnlyRound };');
+if (internalsSrc === MJS_SRC) {
+  reason = 'internals-splice failed: the buildLevel() tail was not found in build-level.mjs — this test needs updating alongside that refactor';
+} else {
+  globalThis.args = '{}';
+  const I = await (new AsyncFunction(internalsSrc))();
+  const doc = (n) => ({ reviewer: 'docs-reviewer', findings: 'f' + n });
+
+  // The ONE shape that may skip: a non-empty set every one of whose findings is
+  // POSITIVELY established as docs-reviewer's.
+  const mustSkip = [
+    ['one docs finding', { round: 2, blocking: [doc(1)] }],
+    ['several docs findings', { round: 3, blocking: [doc(1), doc(2), doc(3)] }],
+  ];
+  // Everything else runs the gate. Each entry is a shape the predicate cannot
+  // positively establish as docs-only, listed rather than summarised so a
+  // widening of the skip arm names the exact shape it let through.
+  const mustRun = [
+    ['no review object at all', null],
+    ['a non-object review', 'docs-reviewer'],
+    ['no blocking key', { round: 2 }],
+    ['blocking is not an array', { round: 2, blocking: 'docs-reviewer' }],
+    ['an EMPTY blocking set — nothing was established about this round', { round: 2, blocking: [] }],
+    ['a null entry', { round: 2, blocking: [null] }],
+    ['a string entry rather than a record', { round: 2, blocking: ['docs-reviewer'] }],
+    ['an entry with no reviewer attribution', { round: 2, blocking: [{ findings: 'f' }] }],
+    ['an entry whose reviewer is blank', { round: 2, blocking: [{ reviewer: '   ', findings: 'f' }] }],
+    ['an entry whose reviewer is not a string', { round: 2, blocking: [{ reviewer: 1, findings: 'f' }] }],
+    ['a seat name that merely CONTAINS the docs seat', { round: 2, blocking: [{ reviewer: 'docs-reviewer-2', findings: 'f' }] }],
+    ['a docs finding beside a non-docs one', { round: 2, blocking: [doc(1), { reviewer: 'shell-reviewer', findings: 'f' }] }],
+    ['a non-docs finding alone', { round: 2, blocking: [{ reviewer: 'shell-reviewer', findings: 'f' }] }],
+  ];
+  for (const [label, shape] of mustSkip) {
+    if (I.proseOnlyRound(shape) !== true) { reason = 'must read true (skip the gate): ' + label; break; }
+  }
+  for (const [label, shape] of mustRun) {
+    if (reason) break;
+    if (I.proseOnlyRound(shape) !== false) { reason = 'must read false (RUN the gate) — fail-closed violation: ' + label; break; }
+  }
+
+  // --- the fail-OPEN mutant ------------------------------------------------
+  // Built from the REAL source so it cannot drift from what is under test: the
+  // predicate is replaced by one that treats every unattributable shape as
+  // docs-only. If the mustRun list above did not discriminate, this mutant
+  // would satisfy it too.
+  if (!reason) {
+    const mutantBody = [
+      'function proseOnlyRound(review) {',
+      '  const b = (review && review.blocking) || [];',
+      '  return !b.some((e) => e && e.reviewer && e.reviewer !== PROSE_ONLY_REVIEWER);',
+      '}',
+    ].join(String.fromCharCode(10));
+    const mutantSrc = internalsSrc.replace(/function proseOnlyRound\(review\) \{[\s\S]*?\n\}/, mutantBody);
+    if (mutantSrc === internalsSrc) {
+      reason = 'mutant-splice failed: proseOnlyRound() was not found in its expected shape — the discrimination proof is inert';
+    } else {
+      const M = await (new AsyncFunction(mutantSrc))();
+      // A mutant that THROWS on a shape did not skip the gate on it, so it
+      // counts as 'not leaked' rather than aborting the case. Only the real
+      // predicate is held to never throwing — it is the one that ships.
+      const mutantSkips = (shape) => { try { return M.proseOnlyRound(shape) === true; } catch (e) { return false; } };
+      const leaked = mustRun.filter(([, shape]) => mutantSkips(shape)).map(([label]) => label);
+      if (leaked.length === 0) {
+        reason = 'the fail-open mutant skipped NOTHING the real predicate runs — the mustRun assertions above do not discriminate and prove nothing';
+      } else if (leaked.indexOf('an EMPTY blocking set — nothing was established about this round') === -1) {
+        reason = 'the empty-blocking-set assertion must be one the mutant breaks, got: ' + JSON.stringify(leaked);
+      }
+    }
+  }
+}
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+# --- K2138 static lockstep guards --------------------------------------------
+# Class-A activation proof, plus the lockstep the node cases cannot express: a
+# predicate that exists but is never CALLED, or a skip arm that is widened past
+# the positively-established docs-only set, passes every mock above.
+grep -q 'function proseOnlyRound(' "$MJS" \
+  || fail "#2138: build-level.mjs must define the proseOnlyRound() predicate — this is the item's Class-A activation proof"
+grep -qF 'const gateSkipped = proseOnlyRound(review);' "$MJS" \
+  || fail "#2138: the 3e.5 gate must CALL proseOnlyRound() — a match on the DEFINITION alone does not prove the gate is actually gated on it"
+grep -qF '!gateSkipped && gateSlices < gateSliceCeiling' "$MJS" \
+  || fail "#2138: the slice LOOP itself must be gated on the verdict. Running quality-gates.sh and then discarding its result saves nothing, which is the whole point of the item"
+# REGION-SCOPED to proseOnlyRound()'s own body: a whole-file grep for these
+# strings matches unrelated code elsewhere in a 9,000-line module.
+_k2138_fn="$(awk '/^function proseOnlyRound\(review\) \{/,/^\}/' "$MJS")"
+printf '%s' "$_k2138_fn" | grep -F 'blocking.length === 0) return false' >/dev/null \
+  || fail "#2138: proseOnlyRound() must refuse an EMPTY blocking set. An empty set establishes nothing about the round, and reading it as docs-only skips the gate on every clean round — the fail-open shape this item is written against"
+printf '%s' "$_k2138_fn" | grep -F '.trim() === PROSE_ONLY_REVIEWER' >/dev/null \
+  || fail "#2138: the seat test must be EXACT equality against PROSE_ONLY_REVIEWER. A substring or prefix test lets a seat merely named LIKE the docs seat skip an acceptance gate"
+printf '%s' "$_k2138_fn" | grep -F 'blocking.every(' >/dev/null \
+  || fail "#2138: the predicate must require EVERY blocking finding to be the docs seat's. A .some() test skips the gate on a round that also carries a functional HIGH"
+unset _k2138_fn
+# COMPOSITION, NOT A SECOND SELECTION PATH. The roster half (re-run only the
+# seats whose routed files moved) is temperloop#2129's reviewCarryForward(); this
+# leg owns the gate skip alone and must not grow a parallel notion of which seat
+# raised what.
+grep -q 'function reviewCarryForward(' "$MJS" \
+  || fail "#2138: the roster half must still be reviewCarryForward() (temperloop#2129) — the gate skip composes with it rather than replacing it"
+grep -qF "verdict: 'SKIPPED'" "$MJS" \
+  || fail "#2138: a skipped gate must report its own SKIPPED verdict, never a fabricated GREEN — claiming a pass for a suite that did not run is exactly the fail-open outcome the skip must not produce"
+echo "PASS: #2138 the prose-only gate skip — a docs-reviewer-only blocking round never invokes quality-gates.sh yet still carries its findings to the PR, a mixed round runs the gate unchanged, every uncertain shape fails CLOSED (proven against a fail-open mutant), and the predicate is wired to the slice loop itself"
+
 echo ""
 echo "All test_workflow.sh cases passed."
