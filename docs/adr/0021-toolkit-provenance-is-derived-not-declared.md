@@ -4,7 +4,7 @@ title: "0021: toolkit provenance is derived from git, never declared as stored s
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 

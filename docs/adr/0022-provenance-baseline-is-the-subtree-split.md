@@ -4,7 +4,7 @@ title: "0022: the provenance baseline is the recorded-vs-recomputed subtree spli
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
