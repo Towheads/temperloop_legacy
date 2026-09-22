@@ -58,6 +58,30 @@
 # guessing. In every case it also prints the live process-group snapshot taken
 # immediately before the kill, which names the actual stuck command.
 #
+# ── SIGNALS REAP THE GROUP TOO, NOT JUST THE BOUND ──────────────────────────
+# `set -m` puts the suite in its OWN process group, which is what lets the
+# bound reap the whole tree. It has a second, less obvious consequence: the
+# suite is no longer in `make`'s foreground group, so a terminal Ctrl-C no
+# longer reaches it. If this wrapper's INT/TERM handlers merely exited, the
+# suite would keep running FULLY DETACHED — reintroducing the orphaned process
+# trees this item exists to prevent, through a different door, and making
+# Ctrl-C strictly WORSE than before the wrapper existed. So INT and TERM run
+# the SAME reap() the bound does before exiting 130/143. Covered by
+# tests/test_bounded_suite.sh case 9.
+#
+# ── WHAT IS *NOT* IDENTICAL IN A WRAPPED RUN ────────────────────────────────
+# The suite's stdout is byte-identical and its stderr is untouched and
+# unmerged, but a wrapped run is NOT indistinguishable from an unwrapped one:
+# the suite's stdout is a FILE ($LOG), relayed onward, not the caller's
+# terminal. So `isatty(1)` is FALSE for the suite where it may have been true
+# before, and stdout arrives in <=1s relay batches, which can interleave with
+# the (unredirected, unbuffered) stderr differently than an unwrapped run
+# would. A suite that colourizes or draws progress on a tty check will take
+# its non-tty branch. Accepted trade-off, deliberately not re-architected
+# around a pty: these suites emit plain line-oriented text, and a pty would
+# add a platform-specific dependency to a guard whose whole point is to work
+# on a stock macOS with no extra binaries.
+#
 # ── USAGE ───────────────────────────────────────────────────────────────────
 #   bounded-suite.sh --label <name> [--case-source <suite.sh>] -- <cmd> [args…]
 #
@@ -142,14 +166,55 @@ fi
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/bounded-suite.XXXXXX")" || exit 2
 # shellcheck disable=SC2329  # invoked indirectly, from the traps below.
 cleanup() { rm -rf "$TMPD"; }
-# EXIT sweeps the scratch dir; INT/TERM must also TERMINATE, not merely clean
-# up — a trap handler that returns without exiting leaves bash carrying on
-# with the next command, so an un-exiting TERM handler would make this guard
-# itself unkillable by an ordinary SIGTERM (a Ctrl-C'd `make`, a CI job
-# timeout). 130/143 are the conventional 128+SIGINT / 128+SIGTERM codes.
+
+# reap() — terminate the suite's whole process group. THE ONLY killer in this
+# script: the bound calls it, and so do the INT/TERM handlers. Factored out
+# precisely so those three paths can never diverge, which is exactly how the
+# signal path came to orphan the tree in the first place.
+#
+# $pgid / $child are resolved further down, AFTER the traps are installed, so
+# a signal can legitimately arrive before either exists — hence ${x:-} and the
+# early return. When the traps fire after the launch but before $pgid is
+# resolved, the group id is re-derived here from $child rather than skipped.
+# shellcheck disable=SC2329  # invoked indirectly, from the traps below.
+reap() {
+  local g s
+  [ -n "${child:-}" ] || return 0
+  g="${pgid:-}"
+  if [ -z "$g" ]; then
+    g="$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ')"
+    s="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+    # Never signal our OWN group: that would kill this wrapper (and, under a
+    # bare `make`, make itself) instead of just the suite.
+    if [ -z "$g" ] || [ "$g" = "$s" ]; then g=""; fi
+  fi
+  if [ -n "$g" ]; then
+    kill -TERM "-$g" 2>/dev/null
+    sleep 2
+    kill -KILL "-$g" 2>/dev/null
+  else
+    kill -TERM "$child" 2>/dev/null
+    sleep 2
+    kill -KILL "$child" 2>/dev/null
+  fi
+  return 0
+}
+
+# EXIT sweeps the scratch dir; INT/TERM must also REAP THE SUITE and then
+# TERMINATE.
+#   - reap, because `set -m` below moved the suite into its own process group,
+#     out of make's foreground group: a terminal Ctrl-C reaches this wrapper
+#     but NOT the suite, so a handler that skipped reap() would leave the whole
+#     suite tree running fully detached — this item's own defect class,
+#     reintroduced through the signal door (and Ctrl-C would be worse than
+#     before the wrapper existed, when make's group still caught it).
+#   - exit, because a trap handler that returns without exiting leaves bash
+#     carrying on with the next command, which would make this guard itself
+#     unkillable by an ordinary SIGTERM (a Ctrl-C'd `make`, a CI job timeout).
+# 130/143 are the conventional 128+SIGINT / 128+SIGTERM codes.
 trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+trap 'reap; cleanup; exit 130' INT
+trap 'reap; cleanup; exit 143' TERM
 
 LOG="$TMPD/out.log"
 RCF="$TMPD/rc"
@@ -185,8 +250,24 @@ relay() {
 # id is the job leader's pid. Signalling -PGID reaches every descendant that
 # has not deliberately left the group, which is what makes the bound reap the
 # whole tree instead of orphaning it.
+#
+# ── THE EXIT-CODE HANDOFF IS ATOMIC, AND WHY IT HAS TO BE ───────────────────
+# $RCF is the child's only channel back to this shell, and the poll loop below
+# uses `[ -f "$RCF" ]` as its "the suite finished" signal. Writing it as
+# `printf … > "$RCF"` would CREATE/TRUNCATE the file before printf's bytes
+# land, so the poller can observe an EXISTING BUT EMPTY $RCF, read "", and —
+# via the non-numeric guard below — report exit 1 for a suite that passed.
+# That is an intermittent false failure in the gate that guards every other
+# gate, i.e. precisely the "flaky test" class CLAUDE.kernel.md § Fix the real
+# problem, not the symptom forbids papering over.
+#
+# So the child writes a SIBLING temp file and `mv`s it into place. A rename
+# within one directory is atomic, so $RCF never exists in a partial state and
+# the `-f` test means what the poller assumes it means. The `wait` before the
+# read below is a second, independent belt (the writer is the very job being
+# waited on). Covered by tests/test_bounded_suite.sh case 10.
 set -m
-{ ( exec "$@" ) >"$LOG"; printf '%s\n' "$?" > "$RCF"; } &
+{ ( exec "$@" ) >"$LOG"; __rc=$?; printf '%s\n' "$__rc" > "$RCF.tmp" && mv -f "$RCF.tmp" "$RCF"; } &
 child=$!
 set +m
 
@@ -211,9 +292,13 @@ done
 relay
 
 if [ "$timed_out" -eq 0 ]; then
+  # `wait` FIRST, then read. The job being waited on is the same job that
+  # writes $RCF, so once wait returns the file is complete — the second belt
+  # behind the atomic rename above. Reading before the wait is the ordering
+  # that produces an intermittent exit 1 on a green suite.
+  wait "$child" 2>/dev/null
   rc="$(cat "$RCF" 2>/dev/null)"
   case "$rc" in ''|*[!0-9]*) rc=1 ;; esac
-  wait "$child" 2>/dev/null
   exit "$rc"
 fi
 
@@ -266,10 +351,18 @@ if [ -z "$running" ]; then
   running_src="none"
 fi
 
+# `ps -A -o …args=` rather than the BSD-shaped `-ax -o …command=`: `-A`,
+# `-o`-with-`=` header suppression and the `args` format keyword are all POSIX,
+# so macOS's BSD ps and Linux's procps both accept this exact spelling. (On
+# macOS `-e` means "also show the environment", NOT "all processes", so `-A` is
+# the portable one.) This section is the whole value of the timeout report —
+# it names the actually-stuck command — and losing it on the Linux CI runner,
+# where nobody can attach a debugger, is exactly where it can least afford to
+# degrade.
 if [ -n "$pgid" ]; then
-  procs="$(ps -ax -o pgid=,pid=,ppid=,etime=,command= 2>/dev/null | awk -v p="$pgid" '$1 == p')"
+  procs="$(ps -A -o pgid=,pid=,ppid=,etime=,args= 2>/dev/null | awk -v p="$pgid" '$1 == p')"
 else
-  procs="$(ps -o pid=,ppid=,etime=,command= -p "$child" 2>/dev/null)"
+  procs="$(ps -o pid=,ppid=,etime=,args= -p "$child" 2>/dev/null)"
 fi
 [ -n "$procs" ] || procs="(no live processes found at kill time)"
 
@@ -299,15 +392,7 @@ fi
   echo "================================================================================"
 } >&2
 
-if [ -n "$pgid" ]; then
-  kill -TERM "-$pgid" 2>/dev/null
-  sleep 2
-  kill -KILL "-$pgid" 2>/dev/null
-else
-  kill -TERM "$child" 2>/dev/null
-  sleep 2
-  kill -KILL "$child" 2>/dev/null
-fi
+reap
 wait "$child" 2>/dev/null
 relay
 

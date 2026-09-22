@@ -134,7 +134,7 @@ test-build:
 	@bash $(BUILD_SRC)/bounded-suite.sh --label test-build -- \
 		bash -c 'for t in "$$1"/tests/test_*.sh; do \
 			printf "%s\n" "$$(basename "$$t")" > "$${SUITE_PROGRESS_FILE:-/dev/null}"; \
-			if out="$$(bash "$$t" 2>&1)"; then echo "  [ok] $$(basename $$t)"; else echo "  [FAIL] $$(basename $$t)"; printf "%s\n" "$$out" | sed "s/^/      /"; exit 1; fi; \
+			if out="$$(bash "$$t" 2>&1)"; then echo "  [ok] $$(basename "$$t")"; else echo "  [FAIL] $$(basename "$$t")"; printf "%s\n" "$$out" | sed "s/^/      /"; exit 1; fi; \
 		done' _ $(BUILD_SRC)
 
 # Bounded exactly like test-build above (temperloop#2184). --case-source lets

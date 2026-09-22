@@ -2013,10 +2013,11 @@ fi
 # reads as the exact opposite of the truth), and kills the suite's whole
 # PROCESS GROUP so the orphaned trees cannot outlive it either.
 #
-# SIZING: measured healthy runtimes on this tree are ~57s
-# (test-build-workflow) and ~55s (test-build), so 1800s is ~30x headroom —
-# far too wide to fire on a slow or loaded CI runner, and still three orders
-# of magnitude tighter than the incident. It mirrors the existing 1800s
+# SIZING: measured healthy runtimes on this tree are ~58s
+# (test-build-workflow) and ~297s (test-build, whose glob now also runs
+# tests/test_bounded_suite.sh), so 1800s leaves ~31x and ~6x headroom — wide
+# enough not to fire on a slow or loaded CI runner, and still three orders of
+# magnitude tighter than the incident. It mirrors the existing 1800s
 # convention BUILD_QUEUE_TIMEOUT and REPLAY_CANDIDATE_TIMEOUT_SECS already use
 # for a generous outer bound. This is a LIVENESS ceiling, never a performance
 # budget: tightening it toward the measured runtime would turn an ordinary
