@@ -156,8 +156,24 @@ trap wf_test_cleanup EXIT INT TERM
 # Writes a temp .mjs, runs it with node, reads the last stdout line as a JSON
 # { ok: true } / { ok: false, reason: "..." } verdict.
 # ---------------------------------------------------------------------------
+# temperloop#2184 — WALL-CLOCK-GUARD BREADCRUMB. `make test-build-workflow`
+# runs this suite under workflows/scripts/build/bounded-suite.sh, which kills
+# the whole process group if the suite outlives $BUILD_SUITE_TIMEOUT_SECS. The
+# guard can only name the case that was RUNNING if the suite says which one it
+# started: the last line on screen names the case that just COMPLETED, which
+# reads as the exact opposite of the truth. Writing the description at case
+# START (and truncating it at case END, so a stall in the inline shell section
+# AFTER a case is never misattributed to that case) is that signal. A no-op
+# when the suite is run directly, with $SUITE_PROGRESS_FILE unset.
+wf_progress() {
+  [ -n "${SUITE_PROGRESS_FILE:-}" ] || return 0
+  printf '%s\n' "$1" > "$SUITE_PROGRESS_FILE" 2>/dev/null || true
+  return 0
+}
+
 run_node_case() {
   local desc="$1"
+  wf_progress "$desc"
   local tmpf
   tmpf="$(mktemp "$WF_TEST_TMPDIR/case-XXXXXX.mjs")"
   printf '%s\n' "$2" > "$tmpf"
@@ -187,6 +203,7 @@ run_node_case() {
   " 2>/dev/null)" 2>/dev/null || verdict="parse-err"
 
   if [[ "$verdict" == ok ]]; then
+    wf_progress ""
     echo "PASS: $desc"
   else
     echo "FAIL: $desc — $verdict" >&2

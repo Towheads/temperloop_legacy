@@ -1998,7 +1998,38 @@ fi
 : "${DUAL_BUILD_CALIBRATION_BAR_PCT:=70}"
 : "${DUAL_BUILD_CALIBRATION_BAR_N:=20}"
 
+# ── Makefile test-suite wall-clock bound (temperloop#2184) ─────────────────
+# Wall-clock ceiling, in seconds, on ONE bounded Makefile test-suite target —
+# `make test-build-workflow` and `make test-build` today, both routed through
+# workflows/scripts/build/bounded-suite.sh, which owns the mechanism and
+# carries the byte-identical layer-6 fallback for a non-vendoring checkout.
+#
+# WHY IT EXISTS: neither target had ANY bound, so a hang inside the suite ran
+# forever with nothing going red. The observed incident ran ~50h and left two
+# orphaned process trees behind; it surfaced only because a human happened to
+# look at `ps`. The bound converts that silent forever-hang into a loud
+# non-zero failure that NAMES THE CASE THAT WAS RUNNING when it fired (the
+# previous last line on screen named the case that had just COMPLETED, which
+# reads as the exact opposite of the truth), and kills the suite's whole
+# PROCESS GROUP so the orphaned trees cannot outlive it either.
+#
+# SIZING: measured healthy runtimes on this tree are ~57s
+# (test-build-workflow) and ~55s (test-build), so 1800s is ~30x headroom —
+# far too wide to fire on a slow or loaded CI runner, and still three orders
+# of magnitude tighter than the incident. It mirrors the existing 1800s
+# convention BUILD_QUEUE_TIMEOUT and REPLAY_CANDIDATE_TIMEOUT_SECS already use
+# for a generous outer bound. This is a LIVENESS ceiling, never a performance
+# budget: tightening it toward the measured runtime would turn an ordinary
+# slow machine into a red gate.
+#
+# A `0` or non-numeric value is REJECTED back to the default and the refusal
+# is REPORTED (the temperloop#1592 lesson): honoring `0` would mean either no
+# bound at all — this item's own defect, reintroduced by a typo — or killing
+# every healthy run instantly.
+: "${BUILD_SUITE_TIMEOUT_SECS:=1800}"
+
 export BUILD_QUOTA_PAUSE_PCT BUILD_QUOTA_CACHE BUILD_QUOTA_WAIT_BUFFER \
+       BUILD_SUITE_TIMEOUT_SECS \
        BUILD_QUOTA_MAX_AGE BUILD_MERGE_GATE_WINDOW BUILD_QUEUE_TIMEOUT BUILD_QUEUE_STALL_AFTER \
        BUILD_HEADLESS_POLL_TIMEOUT \
        BUILD_MERGE_BACKEND BUILD_COMBINED_TREE_PRECHECK BUILD_MERGE_AS_YOU_GO \
