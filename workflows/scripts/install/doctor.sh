@@ -869,6 +869,72 @@ check_project_agents_tree() {
   return 0
 }
 
+# check_toolkit_provenance — is the toolkit code in THIS checkout the release
+# it claims to be? (temperloop#1047, ADR 0021/0022.)
+#
+# Delegates entirely to workflows/scripts/toolkit-provenance.sh — this
+# function carries no baseline logic of its own, exactly as
+# check_legacy_host_config delegates to legacy-host-preflight.sh. The probe is
+# read-only, network-free and always exits 0, so this check cannot fail doctor
+# for an environmental reason.
+#
+# NON-FATAL by design, mirroring check_cache_state / check_reviewer_coverage:
+# a MODIFIED checkout is a state an operator may have entered deliberately
+# (the sanctioned KERNEL_EDIT_ACK / `Upstream:` waiver path — see
+# docs/features/toolkit-provenance.md), so it WARNs and always returns 0. It
+# never touches `non_ok` or doctor's exit code.
+#
+# Three outcomes, one per verdict:
+#   RELEASED  — one line, no WARN. A released checkout passes quietly.
+#   MODIFIED  — WARN, plus the probe's own attribution block verbatim
+#               (uncommitted vs. committed drift; commit, author and any
+#               `Upstream:` reference) so the reader can act without re-running
+#               anything.
+#   UNKNOWN   — SKIPPED, carrying the probe's own reason. This is the kernel's
+#               OWN development checkout's outcome: it has no release baseline
+#               by construction, and giving it one would mis-classify the
+#               self-distribution suite (ADR 0021).
+# ---------------------------------------------------------------------------
+check_toolkit_provenance() {
+  local probe="${FOUNDATION}/workflows/scripts/toolkit-provenance.sh"
+
+  printf '\nToolkit provenance check (temperloop#1047):\n'
+
+  if [[ ! -f "$probe" ]]; then
+    printf '  SKIPPED (toolkit-provenance.sh not found under %s)\n' "$FOUNDATION"
+    return 0
+  fi
+
+  local report=""
+  report="$(bash "$probe" --root "$FOUNDATION" --format report 2>&1)" || report=""
+
+  if [[ -z "$report" ]]; then
+    printf '  SKIPPED (the provenance probe produced no output)\n'
+    return 0
+  fi
+
+  local verdict claims reason
+  verdict="$(sed -n '1s/^Toolkit provenance: //p' <<<"$report")"
+
+  case "$verdict" in
+    RELEASED)
+      claims="$(sed -n 's/^  claims:  *//p' <<<"$report" | head -n1)"
+      printf '  toolkit tree is byte-identical to the release it claims (%s)\n' "${claims:-unnamed release}"
+      ;;
+    MODIFIED)
+      claims="$(sed -n 's/^  claims:  *//p' <<<"$report" | head -n1)"
+      printf '  WARN  MODIFIED — the running toolkit is NOT the release it claims (%s). Upstream the change or restore the released content; see docs/features/toolkit-provenance.md\n' "${claims:-unnamed release}"
+      sed -n '2,$p' <<<"$report" | sed 's/^/    /'
+      ;;
+    *)
+      reason="$(sed -n 's/^  reason:  *//p' <<<"$report" | head -n1)"
+      printf '  SKIPPED (%s)\n' "${reason:-no release baseline could be established}"
+      ;;
+  esac
+
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # check_legacy_host_config — HOST-STATE preflight for legacy host-config
 # paths a release has REMOVED (temperloop#908). Delegates entirely to the
@@ -1213,6 +1279,7 @@ check_reviewer_coverage || true
 # the exit-code composition below, exactly like check_cache_state() and
 # check_reviewer_coverage() above.
 check_project_agents_tree || true
+check_toolkit_provenance || true
 
 legacy_host_status=0
 check_legacy_host_config || legacy_host_status=$?

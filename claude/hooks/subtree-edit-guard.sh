@@ -31,6 +31,16 @@
 # wanted (an operator-approved batched waiver — CUTOVER-RUNBOOK.md), so this
 # only forces a conscious beat, not a hard stop.
 #
+# PROVENANCE RE-PROBE (temperloop#1047): whichever way this guard resolves —
+# ask or bypass — it first re-runs workflows/scripts/toolkit-provenance.sh and
+# folds the current verdict into the message it emits. This guard's fire IS
+# the moment drift begins, so it is the only place a MID-SESSION provenance
+# notice can be delivered at all: the SessionStart provenance hook
+# (session-start-provenance.sh) ran before this edit existed and is
+# structurally blind to it. The two halves ship together; neither subsumes the
+# other. The re-probe is fail-open and contributes nothing if the probe is
+# absent or errors.
+#
 # BUILD-WORKER BYPASS (documented, deliberate — does not deadlock the build
 # pipeline): a build worker operating inside a `.build-guard`-armed worktree
 # (workflows/scripts/build/worktree.sh create) is ALREADY working under
@@ -178,13 +188,46 @@ for t in "${targets[@]}"; do
 done
 [ -n "$hit" ] || exit 0
 
+# --- PROVENANCE RE-PROBE (temperloop#1047) -------------------------------
+# This guard firing IS the moment drift begins, which makes it the one place
+# a mid-session notice can be delivered at all: the SessionStart provenance
+# hook ran before this edit was conceived and is structurally blind to it.
+# So re-probe here and fold the current verdict into whichever message this
+# guard is about to emit — the ask prompt, or the bypass note.
+#
+# Deliberately reports the state as it is RIGHT NOW, before the edit lands: on
+# a clean tree that reads RELEASED, and the line says plainly that this edit
+# is what begins the drift. Claiming MODIFIED for an edit that has not
+# happened yet would be a false report, and this whole mechanism is built on
+# never reporting a state the tree is not actually in.
+#
+# Fail-open and best-effort, like every other line in this file: a missing or
+# erroring probe simply contributes nothing. Test seam:
+# TOOLKIT_PROVENANCE_SH.
+provenance_note=""
+_probe="${TOOLKIT_PROVENANCE_SH:-}"
+if [ -z "$_probe" ]; then
+  _probe="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../workflows/scripts" 2>/dev/null && pwd)/toolkit-provenance.sh"
+fi
+if [ -f "$_probe" ]; then
+  _verdict=$(bash "$_probe" --root "$root" --format verdict 2>/dev/null) || _verdict=""
+  case "$_verdict" in
+    RELEASED)
+      provenance_note=" TOOLKIT PROVENANCE: this checkout currently reports RELEASED — this edit is the moment it stops being the release it claims. Run 'temperloop doctor' (or workflows/scripts/toolkit-provenance.sh) at any point to see the verdict and every drifted path."
+      ;;
+    MODIFIED)
+      provenance_note=" TOOLKIT PROVENANCE: this checkout ALREADY reports MODIFIED — it is not the release it claims to be, and this edit adds to that. Run 'temperloop doctor' (or workflows/scripts/toolkit-provenance.sh) for every drifted path, with the commit and author behind each."
+      ;;
+  esac
+fi
+
 if [ -n "$bypass_reason" ]; then
   log "BYPASS ($bypass_reason) :: $hit"
-  echo "subtree-edit-guard: kernel/ edit at '$hit' permitted without an interactive ask — bypass: $bypass_reason. Reminder: this content is vendored from temperloop; the PR must carry a bare 'Upstream: <kernel-PR-url>' line (or ride an operator-approved batched waiver — see CUTOVER-RUNBOOK.md), or Guard #2 (scripts/kernel-drift-check.sh) will flag it at merge time." >&2
+  echo "subtree-edit-guard: kernel/ edit at '$hit' permitted without an interactive ask — bypass: $bypass_reason. Reminder: this content is vendored from temperloop; the PR must carry a bare 'Upstream: <kernel-PR-url>' line (or ride an operator-approved batched waiver — see CUTOVER-RUNBOOK.md), or Guard #2 (scripts/kernel-drift-check.sh) will flag it at merge time.${provenance_note}" >&2
   exit 0
 fi
 
-reason="This Edit/Write/MultiEdit targets '$hit', which is INSIDE the vendored kernel/ subtree (pinned by .kernel-pin at $root) — either a direct kernel/... path or a pre-split compat symlink that resolves into it. Kernel content is upstream-first: land this change in the temperloop repo and pull it down via 'make update-kernel' (bumps .kernel-pin atomically), rather than editing the vendored copy here. If this is a deliberate, operator-approved exception (a batched waiver — see CUTOVER-RUNBOOK.md), proceed and make sure the PR body carries a bare 'Upstream: <kernel-PR-url>' line; scripts/kernel-drift-check.sh (Guard #2) enforces that at merge time."
+reason="This Edit/Write/MultiEdit targets '$hit', which is INSIDE the vendored kernel/ subtree (pinned by .kernel-pin at $root) — either a direct kernel/... path or a pre-split compat symlink that resolves into it. Kernel content is upstream-first: land this change in the temperloop repo and pull it down via 'make update-kernel' (bumps .kernel-pin atomically), rather than editing the vendored copy here. Editing it in place is a SANCTIONED, VISIBLE exception rather than a forbidden one: set KERNEL_EDIT_ACK=1 to acknowledge it up front, and carry the change back upstream with a bare 'Upstream: <kernel-PR-url>' line in the PR body (or an operator-approved batched waiver — see CUTOVER-RUNBOOK.md); scripts/kernel-drift-check.sh (Guard #2) enforces that waiver at merge time.${provenance_note}"
 log "ASK :: $hit"
 jq -cn --arg r "$reason" \
   '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"ask",permissionDecisionReason:$r}}' \

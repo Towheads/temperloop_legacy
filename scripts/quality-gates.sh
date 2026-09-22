@@ -327,6 +327,21 @@ KERNEL_GATES=(
   # the sibling doctor gates above (kernel Makefile is generator-owned; no new
   # target added here).
   "bash workflows/scripts/tests/test_doctor_bm_tool.sh"
+  # Toolkit provenance (temperloop#1047, ADR 0021/0022): the probe itself —
+  # is the toolkit code in a given checkout byte-identical to the release it
+  # claims to be? — plus its wiring into doctor.sh's
+  # check_toolkit_provenance(). The probe suite's case 1 is the load-bearing
+  # one: it reproduces the exact hand-edit-then-update-kernel sequence under
+  # which the REJECTED pin-commit baseline reports a modified tree as
+  # RELEASED, and asserts in the same case that the rejected heuristic still
+  # returns an empty diff on that fixture — so the test fails if it ever
+  # stops discriminating. Hermetic: real `git subtree` fixtures in a tmpdir,
+  # zero network. Same direct-`bash` form as the sibling doctor gates above
+  # (kernel Makefile is generator-owned; no new target added here). The two
+  # hook halves of the notice and the `temperloop doctor` subcommand ride the
+  # existing glob gates (`make test-hooks`, `make test-cli-subcommands`).
+  "bash workflows/scripts/tests/test_toolkit_provenance.sh"
+  "bash workflows/scripts/tests/test_doctor_toolkit_provenance.sh"
   # Legacy host-config preflight (temperloop#908): workflows/scripts/install/
   # legacy-host-preflight.sh's registry-driven HOST-STATE check — asserts the
   # CONSUMABLE ON THE HOST for a legacy path a release has removed, never the

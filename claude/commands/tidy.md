@@ -615,6 +615,33 @@ For each drift class the `report` output surfaces, dispose as follows:
 
 A ledger with no open class-C records past their window is a no-op — surface nothing. A discharge here is silent to the drain summary (the ledger itself is the durable record `/check-in` reviews); only a recurring `AGENT_STALE`/`AGENT_UNLOADED` or a record with no derivable predicate needs the operator's attention, and both already have their own surfacing path above.
 
+### Toolkit provenance
+
+A periodic **detect-and-propose** probe for one question the other hygiene steps never ask: is the toolkit code this host is *running* the release it claims to be? (temperloop#1047, ADR 0021/0022.) The two unprompted notices this feature ships — the session-start hook and the subtree-edit guard's re-probe — both fire only when somebody is *in a session*. A modified checkout on a host nobody has started a session on stays invisible indefinitely, and the design's own silent-fork metric (what fraction of modified checkouts end reconciled versus neither) has no collection point at all without a periodic reader. This step is that reader.
+
+**A drain-internal detector**, not a capture/backstop pair — exactly like § Vault hygiene and § Environment hygiene above. A modified toolkit tree is accumulated *state*, not an author action a capture rule captures, so it backstops **no live extraction rule**, needs **no Capture/Backstop registry row**, and requires **no `validate-capture-backstop.sh` change**.
+
+**Run the probe**, both formats — `report` for the verdict and attribution this step reasons over, `entry` for the ready-to-append block:
+
+```
+workflows/scripts/toolkit-provenance.sh --format report
+workflows/scripts/toolkit-provenance.sh --format entry
+```
+
+Both are **read-only, network-free and fail-open**: the probe writes nothing anywhere (the whole mechanism persists no state by design), never fetches, and always exits 0. A checkout with no release baseline — the kernel's own development checkout, or any tree that is neither a vendoring consumer nor the managed clone — answers `UNKNOWN`, and `--format entry` prints nothing there, so this is safe to run unconditionally.
+
+Dispose by verdict:
+
+- **`RELEASED`** — surface nothing. The common case.
+- **`UNKNOWN`** — surface nothing. A missing baseline is not a finding; the probe is telling you it cannot answer, which is its correct behaviour in a kernel checkout and is never an alarm.
+- **`MODIFIED`** — an **`ask-at-checkin` deferral** ([[Context/foundation - AskUserQuestion severity taxonomy]]). Append the `entry`-format block verbatim as one `### open` entry to the pending-decisions surface (`Pipeline/pending decisions.md` vs the legacy `Context/pipeline - pending decisions.md` — target pinned by the append-target resolution rule of the path fallback convention, `claude/commands/check-in.md`; in the knowledge store) via `mcp__obsidian-builtin__vault_append`. `/check-in` disposes: upstream the change, restore the released content, or dismiss it as a deliberate in-flight fast-lane edit.
+
+**Never auto-reconcile.** This step never restores a file, never reverts a commit, never opens a PR, and never sets `KERNEL_EDIT_ACK`. A modified toolkit tree is frequently a *deliberate* state (the sanctioned fast-lane path — `docs/features/toolkit-provenance.md`), and mechanically undoing an operator's live edit would destroy exactly the work the mechanism exists to make visible. Report; the operator decides. This is the same report-never-mutate posture § Environment hygiene applies to a foreign checkout's `HEAD`, for the same reason.
+
+**Recurrence is the signal worth escalating, not a single run.** One `MODIFIED` run is ordinary. The *same* checkout reporting `MODIFIED` across many consecutive drains — with no `Upstream:` reference on its committed drift, so nothing suggests it is in flight — is a silent fork: file a board defect for it via `workflows/scripts/board/capture.sh "<title>" --body "<one-line context>" --label bug --repo kernel` (dedup against an existing issue first, same as § Unfiled defects), rather than letting it re-surface silently every night.
+
+**Default to silence.** A `RELEASED` or `UNKNOWN` verdict emits no entry and no Step 6 line.
+
 ### Generated navigation (Index + Project Home MOCs)
 
 A **detect-and-generate** step, the sibling of § Vault hygiene and § Environment hygiene above (temperloop#231, epic #226 "generated navigation"). Design intent (epic #226 ADR §2.1): project-first browsing of the vault is served **virtually**, by regeneration from signals already present in the store, never by hand-curating a nav page. `Index.md` (top-level) and `Projects/<name>/Home.md` (one per detected project) are the two generated MOCs; both are content **/tidy owns**, not the operator — a hand-edit to either is never reflected back and is never silently destroyed (see the refuse-and-propose behavior below). <!-- cite: T.17 guard:workflows/scripts/drain/generate_moc.sh -->

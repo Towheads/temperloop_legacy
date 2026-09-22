@@ -71,7 +71,12 @@ fact and can only observe and record, never block.
   the kernel repository first, then pull it down. A build worker operating
   inside an already-supervised, marker-armed worktree is exempted from the
   interactive prompt (nothing to ask — no live operator is present, and a
-  downstream mechanical check still catches an unwaived change).
+  downstream mechanical check still catches an unwaived change). Whichever way
+  it resolves, it first re-runs the toolkit-provenance probe and folds the
+  current verdict into its message: this guard firing *is* the moment the
+  vendored tree stops being the release it claims, so it is the only place a
+  mid-session provenance notice can be delivered at all (see
+  [toolkit provenance](toolkit-provenance.md)).
 - **claude-p-spawn-guard.sh** — matches `Bash`. A headless `claude -p` /
   `--print` spawn does not inherit the launching session's model; it resolves
   the *machine's* saved default, so a fan-out composed mid-run silently routes
@@ -156,8 +161,11 @@ containment an evaluation run is least able to notice the loss of.
 **Session lifecycle hooks.** Beyond the six guards, a set of `SessionStart`
 and `SessionEnd` hooks handle non-blocking bookkeeping: writing a transcript
 stub when a session ends, draining accumulated stubs into durable storage
-when a new session starts, and a health-preflight check that injects a
-banner into the model's context if a dependency looks degraded. These never
+when a new session starts, a health-preflight check that injects a banner into
+the model's context if a dependency looks degraded, and a toolkit-provenance
+notice that injects a banner when the toolkit code about to run is not the
+release it claims to be (silent otherwise — see
+[toolkit provenance](toolkit-provenance.md)). These never
 return a permission decision — they observe and record, and every one of
 them is itself `EVAL_RUN`-suppressed so an evaluation run's transcripts and
 telemetry never mix with production data.

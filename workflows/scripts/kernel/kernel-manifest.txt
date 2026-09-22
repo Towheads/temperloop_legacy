@@ -436,6 +436,10 @@ kernel workflows/scripts/emit-command-run.sh
 kernel workflows/scripts/emit-session-context.sh
 kernel workflows/scripts/env-hygiene-report.sh
 kernel workflows/scripts/ready-pr-sweep.sh
+# The toolkit-provenance probe (temperloop#1047): a stranger's vendoring or
+# managed-clone install is exactly who needs to know whether the toolkit code
+# they are running is the release it claims to be — kernel, not overlay.
+kernel workflows/scripts/toolkit-provenance.sh
 kernel workflows/scripts/emit-gh-perf.sh
 kernel workflows/scripts/emit-diagnose-queue.sh
 kernel workflows/scripts/emit-issue-touch.sh

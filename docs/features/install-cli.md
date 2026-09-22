@@ -144,7 +144,11 @@ present but its target does not exist on disk). `bash
 workflows/scripts/install/doctor.sh` exits 0 only
 when every entry is `OK`, 1 otherwise (`temperloop install` also prints this
 exact command at the end of its own run — see § Verify in `bin/README.md`).
-It separately reports a
+**`temperloop doctor` is the first-class way in**: the subcommand `exec`s that
+same script, so its output and exit code are identical by construction and it
+takes the same optional `<toolkit-root>` argument. (Earlier releases had no
+such subcommand and both this page and `bin/README.md` said so; that statement
+is superseded.) It separately reports a
 knowledge-store root check (does the agent-plane Obsidian MCP vault agree
 with the script-plane `KNOWLEDGE_STORE_ROOT`?), a cross-checkout
 install-source check (does the real, symlink-resolved location of a
@@ -156,7 +160,11 @@ different clone entirely? A mismatch names both real paths and both
 issue-cache store state — all read-only, all `SKIPPED`-not-`FAIL` when the
 underlying pieces simply aren't configured yet (the knowledge-store and
 cross-checkout checks additionally FAIL — not just report — on a genuine
-mismatch, contributing to doctor's exit code).
+mismatch, contributing to doctor's exit code). It also reports **toolkit
+provenance** — whether the toolkit code in this checkout is byte-identical to
+the release it claims to be — as a `WARN`-level, strictly non-fatal check that
+never touches the exit code; see
+[toolkit provenance](toolkit-provenance.md).
 
 **Installed build-workflow content check.** The five link states above
 compare a symlink's *target string*, and the cross-checkout check compares

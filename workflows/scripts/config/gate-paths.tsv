@@ -248,6 +248,8 @@ bash workflows/scripts/tests/test_doctor_cross_checkout_split.sh	workflows/scrip
 bash workflows/scripts/tests/test_doctor_symlinked_home.sh	workflows/scripts/install/** workflows/scripts/tests/test_doctor_symlinked_home.sh
 bash workflows/scripts/tests/test_doctor_installed_workflow_drift.sh	workflows/scripts/install/** claude/workflows/** workflows/scripts/tests/test_doctor_installed_workflow_drift.sh
 bash workflows/scripts/tests/test_doctor_bm_tool.sh	workflows/scripts/install/** workflows/scripts/lib/knowledge_* workflows/scripts/tests/test_doctor_bm_tool.sh
+bash workflows/scripts/tests/test_toolkit_provenance.sh	workflows/scripts/toolkit-provenance.sh workflows/scripts/tests/test_toolkit_provenance.sh
+bash workflows/scripts/tests/test_doctor_toolkit_provenance.sh	workflows/scripts/toolkit-provenance.sh workflows/scripts/install/** workflows/scripts/tests/test_doctor_toolkit_provenance.sh
 bash workflows/scripts/tests/test_legacy_host_preflight.sh	workflows/scripts/install/** workflows/scripts/tests/test_legacy_host_preflight.sh
 make test-install-links	workflows/scripts/install/** claude/** bin/** workflows/scripts/tests/test_install_links.sh
 make test-install-worktree-guard	workflows/scripts/install/** claude/hooks/** workflows/scripts/tests/test_install_worktree_guard.sh
