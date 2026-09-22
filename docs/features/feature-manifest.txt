@@ -180,6 +180,9 @@ tidy workflows/scripts/ready-pr-sweep.sh
 tidy workflows/scripts/tests/test_ready_pr_sweep.sh
 tidy workflows/scripts/build/env-reconcile.sh
 tidy workflows/scripts/build/tests/test_env_reconcile.sh
+tidy workflows/scripts/build/lib/job-scratch.sh
+tidy workflows/scripts/build/job-scratch-reclaim.sh
+tidy workflows/scripts/build/tests/test_job_scratch.sh
 tidy workflows/scripts/test_findings.py
 
 # ── telemetry — raw-lake emits + their validators ───────────────────────────

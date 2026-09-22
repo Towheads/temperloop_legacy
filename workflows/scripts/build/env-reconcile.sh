@@ -188,6 +188,33 @@
 #                            exclude this path (_status_porcelain_sans_harness)
 #                            precisely BECAUSE it is classified here; every
 #                            other dirty path still reports DIRTY.
+#   job scratch <root>/<id>/tmp — regenerable background-job scratch
+#                            (temperloop#1111). The same "disposable by
+#                            definition" role as a worktree, one layer down:
+#                            the harness's job dir holds a run RECORD
+#                            (state.json, timeline.jsonl, ~140KB) beside a
+#                            tmp/ tree workers fill with DerivedData and eval
+#                            corpora — 100% regenerable, and reclaimed by
+#                            nothing until this class existed (two job dirs
+#                            held 38.5GB and took the root volume to 0 bytes
+#                            free). Drift:
+#                              JOB_SCRATCH_RECLAIMABLE:<id>:<MB>MB:<state>
+#                                              terminal job, past its grace
+#                                              window, scratch over the size
+#                                              floor — safe to delete
+#                              JOB_SCRATCH_ABANDONED:<id>:<MB>MB:<state>
+#                                              big scratch under a job that is
+#                                              NOT terminal (or whose state is
+#                                              unreadable) and has been idle
+#                                              past the abandoned horizon —
+#                                              REPORT-ONLY, never auto-deleted
+#                            Classification is delegated verbatim to
+#                            lib/job-scratch.sh, so this reconciler and the
+#                            mutating job-scratch-reclaim.sh can never disagree
+#                            about what is safe to delete — and this file stays
+#                            READ-ONLY as promised above. Override:
+#                            JOB_SCRATCH_ROOT (plus the floor/window settings
+#                            in that lib's own header).
 #
 #   launchd agent            each infra/launchd/*.plist declared beside a
 #                            checkout above. Drift:
@@ -466,6 +493,17 @@ if ! command -v merged_detect_is_merged >/dev/null 2>&1; then
 fi
 # _merged_detect_gh is defined by the sourced lib above (or, if the source
 # failed, is simply undefined — _pr_state_of below tolerates that via `|| true`).
+
+# ── Source the shared job-scratch classifier (temperloop#1111) ───────────────
+# READ-ONLY by construction — the lib defines classification only; deletion
+# lives in the sibling job-scratch-reclaim.sh, which this file never calls.
+# shellcheck source=lib/job-scratch.sh
+source "$SCRIPT_DIR/lib/job-scratch.sh" 2>/dev/null || true
+if ! command -v job_scratch_list >/dev/null 2>&1; then
+  # Fail-open stand-in if the sibling lib is somehow missing: report no job
+  # scratch at all rather than abort the whole reconcile.
+  job_scratch_list() { :; }
+fi
 
 # ── Arg parse ─────────────────────────────────────────────────────────────────
 FORMAT="report"
@@ -1851,6 +1889,37 @@ while [ "$_i" -lt "${#HARNESS_WT_ROOTS[@]}" ]; do
   done < <(find "${c}/${HARNESS_WT_SUBDIR}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
 done
 
+# Regenerable background-job scratch (temperloop#1111). Machine-wide like the
+# composed-CLAUDE.md check, not per-checkout: the harness owns ONE job root.
+# The two verdicts are BOTH drift, but they are disposed differently by /tidy —
+# RECLAIMABLE is auto-healed in-lane (job-scratch-reclaim.sh --apply), while
+# ABANDONED is report-only, because a non-terminal job can still resume and
+# deleting a live run's scratch mid-flight is worse than leaving the bytes.
+JOB_SCRATCH_LINES=""
+job_scratch_checked=0
+while IFS= read -r _js_line; do
+  [ -n "$_js_line" ] || continue
+  job_scratch_checked=$((job_scratch_checked + 1))
+  cls="${_js_line%% *}"
+  _js_dir="${_js_line#* }"
+  JOB_SCRATCH_LINES="${JOB_SCRATCH_LINES}  DRIFT        ${_js_dir}/tmp  [${cls}]"$'\n'
+  case "$cls" in
+    JOB_SCRATCH_RECLAIMABLE:*)
+      add "- ⚠️ reclaimable job scratch: ${_js_dir}/tmp — ${cls}" drift
+      # Emit the remedy in BOTH formats (same convention as the vendored-hook
+      # re-sync line above): the report table an operator reads by eye, and the
+      # FINDINGS block --format entry renders into the review surface. Appended
+      # via `add` WITHOUT the drift flag — it annotates the alarm already
+      # counted above rather than counting as a second one.
+      JOB_SCRATCH_LINES="${JOB_SCRATCH_LINES}               ↳ reclaim: workflows/scripts/build/job-scratch-reclaim.sh --apply"$'\n'
+      add "  - remedy — reclaim it: \`workflows/scripts/build/job-scratch-reclaim.sh --apply\`"
+      ;;
+    *)
+      add "- ⚠️ abandoned job scratch: ${_js_dir}/tmp — ${cls} (report-only: a non-terminal job may still resume)" drift
+      ;;
+  esac
+done < <(job_scratch_list)
+
 AGENT_LINES=""
 agent_checked=0
 _i=0
@@ -1904,6 +1973,8 @@ echo "-- composed CLAUDE.md --"
 printf '%s' "$COMPOSED_LINES"
 echo "-- worktrees ($wt_checked checked) --"
 printf '%s' "$WT_LINES"
+echo "-- job scratch ($job_scratch_checked flagged) --"
+printf '%s' "$JOB_SCRATCH_LINES"
 echo "-- launchd agents ($agent_checked checked) --"
 printf '%s' "$AGENT_LINES"
 echo "---"

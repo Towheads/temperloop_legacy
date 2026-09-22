@@ -67,6 +67,20 @@ detector that mines assistant-narrated reasoning reversals for reusable
 patterns or pitfalls, and a vault-hygiene probe that periodically checks for
 housekeeping and structural drift the vault otherwise never alarms on.
 
+One of those drain-internal detectors also sweeps the **host filesystem**:
+checkouts, worktrees, launchd agents, and the scratch directories background
+job runs leave behind. Job scratch is the case with real bytes attached —
+worker isolation gives each build its own scratch tree, but nothing reclaimed
+those trees when the job ended, so regenerable build output and eval corpora
+accumulated until a root volume filled completely. The sweep classifies each
+job by its own recorded terminal state: a finished job past a grace window,
+holding scratch over a size floor, is reclaimed in place (the run record is
+kept; only the regenerable tree is deleted), while a job that has **not**
+finished is reported for a human instead, because it may still resume. The
+reclaimer is dry-run unless explicitly applied, re-verifies each target
+against the job root before deleting it, and refuses obviously-wrong sweep
+roots outright.
+
 Every extraction is written as a **findings record** (one per drain-produced
 artifact) so the whole extraction history — lexicon hits and model-skim
 misses alike — is queryable rather than only visible inside the note it
@@ -134,6 +148,14 @@ stale-claim sweep costs one cached-bypassed board resolve plus two flat-cost
 list reads per governed board — no per-item burst. Disk cost is the raw
 findings-record stream, which grows by one line per accepted extraction and
 is rotated monthly.
+
+Disk is also **reclaimed** here rather than only consumed: the environment
+sweep's job-scratch pass is the only thing that bounds background-job scratch,
+which is otherwise write-only and unbounded (the motivating incident was two
+finished job directories holding 38.5GB of regenerable build and eval
+artifacts on a volume that then hit zero bytes free). Its own probe cost is
+one directory-size measurement per job directory, gated by a size floor so a
+routine host does no per-job work worth naming.
 
 ## Telemetry
 

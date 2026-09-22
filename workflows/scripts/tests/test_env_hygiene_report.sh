@@ -77,18 +77,25 @@ exit 0
 FAKE_LAUNCHCTL
 chmod +x "$TMP/bin/launchctl"
 
+# JOB_SCRATCH_ROOT is pinned at a path that does not exist, so the job-scratch
+# drift class (temperloop#1111) can never leak the RUNNING HOST's real
+# ~/.claude/jobs backlog into these fixtures' drift counts — this suite would
+# otherwise pass or fail depending on how much scratch the developer's machine
+# happens to be carrying.
 DRIFT_ENV=(
   PATH="$TMP/bin:$PATH"
   GH_MOCK_MERGED_BRANCHES="feature-parked"
   ENV_RECONCILE_CRON_CHECKOUTS="$TMP/no-such-cron-checkout"
   ENV_RECONCILE_OPERATOR_CHECKOUTS="$OP1"
   ENV_RECONCILE_LAUNCHD_DIRS="$TMP/no-such-launchd-dir"
+  JOB_SCRATCH_ROOT="$TMP/no-such-jobs-root"
 )
 CLEAN_ENV=(
   PATH="$TMP/bin:$PATH"
   ENV_RECONCILE_CRON_CHECKOUTS="$TMP/no-such-cron-checkout"
   ENV_RECONCILE_OPERATOR_CHECKOUTS="$TMP/no-such-operator-checkout"
   ENV_RECONCILE_LAUNCHD_DIRS="$TMP/no-such-launchd-dir"
+  JOB_SCRATCH_ROOT="$TMP/no-such-jobs-root"
 )
 
 # ── Test 1: drift fixture → --format entry passthrough ───────────────────────

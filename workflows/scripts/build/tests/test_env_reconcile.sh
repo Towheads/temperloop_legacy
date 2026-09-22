@@ -38,6 +38,14 @@ TMP="$(mktemp -d)"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
+# Hermeticity pin (temperloop#1111): env-reconcile now also classifies
+# background-job scratch under JOB_SCRATCH_ROOT, which defaults to the RUNNING
+# HOST's real ~/.claude/jobs. Left unpinned, the developer's own job backlog
+# would add drift to every fixture below and make the exact `DRIFT: N` counts
+# machine-dependent. Every case pins it; the job-scratch cases at the bottom
+# override it with their own fixture root.
+export JOB_SCRATCH_ROOT="$TMP/no-such-jobs-root"
+
 # --- Fixture: an "upstream" with a main branch -------------------------------
 git init -q --initial-branch=main "$TMP/upstream"
 git -C "$TMP/upstream" commit -q --allow-empty -m init
@@ -1274,5 +1282,99 @@ echo "PASS: ENV_RECONCILE_DORMANT_DAYS gates the dormancy horizon"
 [ "$(git -C "$DORM" rev-parse HEAD)" = "$(git -C "$DORM" rev-parse origin/main~1 2>/dev/null || git -C "$DORM" rev-parse HEAD)" ] \
   || fail "dormant checkout's HEAD moved — env-reconcile.sh must never pull"
 echo "PASS: dormancy detection stays read-only"
+# --- Job scratch (temperloop#1111): both verdicts surface as drift ----------
+# env-reconcile is the DETECTOR half of the retention policy; the reclaimer's
+# own behaviour (what it deletes, what it refuses) is covered in
+# test_job_scratch.sh. What matters here is that the classes reach the report,
+# the entry block, and the drift count — and that this READ-ONLY script does
+# not delete the scratch it just flagged.
+JOBS="$TMP/jobs"
+mkdir -p "$JOBS/term01/tmp/dd-266" "$JOBS/live01/tmp"
+printf '{\n  "state": "done"\n}\n'    > "$JOBS/term01/state.json"
+printf '{\n  "state": "blocked"\n}\n' > "$JOBS/live01/state.json"
+# 2 MB apiece, well over the floor these runs pin.
+dd if=/dev/zero of="$JOBS/term01/tmp/dd-266/blob" bs=1024 count=2048 2>/dev/null
+dd if=/dev/zero of="$JOBS/live01/tmp/blob"        bs=1024 count=2048 2>/dev/null
+# Age both past every window below (mtime in the past; no sleep needed).
+touch -t 202001010000 "$JOBS/term01/state.json" "$JOBS/live01/state.json"
+
+rc=0
+jsout="$(
+  JOB_SCRATCH_ROOT="$JOBS" JOB_SCRATCH_MIN_MB=1 \
+  JOB_SCRATCH_GRACE_DAYS=1 JOB_SCRATCH_ABANDONED_DAYS=14 \
+  ENV_RECONCILE_CRON_CHECKOUTS="$TMP/no-such-cron-checkout" \
+  ENV_RECONCILE_OPERATOR_CHECKOUTS="$TMP/no-such-operator-checkout" \
+  ENV_RECONCILE_LAUNCHD_DIRS="$TMP/no-such-launchd-dir" \
+  bash "$SCRIPT" --format report
+)" || rc=$?
+[ "$rc" -eq 0 ] || fail "job scratch: expected exit 0 (got $rc); output:
+$jsout"
+grep -q "JOB_SCRATCH_RECLAIMABLE:term01:.*:done" <<<"$jsout" \
+  || fail "a terminal, aged, oversize job tmp/ should report JOB_SCRATCH_RECLAIMABLE; output:
+$jsout"
+grep -q "JOB_SCRATCH_ABANDONED:live01:.*:blocked" <<<"$jsout" \
+  || fail "a non-terminal aged job tmp/ should report JOB_SCRATCH_ABANDONED; output:
+$jsout"
+grep -q "^DRIFT: 2$" <<<"$jsout" \
+  || fail "expected exactly the 2 job-scratch alarms; output:
+$jsout"
+echo "PASS: job scratch -> JOB_SCRATCH_RECLAIMABLE + JOB_SCRATCH_ABANDONED, counted as drift"
+
+# The RECLAIMABLE finding carries its remedy command (an operator reading the
+# surface must not have to go look the invocation up).
+grep -q "job-scratch-reclaim.sh --apply" <<<"$jsout" \
+  || fail "the reclaimable finding must name its remedy command; output:
+$jsout"
+echo "PASS: reclaimable job scratch carries the job-scratch-reclaim.sh --apply remedy"
+
+# READ-ONLY: detection must not have deleted either tmp/ tree.
+[ -f "$JOBS/term01/tmp/dd-266/blob" ] || fail "env-reconcile.sh deleted job scratch — it must be READ-ONLY"
+[ -f "$JOBS/live01/tmp/blob" ]        || fail "env-reconcile.sh deleted job scratch — it must be READ-ONLY"
+echo "PASS: job-scratch detection is read-only"
+
+# The findings reach --format entry too (that block is what /tidy appends).
+rc=0
+jsentry="$(
+  JOB_SCRATCH_ROOT="$JOBS" JOB_SCRATCH_MIN_MB=1 \
+  ENV_RECONCILE_CRON_CHECKOUTS="$TMP/no-such-cron-checkout" \
+  ENV_RECONCILE_OPERATOR_CHECKOUTS="$TMP/no-such-operator-checkout" \
+  ENV_RECONCILE_LAUNCHD_DIRS="$TMP/no-such-launchd-dir" \
+  bash "$SCRIPT" --format entry
+)" || rc=$?
+[ "$rc" -eq 0 ] || fail "job scratch --format entry: expected exit 0 (got $rc)"
+grep -q "JOB_SCRATCH_RECLAIMABLE:term01" <<<"$jsentry" \
+  || fail "--format entry omitted the job-scratch finding; got:
+$jsentry"
+echo "PASS: job-scratch findings reach --format entry"
+
+# Under the floor -> silent. Same fixture, a floor above its size: no drift at
+# all, so a host with a few small job dirs never gets a nightly report.
+rc=0
+jsquiet="$(
+  JOB_SCRATCH_ROOT="$JOBS" JOB_SCRATCH_MIN_MB=4096 \
+  ENV_RECONCILE_CRON_CHECKOUTS="$TMP/no-such-cron-checkout" \
+  ENV_RECONCILE_OPERATOR_CHECKOUTS="$TMP/no-such-operator-checkout" \
+  ENV_RECONCILE_LAUNCHD_DIRS="$TMP/no-such-launchd-dir" \
+  bash "$SCRIPT" --format report
+)" || rc=$?
+[ "$rc" -eq 0 ] || fail "job scratch under floor: expected exit 0 (got $rc)"
+grep -q "^OK$" <<<"$jsquiet" \
+  || fail "job scratch under the size floor must not be drift; output:
+$jsquiet"
+echo "PASS: job scratch under the size floor is silent"
+
+# Absent job root -> fail-open, never a crash and never a false alarm.
+rc=0
+jsnone="$(
+  JOB_SCRATCH_ROOT="$TMP/no-such-jobs-root-at-all" \
+  ENV_RECONCILE_CRON_CHECKOUTS="$TMP/no-such-cron-checkout" \
+  ENV_RECONCILE_OPERATOR_CHECKOUTS="$TMP/no-such-operator-checkout" \
+  ENV_RECONCILE_LAUNCHD_DIRS="$TMP/no-such-launchd-dir" \
+  bash "$SCRIPT" --format report
+)" || rc=$?
+[ "$rc" -eq 0 ] || fail "absent job root: expected exit 0 (got $rc)"
+grep -q "^OK$" <<<"$jsnone" || fail "an absent job root must not be drift; output:
+$jsnone"
+echo "PASS: absent job root -> fail-open, no drift"
 
 echo "ALL PASS: test_env_reconcile.sh"
