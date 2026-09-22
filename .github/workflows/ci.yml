@@ -31,6 +31,25 @@ name: CI
 # the matrix would rename the context to plain `checks` and the required
 # check would then never report. Do not "simplify" it away.
 #
+# SINCE temperloop#2165 THE MATRIX IS A CONTEXT-NAME TOKEN, NOT A RUNNER
+# SELECTOR. `runs-on` is now resolved dynamically by the `runner-preflight`
+# job below (the self-hosted ci-mini Linux runner when it is online and
+# idle, hosted `ubuntu-latest` otherwise) and no longer reads `matrix.os`.
+# That separation is the entire point: GitHub derives a matrix job's
+# status-check name from the JOB ID plus its `strategy.matrix` VALUES —
+# `runs-on` contributes nothing to it — so the reported context stays
+# byte-identical `checks (ubuntu-latest)` on BOTH arms, and branch
+# protection / the merge queue are untouched.
+#
+# CONSEQUENCE, STATED PLAINLY: the literal `ubuntu-latest` in the matrix
+# below is now load-bearing ONLY as that context string. Changing it
+# renames the required check and bricks every future PR — the required
+# check would never report, so nothing could leave the merge queue. The
+# SEPARATE literal `"ubuntu-latest"` in runner-preflight's `HOSTED` is the
+# actual fallback runner. They must agree by convention (the fallback arm
+# should land on the image the context name claims), but they are two
+# different knobs: editing one does not move the other.
+#
 # WHICH GATES RUN, BY EVENT (temperloop#1024) — the workflow itself is
 # unchanged here; the split lives inside scripts/quality-gates.sh, so the
 # job name, the matrix, the required context `checks (ubuntu-latest)`, and
@@ -67,13 +86,111 @@ on:
     branches: [main]
 
 jobs:
+  # ── Self-hosted runner preflight (temperloop#2165) ───────────────────────
+  # Decide WHERE `checks` runs. The gate set is compute-bound and the hosted
+  # runner a private repo gets is 2 vCPU; the shared ci-mini Linux VM is a
+  # dedicated multi-core persistent runner (stood up by foundation#1927). So
+  # this job probes that runner and emits a dynamic `runs-on` for `checks`:
+  #
+  #   online AND idle ci-mini → ["self-hosted","linux","ci-mini"]
+  #   anything else           → "ubuntu-latest"   (never blocks the queue)
+  #
+  # "AND idle": there is ONE runner, so a second concurrent run routed to it
+  # would queue behind the first — overflow goes hosted instead (`busy` is on
+  # the runners API). Two preflights racing within a few seconds can both see
+  # idle; the loser waits one job, bounded by `timeout-minutes` on `checks`.
+  #
+  # PROBE = THE SAME LABEL SET `runs-on` DEMANDS, deliberately. If the probe
+  # accepted a runner carrying only `ci-mini` while `runs-on` also demands
+  # `linux`, the scheduler would never match it and the job would hang until
+  # its timeout — holding the merge queue. Requiring the identical triple
+  # makes probe and scheduler agree by construction. Comparison is
+  # case-folded because Actions' own label matching is case-insensitive
+  # (a runner self-registers `Linux`, not `linux`).
+  #
+  # BOTH SCOPES ARE PROBED (org, then repo) and the counts are summed. The
+  # ci-mini runner is org-level, so `/repos/{repo}/actions/runners` — which
+  # lists REPO-level runners only — would report zero for it and this repo
+  # would silently never use the runner at all. The repo endpoint is kept as
+  # well so a repo-level registration works without editing this file.
+  #
+  # GITHUB_TOKEN cannot list self-hosted runners (admin-only, not grantable
+  # to the workflow token), so detection uses the fine-grained PAT secret
+  # RUNNER_PAT. THAT SECRET IS NOT CONFIGURED ON THIS REPO TODAY, which is
+  # the point of the fail-safe: a missing/empty PAT, an API error, a 403 on
+  # either scope, or a fork PR (no secrets exposed) ALL fall through to
+  # hosted. Worst case is "runs on ubuntu-latest exactly as before" — never
+  # red, never hung. A bare kernel checkout with no runner and no secret
+  # therefore still gets a working `checks` run; the self-hosted path is an
+  # optimisation, never a requirement.
+  #
+  # THE REQUIRED STATUS CONTEXT IS UNAFFECTED: only `runs-on` is dynamic.
+  # See "SINCE temperloop#2165" in the header above for why.
+  runner-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runs_on: ${{ steps.pick.outputs.runs_on }}
+    steps:
+      - id: pick
+        env:
+          RUNNER_PAT: ${{ secrets.RUNNER_PAT }}
+          GH_OWNER: ${{ github.repository_owner }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          HOSTED='"ubuntu-latest"'
+          SELF='["self-hosted","linux","ci-mini"]'
+          if [ -z "${RUNNER_PAT:-}" ]; then
+            echo "No RUNNER_PAT secret (absent, or a fork PR) — routing checks to hosted ubuntu-latest."
+            echo "runs_on=$HOSTED" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Count runners carrying EVERY label in $SELF that are online AND idle.
+          # Any curl/jq failure (403, 404, network, malformed body) yields "" and
+          # is treated as zero by the arithmetic below.
+          count_idle() {
+            curl -sf --max-time 20 \
+              -H "Authorization: Bearer $RUNNER_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/$1/actions/runners?per_page=100" \
+              | jq -r --argjson want "$SELF" \
+                  '[.runners[]? | select(.status=="online" and .busy==false)
+                     | select(($want - [.labels[].name | ascii_downcase]) | length == 0)]
+                   | length' 2>/dev/null
+          }
+          org_n=$(count_idle "orgs/$GH_OWNER"); org_n=${org_n:-0}
+          repo_n=$(count_idle "repos/$GH_REPOSITORY"); repo_n=${repo_n:-0}
+          case "$org_n$repo_n" in *[!0-9]*) org_n=0; repo_n=0 ;; esac
+          idle=$(( org_n + repo_n ))
+          if [ "$idle" -ge 1 ]; then
+            echo "ci-mini is online and idle (org=$org_n repo=$repo_n) — routing checks to the self-hosted runner."
+            echo "runs_on=$SELF" >> "$GITHUB_OUTPUT"
+          else
+            echo "No online+idle ci-mini runner (org=$org_n repo=$repo_n) — routing checks to hosted ubuntu-latest."
+            echo "runs_on=$HOSTED" >> "$GITHUB_OUTPUT"
+          fi
+
   checks:
-    runs-on: ${{ matrix.os }}
+    needs: [runner-preflight]
+    # Dynamic runner (temperloop#2165): the shared ci-mini Linux VM when it is
+    # online and idle, else hosted ubuntu-latest — resolved by runner-preflight
+    # above. The job body is IDENTICAL on both targets; only the machine
+    # differs. `matrix.os` is deliberately NOT read here — see the header.
+    runs-on: ${{ fromJSON(needs.runner-preflight.outputs.runs_on) }}
+    # Hard backstop for a wedged self-hosted job: without it a hung gate runs
+    # to GitHub's 6-hour default and holds the merge queue. The full set is
+    # ~5-6 min on the hosted 2 vCPU image today; 30 min is comfortably above
+    # it and well below the default.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         # Single-entry matrix, retained deliberately — see "KEEP THE
-        # MATRIX" in the header comment above.
+        # MATRIX" in the header comment above. This value is the required
+        # status-check CONTEXT NAME (`checks (ubuntu-latest)`), not a runner
+        # selector; the runner comes from `runs-on` above. Renaming it makes
+        # the required check stop reporting and blocks every future merge.
         os: [ubuntu-latest]
     # The diff-scoped PR leak guard (make test-pr-leak-guard, run inside
     # quality-gates.sh) needs the PR's base commit to diff the added lines
