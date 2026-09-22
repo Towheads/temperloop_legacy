@@ -414,7 +414,13 @@ count
 # value on purpose (never pinned equal to the shipped default).
 cat >"$WT/scripts/quality-gates.sh" <<'G'
 #!/usr/bin/env bash
-sleep 20
+# EXEC, not a plain `sleep` (temperloop#2163): score.sh bounds this gate with
+# run_with_timeout, whose portable bash backend (a stock macOS runner, with
+# neither `timeout` nor `gtimeout`) `kill -9`s the process it spawned — this
+# bash. A forked `sleep` would be that bash's CHILD, be re-parented to init,
+# and outlive the suite as an orphan the CI runner names at job teardown.
+# `exec` makes the sleep BE the bounded process, so the timeout reaps it.
+exec sleep 20
 G
 out="$(env REPLAY_SCORE_GATE_TIMEOUT_SECS=1 bash "$SCORE" gates --worktree "$WT")"
 [ "$(jq -r .timed_out <<<"$out")" = "true" ] || fail "A7: expected timed_out=true, got: $out"

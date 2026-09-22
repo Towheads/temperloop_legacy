@@ -80,11 +80,64 @@
 #      driver overlapping a record's two legs FAILS the same predicate)
 #   L  the suite-wide no-live-call canary verdict
 #
-# Usage: bash workflows/scripts/model-comparison/tests/test_replay_batch.sh
+# Usage: bash workflows/scripts/model-comparison/tests/test_replay_batch.sh [--group 1..8]
 #
 # shellcheck disable=SC2016
 
 set -uo pipefail
+
+# ── SHARDING: `--group N` (temperloop#2163) ────────────────────────────────
+# The sections above fall into eight DEPENDENCY-CLOSED groups. `--group N` runs
+# exactly one of them; with no flag every group runs, in file order, with the
+# same assertions, exactly as before. Nothing is skipped, moved to nightly or
+# loosened — the partition is only about WHERE the wall time is paid.
+#
+# WHY: the quality-gate pool's makespan is max(total/jobs, longest single
+# gate), so a 250-second suite is a straggler no amount of added pool
+# parallelism can shorten — it sets the floor on its own. The work here is
+# irreducibly ~190 replay legs at ~1.3s each (measured: 0.43s worktree
+# prepare + 0.25s teardown + ~0.6s execute-and-score per leg, against a
+# fixture whose runners are already recorded stubs and whose gate is a
+# two-line script). There is no wait to delete, so the only honest way to
+# shorten the longest gate is to run those legs in more than one process.
+#
+# THE GROUPS, and why each is closed:
+#   1  A B          the refusal paths; no state flows out of them
+#   2  C D E F      ONE chain: C1's happy-path batch populates $A_OUT/$A_STATE
+#                   and E resumes it; D's degraded batch populates $FAIL_OUT
+#                   and F asserts teardown on BOTH that failure path and C's
+#                   success path
+#   3  G H          the report producer and the judge pass, both over the
+#                   section-C run — rebuilt on a shard by drive_a_happy_path
+#   4  I J          interrupt semantics, arm-file reconciliation
+#   5  K            the circuit breaker (8-leg corpora, four scenarios)
+#   6  S M          projected-vs-observed spend, counterbalanced arm order
+#   7  N            record-level concurrency (carries its own N=1 reference run)
+#   8  R W          --retry-stage recovery, atomic leg-state writes
+#
+# Section L — the no-live-call canary verdict — is deliberately OUTSIDE the
+# partition and runs at the END of every shard, so "no live call happened" is
+# asserted for whatever this process actually ran rather than only for a
+# whole-suite run. Every group therefore carries its own hermeticity proof.
+#
+# The few fixtures that straddle a boundary ($A_OUT/$A_STATE and their drive,
+# the circuit breaker's corpus and stub) are defined with the rest of the
+# fixture setup below, never inside a group, so every group starts from the
+# same base.
+GROUP="all"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --group) GROUP="${2:?--group needs a value}"; shift 2 ;;
+    *) echo "test_replay_batch.sh: unknown arg: $1 (want --group 1..8)" >&2; exit 2 ;;
+  esac
+done
+case "$GROUP" in
+  all|1|2|3|4|5|6|7|8) ;;
+  *) echo "test_replay_batch.sh: --group must be 1..8 (got: $GROUP)" >&2; exit 2 ;;
+esac
+
+# run_group <n> -> rc 0 iff group <n> should run in this process.
+run_group() { [ "$GROUP" = "all" ] || [ "$GROUP" = "$1" ]; }
 
 # Physical derivation (`cd -P`) — dir-symlink-composition-safe (temperloop#1557).
 HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -353,11 +406,54 @@ wt_count() {  # how many mc-replay-* worktrees the fixture repo currently has
   printf '%s' "$n"
 }
 
+# ── FIXTURES THAT STRADDLE A GROUP BOUNDARY (temperloop#2163) ─────────────
+# Defined here, with the rest of the fixture setup, rather than inside the
+# first group that happens to use them — so a `--group N` shard starts from
+# the same base as a whole-suite run. Nothing here DRIVES anything: these are
+# paths and stubs only, and each group still produces its own state.
+
+# Section A names these; section C populates them and E/F/G/H read them back.
+A_OUT="$WORK/out-a"; A_STATE="$WORK/state-a"
+
+# drive_a_happy_path — the judged, two-arm CORPUS_A batch. Section C1 asserts
+# on it; sections E/F/G/H then resume, tear down, report on and judge that same
+# run. It is a NAMED helper rather than inline in C1 so the G/H shard can
+# rebuild the state it reads without re-running C1's assertions.
+drive_a_happy_path() {
+  : >"$CAND_LOG"
+  DRIVE_ARGS=(--corpus-file "$CORPUS_A" --repo-root "$REPO" --out-dir "$A_OUT" --state-dir "$A_STATE"
+              --baseline-runner "bash $BASE_STUB" --candidate-runner "bash $CAND_STUB"
+              --judge-runner "bash $JUDGE_STUB" --confirm)
+  drive ""
+}
+
+# CORPUS_CB — 4 eligible records (8 legs) driven at a threshold of 2, so the
+# breaker trips on the second leg and 6 legs across 3 whole records are left
+# un-attempted. The threshold is passed as the SETTING, never a flag: that is
+# what proves it is config-named rather than a literal in the driver.
+CORPUS_CB="$WORK/corpus-cb.jsonl"
+{ mk_corpus_line 401 eligible "$BASE"
+  mk_corpus_line 402 eligible "$BASE"
+  mk_corpus_line 403 eligible "$BASE"
+  mk_corpus_line 404 eligible "$BASE"; } >"$CORPUS_CB"
+
+# The systemically-unavailable runner: every call fails the same way, which
+# replay.sh execute turns into a `candidate-spawn` integration-error record.
+CB_LOG="$WORK/cb-calls.log"; : >"$CB_LOG"
+CB_STUB="$WORK/stub-cb-unavailable.sh"
+cat >"$CB_STUB" <<STUBEOF
+#!/usr/bin/env bash
+set -u
+printf 'cb %s\n' "\$1" >>"$CB_LOG"
+echo "API error 429: rate limit exceeded" >&2
+exit 1
+STUBEOF
+chmod +x "$CB_STUB"
+
+if run_group 1; then  # sections A, B
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION A — THE SEAM. Every un-seamed arm refuses, before ANY spend.
 # ═══════════════════════════════════════════════════════════════════════════
-A_OUT="$WORK/out-a"; A_STATE="$WORK/state-a"
-
 # A1 — no runner at all, no --live.
 count
 DRIVE_ARGS=(--corpus-file "$CORPUS_A" --repo-root "$REPO" --out-dir "$A_OUT" --state-dir "$A_STATE" --confirm)
@@ -459,17 +555,16 @@ mut_b_calls="$(wc -l <"$CAND_LOG" | tr -d ' ')"
 : >"$CAND_LOG"
 ok "B4 MUTATION PROOF: neutering the gate's stop check DOES execute replays ($mut_b_calls candidate calls) — B3's refusal is load-bearing"
 
+fi
+
+if run_group 2; then  # sections C, D, E, F
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION C — THE TWO-ARM UNIT CONTRACT (temperloop#1379) + THE BATCH CAP.
 # ═══════════════════════════════════════════════════════════════════════════
 
 # C1 — the happy path over CORPUS_A: 2 eligible records, BOTH arms.
 count
-: >"$CAND_LOG"
-DRIVE_ARGS=(--corpus-file "$CORPUS_A" --repo-root "$REPO" --out-dir "$A_OUT" --state-dir "$A_STATE"
-            --baseline-runner "bash $BASE_STUB" --candidate-runner "bash $CAND_STUB"
-            --judge-runner "bash $JUDGE_STUB" --confirm)
-drive ""
+drive_a_happy_path
 [ "$RC" -eq 0 ] || fail "C1: the happy-path batch should exit 0, got $RC: $OUT / $(head -c 600 "$WORK/last-stderr.txt")"
 [ "$(jq -r '.outcome' <<<"$OUT")" = "BATCH_COMPLETE" ] || fail "C1: expected BATCH_COMPLETE, got: $OUT"
 [ "$(jq -r '.selection.selected_records_n' <<<"$OUT")" = "2" ] || fail "C1: expected 2 selected corpus records (the rejected one is never replayed), got: $OUT"
@@ -731,6 +826,19 @@ done
 [ "$(wt_count)" = "0" ] || fail "F2: could not clean up the mutation proof's leaked worktrees"
 ok "F2 MUTATION PROOF: removing teardown leaks $mut_g_wt worktree(s) — F1's clean sweep is load-bearing"
 
+fi
+
+if run_group 3; then  # sections G, H
+# Section C1 built $A_OUT/$A_STATE; on a SHARD that did not run section C,
+# rebuild it here from the same drive before G reports on it and H judges it.
+# Skipped on a whole-suite run, where C1 has already produced it — so `all`
+# executes exactly the drives it always did (temperloop#2163).
+if [ "$GROUP" != "all" ]; then
+  drive_a_happy_path
+  # C3 reads the authorized cost UNIT off that same run; G2 compares the
+  # report's unit against it, so a shard has to re-derive it here.
+  pf_basis="$(jq -r '.preflight.cost_basis' <<<"$OUT")"
+fi
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION G — THE REPORT PRODUCER CONSUMES THE DRIVER'S OUTPUT UNCHANGED.
 # ═══════════════════════════════════════════════════════════════════════════
@@ -831,6 +939,9 @@ drive ""
 [ ! -e "$CANARY" ] || fail "H5: the unmutated driver reached a 'claude' binary: $(cat "$CANARY")"
 ok "H5 the unmutated driver, on the same input, reaches no 'claude' at all"
 
+fi
+
+if run_group 4; then  # sections I, J
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION I — INTERRUPT SEMANTICS (temperloop#1527).
 #
@@ -1078,6 +1189,9 @@ jq -e '.completion.rate_caveat | type == "string" and (length > 20)' <<<"$OUT" >
   || fail "J2: the caveat must be NAMED, never a bare flag: $(jq -c .completion <<<"$OUT")"
 ok "J2 MUTATION PROOF: the pre-fix judge substitution corrupts the arm file, and the driver REPORTS the mismatch instead of a clean 1.0 completion rate over it"
 
+fi
+
+if run_group 5; then  # section K
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION K — THE CIRCUIT BREAKER (temperloop#1554).
 #
@@ -1103,29 +1217,6 @@ ok "J2 MUTATION PROOF: the pre-fix judge substitution corrupts the arm file, and
 #   K6     MUTATION PROOF — with the breaker disarmed the very same input runs
 #          the whole corpus out and exits 0, which is the pre-fix behaviour
 # ═══════════════════════════════════════════════════════════════════════════
-
-# CORPUS_CB — 4 eligible records (8 legs) driven at a threshold of 2, so the
-# breaker trips on the second leg and 6 legs across 3 whole records are left
-# un-attempted. The threshold is passed as the SETTING, never a flag: that is
-# what proves it is config-named rather than a literal in the driver.
-CORPUS_CB="$WORK/corpus-cb.jsonl"
-{ mk_corpus_line 401 eligible "$BASE"
-  mk_corpus_line 402 eligible "$BASE"
-  mk_corpus_line 403 eligible "$BASE"
-  mk_corpus_line 404 eligible "$BASE"; } >"$CORPUS_CB"
-
-# The systemically-unavailable runner: every call fails the same way, which
-# replay.sh execute turns into a `candidate-spawn` integration-error record.
-CB_LOG="$WORK/cb-calls.log"; : >"$CB_LOG"
-CB_STUB="$WORK/stub-cb-unavailable.sh"
-cat >"$CB_STUB" <<STUBEOF
-#!/usr/bin/env bash
-set -u
-printf 'cb %s\n' "\$1" >>"$CB_LOG"
-echo "API error 429: rate limit exceeded" >&2
-exit 1
-STUBEOF
-chmod +x "$CB_STUB"
 
 CB_OUT="$WORK/out-cb"; CB_STATE="$WORK/state-cb"
 
@@ -1317,6 +1408,9 @@ cb0_calls="$(wc -l <"$CB_LOG" | tr -d ' ')"
   || fail "K6: a disarmed breaker skips nothing: $(jq -c .legs <<<"$OUT")"
 ok "K6 MUTATION PROOF: with the breaker disarmed the same unavailable runner is hammered for all $cb0_calls legs and the run exits 0 — K1/K2's stop is a measurement, not a restatement"
 
+fi
+
+if run_group 6; then  # sections S, M
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION S — PROJECTED vs OBSERVED SPEND (temperloop#1555).
 #
@@ -1634,6 +1728,9 @@ m5_total="$(grep -c '^[[:space:]]*for arm in ' "$SUT")"
   || fail "M5: expected at least 4 arm loops to audit in batch.sh, found $m5_total — this check may have stopped matching"
 ok "M5 all $m5_total arm loop(s) in batch.sh are either the counterbalanced execute loop or carry an ARM-ORDER AUDIT marker"
 
+fi
+
+if run_group 7; then  # section N
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION N — RECORD-LEVEL CONCURRENCY (temperloop#1682).
 #
@@ -1868,21 +1965,9 @@ if mut_n_reason="$(assert_legs_sequential "$MUT_N_STATE")"; then
 fi
 ok "N8 MUTATION PROOF: a driver that overlaps a record's two legs FAILS the same predicate N2 passes ($mut_n_reason) — N2 is a measurement"
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION L — the suite-wide no-live-call verdict.
-# ═══════════════════════════════════════════════════════════════════════════
-count
-if [ -e "$CANARY" ]; then
-  fail "L1: A LIVE MODEL CALL WAS ATTEMPTED during this suite: $(cat "$CANARY")"
 fi
-ok "L1 no test in this suite ever invoked a 'claude' binary"
 
-count
-"$WORK/bin/claude" --self-test >/dev/null 2>&1
-[ -e "$CANARY" ] || fail "L2: the canary itself does not work, so L1 proves nothing"
-rm -f "$CANARY"
-ok "L2 the canary is genuinely capable of firing (so L1 is a measurement, not a tautology)"
-
+if run_group 8; then  # sections R, W
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION R — --retry-stage: a timed-out leg is recoverable (temperloop#1693)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1902,7 +1987,12 @@ cat >"$TO_STUB" <<STUBEOF
 #!/usr/bin/env bash
 set -u
 printf 'timeout-stub %s\n' "\$1" >>"$CAND_LOG"
-sleep 5
+# EXEC, not a plain `sleep` (temperloop#2163): replay.sh bounds this runner
+# with run_with_timeout, which kills the process it spawned — this bash. A
+# forked `sleep` would be that bash's CHILD, survive its parent, and outlive
+# the whole suite as an orphan (CI reported them by name at job teardown).
+# `exec` makes the sleep BE the bounded process, so the timeout reaps it.
+exec sleep 5
 STUBEOF
 chmod +x "$TO_STUB"
 
@@ -2101,6 +2191,27 @@ drive ""
   || fail "W4: --retry-failed must re-drive a torn leg — otherwise it is stranded forever"
 ok "W4 a torn leg is not re-spent by default, and --retry-failed recovers it as a deliberate choice"
 
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION L — the suite-wide no-live-call verdict.
+# ═══════════════════════════════════════════════════════════════════════════
+count
+if [ -e "$CANARY" ]; then
+  fail "L1: A LIVE MODEL CALL WAS ATTEMPTED during this suite: $(cat "$CANARY")"
+fi
+ok "L1 no test in this suite ever invoked a 'claude' binary"
+
+count
+"$WORK/bin/claude" --self-test >/dev/null 2>&1
+[ -e "$CANARY" ] || fail "L2: the canary itself does not work, so L1 proves nothing"
+rm -f "$CANARY"
+ok "L2 the canary is genuinely capable of firing (so L1 is a measurement, not a tautology)"
+
 echo
-echo "test_replay_batch.sh: $pass/$total checks passed"
+if [ "$GROUP" = "all" ]; then
+  echo "test_replay_batch.sh: $pass/$total checks passed"
+else
+  echo "test_replay_batch.sh [group $GROUP]: $pass/$total checks passed"
+fi
 [ "$pass" -eq "$total" ] || exit 1

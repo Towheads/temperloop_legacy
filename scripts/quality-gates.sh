@@ -1510,7 +1510,27 @@ KERNEL_GATES=(
   # so the assertion is a measurement rather than a tautology. Same
   # direct-`bash` form, no Makefile target, as the test_judge_rotation.sh gate
   # immediately above.
-  "bash workflows/scripts/model-comparison/tests/test_replay_batch.sh"
+  # SHARDED into eight gates (temperloop#2163). The suite is ~190 replay legs at
+  # ~1.3s each; as one gate it took ~250s locally / ~176s in CI and, because
+  # the pool's makespan is max(total/jobs, longest single gate), it set the
+  # floor for the whole run on its own. `--group N` runs one dependency-closed
+  # subset of the SAME sections with the SAME assertions (the file's own
+  # "SHARDING" header owns the partition and why each group is closed); the
+  # union is exactly the previous suite, and a bare invocation with no --group
+  # still runs all eight in order. Section L's no-live-call canary verdict sits
+  # outside the partition and runs at the end of EVERY shard, so each of these
+  # eight gates carries its own hermeticity proof rather than inheriting one.
+  # They mutate only MIRROR copies (mk_mirror), never the live replay.sh, so
+  # unlike the SERIAL_LANE suites below they are safe to run concurrently with
+  # each other.
+  "bash workflows/scripts/model-comparison/tests/test_replay_batch.sh --group 1"
+  "bash workflows/scripts/model-comparison/tests/test_replay_batch.sh --group 2"
+  "bash workflows/scripts/model-comparison/tests/test_replay_batch.sh --group 3"
+  "bash workflows/scripts/model-comparison/tests/test_replay_batch.sh --group 4"
+  "bash workflows/scripts/model-comparison/tests/test_replay_batch.sh --group 5"
+  "bash workflows/scripts/model-comparison/tests/test_replay_batch.sh --group 6"
+  "bash workflows/scripts/model-comparison/tests/test_replay_batch.sh --group 7"
+  "bash workflows/scripts/model-comparison/tests/test_replay_batch.sh --group 8"
   # Prose-plane baseline counter (temperloop#719, item
   # prose-baseline-measurement / #722): count-prose.sh reports the tier-1
   # composed-kernel-authored-render line count (through
