@@ -15097,6 +15097,82 @@ if (y2.dual_build.pick.loser.archived !== false || y2.dual_build.pick.loser.dele
 console.log(JSON.stringify({ ok: true }));
 "
 
+# --- K2119: the ledger DATA dir is pinned at every call site ------------------
+# dual-build-ledger.sh resolves its default ledger dir from the INVOKING CWD's
+# git toplevel (temperloop#2119). Nothing in an emitted machinery command sets
+# or asserts the executor's cwd, and a linked worktree is its OWN toplevel — so
+# an unpinned invocation could write rows.jsonl, archives/*.patch and
+# calibration-pairs.jsonl into `<repo>.wt/<slug>`, which `git worktree remove`
+# then destroys along with the losing arm's only copy. Every emitted ledger
+# command must therefore carry an explicit ABSOLUTE --dir rooted at repoRoot.
+run_node_case "K2119 ledger dir: every emitted dual-build-ledger.sh command carries an explicit absolute --dir rooted at input.repoRoot, so the ledger target never follows the executor's cwd" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+// The same shape as the per-item-override case, chosen because it is the one
+// level that reaches ALL of the ledger emitters: calibrate-status, the row
+// appends, calibrate-record (the override pair) and archive + archive-check.
+calibrated();
+for (const [s, pr] of [['w1',701],['w2',702]]) {
+  winningArm(s, 'baseline', pr, 'abc' + pr);
+  winningArm(s, 'candidate', pr, 'abc' + pr);
+  itemBarrier(s, { outcome: 'JUDGED', judge: { preference: 'A', margin: 30, order_agreement: true } });
+}
+pickPhase('w1');
+pickPhase('w2', { pair: { outcome: 'CALIBRATION_PAIR_RECORDED' } });
+
+globalThis.args = { ...dualArgs(['w1','w2']),
+  levelPick: { verdict: 'override-item', items: [{ slug: 'w2', arm: 'candidate', reason: 'the candidate diff is the one I want' }] },
+  items: [
+    { slug: 'w1', branch: 'build/w1', title: 'W1', kind: 'impl', acceptance: ['c'] },
+    { slug: 'w2', branch: 'build/w2', title: 'W2', kind: 'impl', acceptance: ['c'] },
+  ]};
+
+const mod = await loadLevel();
+await mod.default();
+
+// Every occurrence of the emitted ledger invocation, across every label — an
+// index scan rather than a regex so a subcommand growing an odd argument
+// cannot slip past a lazy pattern.
+const marker = 'bash \"\$__led\" ';
+const calls = [];
+for (const c of callLog) {
+  const text = String(c.promptFull ?? '');
+  let i = 0;
+  for (;;) {
+    const a = text.indexOf(marker, i);
+    if (a < 0) break;
+    const eol = text.indexOf('\\n', a);
+    calls.push({ label: String(c.opts.label), line: text.slice(a + marker.length, eol < 0 ? undefined : eol) });
+    i = a + marker.length;
+  }
+}
+if (calls.length === 0)
+  { console.log(JSON.stringify({ ok: false, reason: 'no dual-build-ledger.sh invocation was emitted at all — this case would assert nothing' })); process.exit(0); }
+const want = '--dir \\'/tmp/repo/.temperloop/model-comparison/dual-build\\'';
+const bad = calls.filter(c => !c.line.includes(want));
+if (bad.length)
+  { console.log(JSON.stringify({ ok: false, reason: 'a ledger command carries no explicit absolute --dir: ' + JSON.stringify(bad) })); process.exit(0); }
+// …and every emitter is actually represented, so a fixture that stops reaching
+// one of them cannot turn this into a vacuous pass.
+const subs = [...new Set(calls.map(c => c.line.split(' ')[0]))].sort().join(',');
+if (subs !== 'append,archive,archive-check,calibrate-record,calibrate-status')
+  { console.log(JSON.stringify({ ok: false, reason: 'not every ledger subcommand was emitted by this level: ' + subs })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# --- K2119 static lockstep guard ----------------------------------------------
+# The case above can only see the emitters a fixture reaches. This scan holds
+# every call site in the file, including any added later.
+_unpinned="$(grep -n 'bash \"\$__led\"' "$MJS" | grep -v 'ledgerDirFlag()' || true)"
+[ -z "$_unpinned" ] \
+  || fail "#2119: a dual-build-ledger.sh invocation in build-level.mjs carries no ledgerDirFlag() --dir — it would resolve the ledger from the executor's cwd: $_unpinned"
+grep -qF "const ledgerDirFlag = () => " "$MJS" \
+  || fail "#2119: build-level.mjs no longer defines ledgerDirFlag() — the one place the machinery's absolute ledger dir is built"
+grep -qF ".temperloop/model-comparison/dual-build" "$MJS" \
+  || fail "#2119: the pinned ledger dir path is gone from build-level.mjs"
+
 run_node_case "K2083 winning-arm-lost: the item is re-driven ONCE on the winning arm's OWN model and parks incomplete when that still fails — the losing arm is never shipped in its place" "
 $PREAMBLE
 $DUAL_FIXTURE

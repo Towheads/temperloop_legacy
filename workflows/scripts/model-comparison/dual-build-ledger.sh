@@ -192,6 +192,17 @@
 # is `<invoking-repo-root>/.temperloop/model-comparison/dual-build`, where
 # `<invoking-repo-root>` is `git rev-parse --show-toplevel` of the CWD — see
 # § DATA-DIR vs SETTINGS RESOLUTION BOUNDARY immediately below.
+# `archive-check`'s `--repo` defaults the SAME way, so `archive-check <slug>
+# <arm> --dir DIR` from OUTSIDE any checkout refuses by name (it used to
+# inherit the kernel checkout via the $0 climb) — pass `--repo PATH`.
+#
+# THE CWD DEFAULT IS FOR HUMANS. A programmatic caller — anything whose own
+# working directory is not asserted, `claude/workflows/build-level.mjs` above
+# all, whose executor may sit in a linked worktree that is its OWN
+# `git rev-parse --show-toplevel` — MUST pass an explicit absolute `--dir`
+# (and `--repo` for archive-check) rather than inherit a cwd. A worktree's
+# `.temperloop/` goes away with `git worktree remove`, taking the rows and the
+# losing arm's only archived patch with it.
 #
 # ── DATA-DIR vs SETTINGS RESOLUTION BOUNDARY (temperloop#2119) ──────────────
 # Two resolutions live in this file and they deliberately DISAGREE:
@@ -291,8 +302,11 @@ LEDGER_DIR="${DUAL_BUILD_LEDGER_DIR:-$INVOKING_REPO_ROOT/.temperloop/model-compa
 [ "$_ledger_dir_overridden" -eq 1 ] || [ -n "$INVOKING_REPO_ROOT" ] || LEDGER_DIR=""
 
 # _require_dir <subcommand> <dir> — the one place the unresolved-default
-# refusal is worded. Every subcommand calls it after its own arg parse, so
-# an explicit `--dir` (or $DUAL_BUILD_LEDGER_DIR) always satisfies it.
+# refusal is worded. Every subcommand calls it after its own arg parse — so
+# an explicit `--dir` (or $DUAL_BUILD_LEDGER_DIR) always satisfies it — and
+# after its own USAGE/required-argument guard, so a malformed invocation
+# from outside a checkout reports what the caller got wrong rather than this
+# environment refusal, which that caller would then fix and hit anyway.
 _require_dir() {
   [ -n "$2" ] || die "$1: no ledger dir — cwd is not inside a git working tree, so the per-repo default (<repo-root>/.temperloop/model-comparison/dual-build) cannot be resolved; pass --dir DIR or set DUAL_BUILD_LEDGER_DIR"
 }
@@ -418,8 +432,8 @@ cmd_append() {
       *) die "append: unknown argument $1" ;;
     esac
   done
-  _require_dir append "$dir"
   [ -n "$row_json" ] || die "append: --row <json>|- is required"
+  _require_dir append "$dir"
   [ "$row_json" != "-" ] || row_json="$(cat)"
   jq -e . >/dev/null 2>&1 <<<"$row_json" || die "append: --row is not valid JSON"
 
@@ -511,8 +525,8 @@ cmd_read() {
       *) die "read: unknown argument $1" ;;
     esac
   done
-  _require_dir read "$dir"
   case "${expect:-0}" in ''|*[!0-9]*) die "read: --expect must be a non-negative integer" ;; esac
+  _require_dir read "$dir"
 
   local rows_file="$dir/$ROWS_FILE_NAME"
   if [ ! -f "$rows_file" ]; then
@@ -594,8 +608,8 @@ cmd_archive() {
       *) die "archive: unknown argument $1" ;;
     esac
   done
-  _require_dir archive "$dir"
   [ -n "$slug" ] && [ -n "$arm" ] || die "archive: usage: archive <slug> <arm> --from <patch-file>|-"
+  _require_dir archive "$dir"
   case "$slug" in ''|*[!A-Za-z0-9._-]*) die "archive: slug must match [A-Za-z0-9._-]+ (it becomes a filesystem path component)" ;; esac
   case "$arm" in baseline|candidate) : ;; *) die "archive: arm must be baseline or candidate" ;; esac
   [ -n "$from" ] || die "archive: --from <patch-file>|- is required"
@@ -634,9 +648,9 @@ cmd_archive_check() {
       *) die "archive-check: unknown argument $1" ;;
     esac
   done
+  [ -n "$slug" ] && [ -n "$arm" ] || die "archive-check: usage: archive-check <slug> <arm> [--base SHA] [--repo PATH]"
   _require_dir archive-check "$dir"
   [ -n "$repo" ] || die "archive-check: no --repo given and cwd is not inside a git working tree, so the repo to test-apply the patch against cannot be resolved; pass --repo PATH"
-  [ -n "$slug" ] && [ -n "$arm" ] || die "archive-check: usage: archive-check <slug> <arm> [--base SHA] [--repo PATH]"
   case "$slug" in ''|*[!A-Za-z0-9._-]*) die "archive-check: slug must match [A-Za-z0-9._-]+ (it becomes a filesystem path component)" ;; esac
   local patch="$dir/$ARCHIVES_SUBDIR/${slug}@${arm}.patch"
   [ -f "$patch" ] || die "archive-check: no archived patch at $patch"
@@ -792,11 +806,11 @@ cmd_calibrate_sample() {
       *) die "calibrate-sample: unknown argument $1" ;;
     esac
   done
-  _require_dir calibrate-sample "$dir"
   [ -n "$count" ] || count="${DUAL_BUILD_CALIBRATE_PAIRS_PER_LEVEL:-}"  # setting:exempt — declared/owned by the sibling dual-build-settings item (#2071); a defensive, no-default read (§ NAMED-SETTING CONVENTION)
   case "$count" in
     ''|*[!0-9]*) die "calibrate-sample: no sample count configured — pass --count N or set DUAL_BUILD_CALIBRATE_PAIRS_PER_LEVEL (workflows/scripts/build/build.config.sh)" ;;
   esac
+  _require_dir calibrate-sample "$dir"
 
   local rows_file="$dir/$ROWS_FILE_NAME" pairs_file="$dir/$CALIBRATION_PAIRS_FILE_NAME" archdir="$dir/$ARCHIVES_SUBDIR"
   if [ ! -f "$rows_file" ]; then
@@ -846,8 +860,8 @@ cmd_calibrate_record() {
       *) die "calibrate-record: unknown argument $1" ;;
     esac
   done
-  _require_dir calibrate-record "$dir"
   [ -n "$slug" ] || die "calibrate-record: --slug is required"
+  _require_dir calibrate-record "$dir"
   case "$preference" in
     baseline|candidate|tie) : ;;
     *) die "calibrate-record: --preference must be baseline, candidate or tie" ;;
@@ -980,12 +994,12 @@ cmd_prune() {
       *) die "prune: unknown argument $1" ;;
     esac
   done
-  _require_dir prune "$dir"
   # See § NAMED-SETTING CONVENTION above — bare reference only, no local default.
   [ -n "$retention" ] || retention="${DUAL_BUILD_ARCHIVE_RETENTION_DAYS:-}"  # setting:exempt — declared/owned/registered by the sibling dual-build-settings item (temperloop#2071) in build.config.sh; this is a defensive, no-default read of a setting this script does not own (order-independent of which of the two sibling PRs merges first)
   case "$retention" in
     ''|*[!0-9]*) die "no retention window configured — pass --retention-days N or set DUAL_BUILD_ARCHIVE_RETENTION_DAYS (workflows/scripts/build/build.config.sh)" ;;
   esac
+  _require_dir prune "$dir"
 
   local archdir="$dir/$ARCHIVES_SUBDIR"
   if [ ! -d "$archdir" ]; then

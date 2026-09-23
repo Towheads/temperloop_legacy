@@ -44,6 +44,11 @@
 #   30    the `repo` row field (temperloop#2119): assigned from the cwd,
 #         caller-supplied respected verbatim, and a pre-existing row with
 #         NO `repo` key still reads and tallies (backward compatibility)
+#   31    archive-check's `--repo` default is DATA too (temperloop#2119): it
+#         resolves from the cwd, so outside a checkout it REFUSES by name
+#         instead of test-applying against whatever checkout the script
+#         happens to ship in — and an explicit --repo, or a cwd that IS in a
+#         checkout, satisfies it (both states)
 #
 # Usage: bash workflows/scripts/model-comparison/tests/test_dual_build_ledger.sh
 set -uo pipefail
@@ -432,6 +437,32 @@ sut read --dir "$DOLD" --expect 4 >/dev/null || fail "30e: the --expect self-che
 sut append --dir "$DOLD" --row "$(row mixed baseline)" >/dev/null || fail "30f: appending onto an old-style ledger failed"
 [ "$(sut read --dir "$DOLD" | jq 'length')" = "5" ] || fail "30g: the mixed old+new ledger did not read back"
 ok "30 repo is stamped from the cwd, respected verbatim when supplied, and rows with NO repo key still read, self-check and accept new appends"
+
+# ── 31. archive-check's `--repo` default is DATA, and refuses by name ──────
+# `--repo` (the checkout a patch is test-applied against) moved from the $0
+# climb to the cwd in #2119, so it is now EMPTY outside any checkout rather
+# than always-populated. That is a deliberate behavior change — an invocation
+# with `--dir` alone, from outside a checkout, used to work and now dies — so
+# it gets its own named refusal and its own test. Both states, per principle
+# 1: the refusal fires when the repo cannot be resolved, and does NOT fire
+# when an explicit --repo or a cwd inside a checkout supplies it.
+count
+DAC="$WORK/d-archcheck"
+out="$(cd "$WORK" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" archive-check cwdscope baseline --dir "$DAC" 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [[ "$out" == *"pass --repo PATH"* ]] \
+  || fail "31: archive-check with --dir but no resolvable repo must refuse by name (got rc=$rc: $out)"
+out="$(cd "$WORK" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" archive-check cwdscope baseline --dir "$DAC" --repo "$REPO_A" 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [[ "$out" != *"pass --repo PATH"* ]] && [[ "$out" == *"no archived patch"* ]] \
+  || fail "31a: an explicit --repo must satisfy the refusal and let the run reach the archive lookup (got rc=$rc: $out)"
+out="$(cd "$REPO_A" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" archive-check cwdscope baseline --dir "$DAC" 2>&1)"; rc=$?
+[[ "$out" != *"pass --repo PATH"* ]] \
+  || fail "31b: a cwd INSIDE a checkout must resolve --repo from it, not refuse (got rc=$rc: $out)"
+# And the usage guard still outranks both refusals: a no-positional call from
+# outside a checkout reports the USAGE error, not the ledger-dir/repo one.
+out="$(cd "$WORK" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" archive-check 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [[ "$out" == *"usage: archive-check"* ]] \
+  || fail "31c: a no-argument archive-check must report the usage error first (got rc=$rc: $out)"
+ok "31 archive-check refuses by name when --repo cannot be resolved, is satisfied by an explicit --repo or an in-checkout cwd, and still reports usage errors first"
 
 printf '\ntest_dual_build_ledger.sh: %d/%d checks passed\n' "$pass" "$total"
 [ "$pass" -eq "$total" ] || exit 1
