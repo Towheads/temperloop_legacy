@@ -70,6 +70,39 @@
 #                    swapped for the resolved `value` and `layer` swapped
 #                    for the resolved `layer`.
 #
+# VALUE ESCAPING — the `one row per line` contract is STRUCTURAL, not a
+# hope (temperloop#2218). A setting's value is arbitrary text: an env-layer
+# value in particular is whatever the environment holds, and in CI at least
+# one registry setting (CHANGELOG_GATE_PR_BODY) is a whole pull-request body
+# — untrusted, multi-line, TAB-bearing. So EVERY value this script prints,
+# in BOTH formats and from ALL five layers, is emitted C-escaped:
+#
+#     backslash -> \\        TAB -> \t        newline -> \n
+#
+# and nothing else is transformed. The escape is applied exactly once, at
+# the single print site at the bottom of this file, so a value can never
+# reach the output carrying a field or record separator of the format it is
+# being printed in. `\\` is escaped FIRST, so the encoding is unambiguous in
+# both directions: a value holding the two literal characters `\` + `n`
+# emits `\\n`, distinct from the `\n` that encodes a real newline. A
+# consumer that wants the raw bytes DECODES WITH A SINGLE LEFT-TO-RIGHT
+# SCAN (see _config_list_unescape below) — no fixed order of three global
+# `${v//…}` substitutions inverts this encoding, because every order
+# rescans the second backslash of `\\n` and fabricates a newline.
+#
+# The same encoding is used INTERNALLY on the layer maps (see
+# _config_list_escape / _config_list_bulk_source / _config_list_index below),
+# where it is load-bearing for correctness rather than presentation.
+#
+# TRAILING NEWLINES ARE PRESERVED (the temperloop#2218 acceptance-4 caveat,
+# now resolved rather than merely documented). The three file-layer maps are
+# captured through `$( )`, which strips trailing newlines — but only from
+# the map as a whole, i.e. from the record TERMINATOR, because a value's own
+# newlines are already `\n` by the time the map is assembled. A value of
+# `a` + two newlines is carried as the six characters `a\n\n` and comes back
+# out of the index byte-identical. The parse is lossless for every byte a
+# shell variable can hold except NUL, which no shell variable can hold.
+#
 # Exit codes: 0 = printed successfully. 1 = broken kernel checkout (the
 # registry lib or build.config.sh is missing). 2 = invalid CLI usage.
 #
@@ -162,11 +195,72 @@ esac
 machine_conf_file="${BUILD_CONFIG_MACHINE:-${XDG_CONFIG_HOME:-$HOME/.config}/temperloop/build.config.sh}"
 repo_local_file="${BUILD_CONFIG_LOCAL:-$(dirname "$TRACKED_REPO_FILE")/build.config.local.sh}"
 
+# _config_list_escape <value> -> sets CFG_ESCAPED to <value> with backslash,
+# TAB and newline replaced by `\\`, `\t` and `\n` (see the header's VALUE
+# ESCAPING note for the contract and why the order is load-bearing).
+# Bash-3.2-safe: plain `${v//pat/rep}` pattern substitution, no `${v@Q}`, no
+# printf %q, no external process.
+_config_list_escape() {
+  local v="$1"
+  v="${v//\\/\\\\}"
+  v="${v//$'\t'/\\t}"
+  v="${v//$'\n'/\\n}"
+  CFG_ESCAPED="$v"
+}
+
+# _config_list_unescape <escaped> -> sets CFG_UNESCAPED to the exact inverse
+# of _config_list_escape. Single left-to-right scan, so `\\n` decodes to the
+# two characters `\`+`n` and NOT to a newline — the ambiguity a naive
+# sequence of three `${v//…}` calls would introduce. An unrecognised escape
+# (`\x`) and a trailing lone backslash are both preserved verbatim rather
+# than silently eaten; neither is producible by _config_list_escape, so that
+# arm exists only to keep the function total.
+_config_list_unescape() {
+  local s="$1" out="" head ch
+  # Fast path: the overwhelming majority of values hold no backslash at all,
+  # and this runs once per map entry per layer (~3x the registry's row count).
+  case "$s" in
+    *\\*) ;;
+    *) CFG_UNESCAPED="$s"; return 0 ;;
+  esac
+  while :; do
+    case "$s" in
+      *\\*) ;;
+      *) out="$out$s"; break ;;
+    esac
+    head="${s%%\\*}"
+    out="$out$head"
+    s="${s:$(( ${#head} + 1 ))}"
+    ch="${s:0:1}"
+    case "$ch" in
+      n)  out="$out"$'\n'; s="${s:1}" ;;
+      t)  out="$out"$'\t'; s="${s:1}" ;;
+      \\) out="$out\\";    s="${s:1}" ;;
+      *)  out="$out\\" ;;   # lone/unknown backslash: keep it, re-scan from ch
+    esac
+  done
+  CFG_UNESCAPED="$out"
+}
+
 # _config_list_bulk_source <file> <name...> -> ONE subshell source of
 # <file> (silent no-op if absent/unreadable), then name<TAB>value for every
-# given <name> that ended up SET after sourcing. One source call per
-# candidate file for the WHOLE run (see header perf note), not one per
-# setting.
+# given <name> that ended up SET after sourcing, with the VALUE C-ESCAPED
+# (_config_list_escape above). One source call per candidate file for the
+# WHOLE run (see header perf note), not one per setting.
+#
+# THE ESCAPE IS THE WHOLE POINT, not tidiness (temperloop#2218). This map is
+# a one-record-per-LINE, TAB-delimited format consumed by an `IFS=$'\t' read`
+# loop, and a value here is arbitrary text — every registry name that is
+# merely SET in the environment is emitted, so an exported
+# CHANGELOG_GATE_PR_BODY (a whole untrusted PR body in CI) lands in the value
+# field. Unescaped, its own newlines opened FRESH RECORDS and its own TABs
+# split them, so _config_list_index then read a variable NAME out of value
+# text: it fabricated rows for real settings (`BUILD_QUOTA_PAUSE_PCT
+# machine-conf 99` out of prose) and, worse, fed attacker-influenced text to
+# `printf -v`, whose name argument bash parses — a name shaped `IDENT[...]`
+# makes the brackets an ARRAY SUBSCRIPT evaluated in ARITHMETIC context,
+# which performs command substitution. Escaping here makes the name field
+# structurally incapable of coming from a value.
 _config_list_bulk_source() {
   local file="$1"
   shift
@@ -177,7 +271,8 @@ _config_list_bulk_source() {
     local n
     for n in "$@"; do
       if [ -n "${!n+x}" ]; then
-        printf '%s\t%s\n' "$n" "${!n}"
+        _config_list_escape "${!n}"
+        printf '%s\t%s\n' "$n" "$CFG_ESCAPED"
       fi
     done
   )
@@ -203,12 +298,39 @@ _config_list_bulk_source() {
 # value is passed as an argument instead of re-parsed as shell. Same
 # `IFS=$'\t' read` split the map is written with. Bash-3.2-portable (printf -v
 # is bash 3.1+): an index of plain variables, never an associative array.
+#
+# TWO INDEPENDENT DEFENCES ON THE NAME ARGUMENT (temperloop#2218; kernel
+# principle 5 — counter the failure mode structurally, do not ask the next
+# editor to be careful):
+#
+#   1. The producer escapes (_config_list_bulk_source above), so value text
+#      can no longer start a record and `lname` can only ever be a name the
+#      producer was handed.
+#   2. This loop REFUSES any `lname` that is not `[A-Za-z_][A-Za-z0-9_]*`,
+#      loudly, BEFORE `printf -v` sees it. That is redundant today and
+#      deliberately so: `printf -v` is not a literal context — bash parses
+#      its name argument, and `IDENT[...]` makes the brackets an array
+#      subscript evaluated in ARITHMETIC context, which performs command
+#      substitution. Defence 1 is one `printf` edit away from being undone;
+#      defence 2 fails closed no matter what reaches it, and says so on
+#      stderr instead of skipping silently.
+#
+# The legality test is the registry lib's OWN `_setting_registry_legal_name`
+# (pure `case`, bash-3.2-portable), not a second copy of the pattern here —
+# same lib this file already borrows `_setting_split_row` from. One
+# definition of "legal shell identifier" for the registry and its consumers
+# means the two can never drift apart into a gap.
 _config_list_index() {
   local prefix="$1" map="$2" lname lval
   [ -n "$map" ] || return 0
   while IFS=$'\t' read -r lname lval; do
     [ -n "$lname" ] || continue
-    printf -v "${prefix}${lname}" '%s' "$lval"
+    if ! _setting_registry_legal_name "$lname"; then
+      echo "config.sh: internal error — refusing to index layer entry '$lname': not a legal shell identifier (unreachable via _config_list_bulk_source; see _config_list_index)" >&2
+      continue
+    fi
+    _config_list_unescape "$lval"
+    printf -v "${prefix}${lname}" '%s' "$CFG_UNESCAPED"
   done <<EOF
 $map
 EOF
@@ -300,10 +422,19 @@ while IFS= read -r row; do
     layer="$reg_layer"
   fi
 
+  # THE SINGLE PRINT SITE — escape here, once, for every layer and both
+  # formats (temperloop#2218). The env layer is why this cannot live in the
+  # index: it reads `${!name}` directly at the top of this loop and never
+  # passes through a layer map at all, so a multi-line env value would reach
+  # `printf` raw and break the documented one-row-per-line contract no matter
+  # what the index does. Escaping the printed `value` rather than each
+  # producer covers env, all three file layers and the registry default in one
+  # place, and makes the contract un-bypassable by a future fifth source.
+  _config_list_escape "$value"
   if [ "$format" = "tsv" ]; then
-    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$layer" "$value" "$owning" "$doc"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$layer" "$CFG_ESCAPED" "$owning" "$doc"
   else
-    printf '%-42s %-13s %-30s %s\n' "$name" "$layer" "$value" "$owning"
+    printf '%-42s %-13s %-30s %s\n' "$name" "$layer" "$CFG_ESCAPED" "$owning"
   fi
 done <<EOF
 $rows

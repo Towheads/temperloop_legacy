@@ -180,5 +180,128 @@ grep -q "setting-registry.overlay.tsv" <<<"$badname_err" \
   || fail "config list stderr did not name the offending source file (got: $badname_err)"
 echo "PASS: an illegal-name overlay row is rejected upstream — config list exits non-zero and names the row + file"
 
+# =============================================================================
+# 9. A setting whose VALUE is arbitrary multi-line text (temperloop#2218).
+#
+#    CHANGELOG_GATE_PR_BODY is a real registry row that CI sets from the
+#    pull_request payload's body, so this is not a synthetic input class: it
+#    is untrusted, attacker-influenceable, multi-line, TAB-bearing text that
+#    reaches `config list` on every PR run. `config list` used to feed it
+#    into a TAB-delimited, one-record-per-line layer map unescaped, so its
+#    own newlines opened fresh records and its own text supplied variable
+#    NAMES. Every assertion below FAILS against the pre-fix script — that is
+#    the point of them; see the PR's verification surface for the recorded
+#    red-then-green run.
+#
+#    Note what is NOT asserted: that the output "looks right". The dropped
+#    fix on PR #2217 passed a test that matched only the FIRST physical line
+#    of a corrupt row. The assertions here pin (a) exact values of OTHER
+#    settings, (b) a physical LINE COUNT, and (c) the absence of a side
+#    effect — none of which a corrupt-but-plausible output can satisfy.
+# =============================================================================
+CLEAN_ENV=(env -u XDG_CONFIG_HOME -u BUILD_CONFIG_MACHINE -u BUILD_CONFIG_LOCAL -u CHANGELOG_GATE_PR_BODY)
+
+# The honest row count: one physical line per registry row, plus the header.
+baseline_out="$("${CLEAN_ENV[@]}" bash "$CONFIG" list --format tsv)"
+baseline_lines="$(wc -l <<<"$baseline_out" | tr -d ' ')"
+
+# --- 9a. A multi-line value must not fabricate a row for a REAL setting. ----
+# The body embeds a line that is literally `IDENT<TAB>value` — the shape
+# `config list --format tsv` output and setting-registry.tsv rows both have,
+# which is exactly why temperloop PR bodies quoting either one trigger this.
+ml_body=$'line one\nBUILD_QUOTA_PAUSE_PCT\t99\ntail'
+set +e
+ml_err="$("${CLEAN_ENV[@]}" CHANGELOG_GATE_PR_BODY="$ml_body" \
+  bash "$CONFIG" list --format tsv 2>&1 >"$WORK/ml.tsv")"; rc=$?
+set -e
+ml_out="$(cat "$WORK/ml.tsv")"
+[ "$rc" -eq 0 ] || fail "a multi-line env value made config list exit $rc (stderr: $ml_err)"
+[ -z "$ml_err" ] || fail "a multi-line env value produced stderr: $ml_err"
+[ "$(tsv_field "$ml_out" BUILD_QUOTA_PAUSE_PCT 2)" = "tracked-repo" ] \
+  || fail "a multi-line env value fabricated BUILD_QUOTA_PAUSE_PCT's LAYER out of prose (got: $(tsv_field "$ml_out" BUILD_QUOTA_PAUSE_PCT 2), want tracked-repo)"
+[ "$(tsv_field "$ml_out" BUILD_QUOTA_PAUSE_PCT 3)" = "10" ] \
+  || fail "a multi-line env value fabricated BUILD_QUOTA_PAUSE_PCT's VALUE out of prose (got: $(tsv_field "$ml_out" BUILD_QUOTA_PAUSE_PCT 3), want 10)"
+echo "PASS: a multi-line setting value produces no stderr and fabricates no row for a real setting"
+
+# --- 9b. --format tsv: exactly one PHYSICAL line per row, multi-line or not.
+ml_lines="$(wc -l <<<"$ml_out" | tr -d ' ')"
+[ "$ml_lines" = "$baseline_lines" ] \
+  || fail "--format tsv emitted $ml_lines physical lines with a multi-line env value, $baseline_lines without — the one-row-per-line contract is broken"
+# And the row itself must be present, on ONE line, carrying the escaped text.
+[ "$(tsv_field "$ml_out" CHANGELOG_GATE_PR_BODY 3)" = 'line one\nBUILD_QUOTA_PAUSE_PCT\t99\ntail' ] \
+  || fail "the multi-line value was not emitted as one escaped field (got: $(tsv_field "$ml_out" CHANGELOG_GATE_PR_BODY 3))"
+# A lone TAB in a value corrupts the name/value split on its own line, so it
+# needs the same treatment as a newline and gets its own assertion.
+tab_out="$("${CLEAN_ENV[@]}" CHANGELOG_GATE_PR_BODY=$'has\ta\ttab' bash "$CONFIG" list --format tsv 2>/dev/null)"
+[ "$(wc -l <<<"$tab_out" | tr -d ' ')" = "$baseline_lines" ] \
+  || fail "a TAB-bearing env value changed the physical line count"
+[ "$(tsv_field "$tab_out" CHANGELOG_GATE_PR_BODY 3)" = 'has\ta\ttab' ] \
+  || fail "a TAB-bearing env value was not escaped into one field (got: $(tsv_field "$tab_out" CHANGELOG_GATE_PR_BODY 3))"
+echo "PASS: --format tsv emits exactly one physical line per registry row, including for multi-line and TAB-bearing values"
+
+# --- 9c. Value text must never reach the NAME argument of `printf -v`. -----
+# THIS IS A COMMAND-EXECUTION HAZARD, NOT A DIAGNOSTIC. Bash parses that name
+# argument: a name of the form IDENT[...] makes the brackets an ARRAY
+# SUBSCRIPT evaluated in ARITHMETIC context, which is an evaluating context
+# that performs command substitution. Two separate assertions, because they
+# fail differently against the unfixed script.
+#
+#   (i) the arithmetic-eval case aborts the run under `set -u`
+#       (`checks: unbound variable`) — this is what turned CI red;
+#  (ii) the command-substitution case exits 0 and runs the command, leaving
+#       nothing in the output to notice. Only a SIDE EFFECT can catch it, so
+#       this asserts on a marker file rather than on stdout.
+subscript_body=$'body line\ncontexts["checks (ubuntu-latest)"]\tvalue'
+set +e
+sub_err="$("${CLEAN_ENV[@]}" CHANGELOG_GATE_PR_BODY="$subscript_body" \
+  bash "$CONFIG" list --format tsv 2>&1 >"$WORK/sub.tsv")"; rc=$?
+set -e
+[ "$rc" -eq 0 ] \
+  || fail "a value yielding a bracketed name aborted config list (rc=$rc, stderr: $sub_err) — value text reached printf -v's name argument"
+[ -z "$sub_err" ] || fail "a value yielding a bracketed name produced stderr: $sub_err"
+[ "$(wc -l <"$WORK/sub.tsv" | tr -d ' ')" = "$baseline_lines" ] \
+  || fail "a value yielding a bracketed name truncated the listing"
+
+MARKER="$WORK/cmdsub-marker"
+rm -f "$MARKER"
+# The \$( ) is escaped so THIS shell does not expand it; the whole question
+# is whether config.sh does.
+cmdsub_body="body line
+evil[\$(touch '$MARKER')]	value"
+set +e
+"${CLEAN_ENV[@]}" CHANGELOG_GATE_PR_BODY="$cmdsub_body" \
+  bash "$CONFIG" list --format tsv >/dev/null 2>&1; rc=$?
+set -e
+[ ! -e "$MARKER" ] \
+  || fail "COMMAND EXECUTION: a command substitution embedded in a setting VALUE was evaluated by config list (marker file created)"
+[ "$rc" -eq 0 ] || fail "the command-substitution probe made config list exit $rc"
+echo "PASS: value text never reaches printf -v's name argument (no arithmetic eval, no command substitution)"
+
+# --- 9d. The escaping is unambiguous, and lossless including trailing NLs. --
+# A value holding the two literal characters backslash+n must NOT round-trip
+# as a newline: it emits `\\n`. This is what distinguishes a real encoding
+# from a one-way `${v//$'\n'/\\n}`.
+amb_out="$("${CLEAN_ENV[@]}" CHANGELOG_GATE_PR_BODY='literal\nbackslash-n' bash "$CONFIG" list --format tsv 2>/dev/null)"
+[ "$(tsv_field "$amb_out" CHANGELOG_GATE_PR_BODY 3)" = 'literal\\nbackslash-n' ] \
+  || fail "a literal backslash-n in a value was not escaped unambiguously (got: $(tsv_field "$amb_out" CHANGELOG_GATE_PR_BODY 3))"
+
+# Trailing newlines survive the `$( )` capture of a FILE layer's map — the
+# acceptance-4 caveat, closed rather than documented. The value below is
+# `a` followed by two newlines.
+TRAIL_LOCAL="$WORK/trailing.local.sh"
+printf '%s\n' 'BUILD_QUOTA_PAUSE_PCT=$'"'"'a\n\n'"'"'' > "$TRAIL_LOCAL"
+trail_out="$(env -u XDG_CONFIG_HOME -u BUILD_CONFIG_MACHINE -u CHANGELOG_GATE_PR_BODY \
+  BUILD_CONFIG_LOCAL="$TRAIL_LOCAL" bash "$CONFIG" list --format tsv 2>/dev/null)"
+[ "$(tsv_field "$trail_out" BUILD_QUOTA_PAUSE_PCT 2)" = "repo-local" ] \
+  || fail "the trailing-newline fixture did not win at layer repo-local (got: $(tsv_field "$trail_out" BUILD_QUOTA_PAUSE_PCT 2))"
+[ "$(tsv_field "$trail_out" BUILD_QUOTA_PAUSE_PCT 3)" = 'a\n\n' ] \
+  || fail "a file-layer value's TRAILING newlines were lost to the \$( ) capture (got: $(tsv_field "$trail_out" BUILD_QUOTA_PAUSE_PCT 3), want 'a\\n\\n')"
+echo "PASS: the value encoding is unambiguous (a literal backslash-n is not decoded as a newline) and preserves trailing newlines"
+
+# --- 9e. No collateral damage: an ordinary value is untouched by the escape.
+[ "$(tsv_field "$baseline_out" PIPELINE_DRIVE_CONCURRENCY 3)" = "3" ] \
+  || fail "the escaping changed an ordinary value"
+echo "PASS: values with nothing to escape are unchanged"
+
 echo
 echo "ALL PASS: test_config.sh"
