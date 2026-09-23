@@ -476,6 +476,34 @@ const SPINE_OUTCOME_SCHEMA = {
         'REVIEW_WAIT_UNAVAILABLE',
         // temperloop#2065 "worker-cost-capture" — the per-item WORKER COST — see build-level.design-notes.md#temperloop-2065-worker-cost-capture-the-per-item-worker-cost
         'WORKER_CLOCK', 'WORKER_USAGE',
+        // temperloop#2205 — the DUAL-BUILD outcomes. These twenty were emitted
+        // by this file's own generated shell from the day dual-build landed but
+        // never listed here, and because runMachinery() hands the executor this
+        // schema as a STRUCTURED-OUTPUT constraint, a constrained decode CANNOT
+        // return an outcome outside the enum: the executor was forced onto some
+        // other member and the real verdict survived only in a free-form field
+        // (`additionalProperties: true`). The first live dual-build run lost two
+        // healthy CANDIDATE_READY arms that way — they came back as `EXISTS`
+        // with the true answer buried one level down, and the gate read them as
+        // `fail` / `lossReason: 'infra'`. The enum IS the contract; the executor
+        // was never at fault. The emitted-literal-vs-enum lockstep guard in
+        // workflows/scripts/build/tests/test_workflow.sh now fails the build if
+        // this list and the emitters drift apart again.
+        // candidate arm gate (3b dual-build) / spine ledger rows:
+        'CANDIDATE_READY', 'CANDIDATE_REFUSED',
+        'ROW_APPENDED', 'ROW_REJECTED', 'ROW_UNAVAILABLE',
+        // the judge-calibration probe and its recorded pair:
+        'CALIBRATION', 'CALIBRATION_UNAVAILABLE',
+        'CALIBRATION_PAIR_RECORDED', 'CALIBRATION_PAIR_REFUSED', 'CALIBRATION_PAIR_UNAVAILABLE',
+        // the arm judge, the winner/loser stamp, and the loser's disposal:
+        'JUDGED', 'JUDGE_UNAVAILABLE',
+        'ARMS_STAMPED', 'ARMS_STAMP_FAILED',
+        'LOSER_ARCHIVED', 'LOSER_KEPT',
+        // leftover dual-build arms found at worktree setup:
+        'DUAL_BUILD_RESIDUE',
+        // the vendored-gate name probe, and the §3e review-round emitter:
+        'GATE_NAMED', 'GATE_NAME_UNKNOWN',
+        'REVIEW_ROUNDS_EMITTED',
         'ERROR',
       ],
     },

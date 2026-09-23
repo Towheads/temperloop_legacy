@@ -16927,5 +16927,61 @@ grep -qF "verdict: 'SKIPPED'" "$MJS" \
   || fail "#2138: a skipped gate must report its own SKIPPED verdict, never a fabricated GREEN — claiming a pass for a suite that did not run is exactly the fail-open outcome the skip must not produce"
 echo "PASS: #2138 the prose-only gate skip — a docs-reviewer-only blocking round never invokes quality-gates.sh yet still carries its findings to the PR, a mixed round runs the gate unchanged, every uncertain shape fails CLOSED (proven against a fail-open mutant), and the predicate is wired to the slice loop itself"
 
+# --- K2205 EMITTED-LITERAL ↔ ENUM lockstep guard ----------------------------
+#
+# WHY THIS EXISTS. runMachinery() hands the machinery executor
+# `schema: SPINE_OUTCOME_SCHEMA` as a STRUCTURED-OUTPUT constraint, so a
+# constrained decode physically cannot return an `outcome` outside that enum.
+# When this file's own generated shell prints an outcome the enum omits, the
+# executor is FORCED onto some other member and the true verdict survives only
+# in a free-form field (`additionalProperties: true` admits anything). That is
+# silent: nothing throws, nothing goes red, and the consumer branches on a
+# verdict that never happened. The first live dual-build run lost two healthy
+# candidate arms exactly this way — candidateArmGate printed
+# {"outcome":"CANDIDATE_READY"} and the executor returned
+# {"outcome":"EXISTS","result":"{\"outcome\":\"CANDIDATE_READY\"}"}, and the
+# `out.outcome !== 'CANDIDATE_READY'` read marked both arms gate:'fail',
+# lossReason:'infra'. Twenty outcomes were missing at once (temperloop#2205).
+#
+# The enum addition alone re-opens the same gap on the very next new outcome,
+# so THIS guard is the real deliverable: it re-derives BOTH sides from the
+# shipping source on every run and fails with the missing names listed.
+#
+# It also refuses to pass vacuously. A regex that silently matched nothing
+# would otherwise read as "every emitted outcome is in the enum" — the
+# temperloop#1706 defect class — so the extraction asserts a non-zero floor of
+# distinct emitted literals (37 at the time of writing).
+K2205_OUT="$(EMITTED_FLOOR=30 node -e '
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[1], "utf8");
+const die = (m) => { console.log(JSON.stringify({ ok: false, reason: m })); process.exit(0); };
+
+// --- side A: the enum, read out of SPINE_OUTCOME_SCHEMA itself -------------
+const block = src.match(/const SPINE_OUTCOME_SCHEMA = \{[\s\S]*?enum:\s*\[([\s\S]*?)\n\s*\],/);
+if (!block) die("could not locate SPINE_OUTCOME_SCHEMA`s outcome enum in build-level.mjs — this guard`s extraction anchor moved and it is now inert");
+const enumVals = [...block[1].matchAll(/"([A-Z][A-Z0-9_]*)"|\x27([A-Z][A-Z0-9_]*)\x27/g)].map((m) => m[1] || m[2]);
+if (enumVals.length === 0) die("extracted ZERO enum members from SPINE_OUTCOME_SCHEMA — the extraction is inert, not the enum empty");
+
+// --- side B: every outcome literal the generated shell actually PRINTS -----
+// Two forms, because the commands are built as JS strings: the ESCAPED
+// {\"outcome\":\"X\" used inside template literals, and a plain {"outcome":"X"
+// where the surrounding quoting does not require escaping.
+const emitted = new Set(
+  [...src.matchAll(/\{\\*"outcome\\*"\s*:\s*\\*"([A-Z][A-Z0-9_]*)"/g)].map((m) => m[1]),
+);
+const floor = Number(process.env.EMITTED_FLOOR);
+if (emitted.size < floor) die("extracted only " + emitted.size + " distinct emitted outcome literals (floor " + floor + ") — the emitted-literal regex has gone stale and this guard would pass vacuously");
+
+const missing = [...emitted].filter((o) => !enumVals.includes(o)).sort();
+if (missing.length) die("build-level.mjs EMITS " + missing.length + " outcome value(s) that SPINE_OUTCOME_SCHEMA`s enum omits, so a constrained decode can never return them: " + missing.join(", ") + ". Add them to the enum — do NOT parse the real verdict back out of a free-form field.");
+console.log(JSON.stringify({ ok: true, emitted: emitted.size, enum: enumVals.length }));
+' "$MJS")" || fail "#2205: the emitted-literal/enum lockstep extractor failed to run"
+case "$K2205_OUT" in
+  *'"ok":true'*) : ;;
+  *) fail "#2205 emitted↔enum lockstep: $K2205_OUT" ;;
+esac
+echo "PASS: #2205 emitted↔enum lockstep — $K2205_OUT"
+unset K2205_OUT
+
 echo ""
 echo "All test_workflow.sh cases passed."
