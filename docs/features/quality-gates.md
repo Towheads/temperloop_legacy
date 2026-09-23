@@ -216,9 +216,12 @@ independent. What the audit found:
   essentially no wall time:
   - `make shellcheck` and `bash scripts/tests/test_ensure_shellcheck.sh` both
     resolve the pinned shellcheck through `scripts/ensure-shellcheck.sh`, which
-    downloads and `mv`s the binary into one shared cache path. On a cold cache —
-    which is every CI run, since nothing restores it — two concurrent resolvers
-    would race over the same file.
+    uses a PATH `shellcheck` reporting exactly the pinned version when there is
+    one (temperloop#2198 — a natively built binary on a self-hosted runner) and
+    otherwise downloads and `mv`s the release binary into one shared cache
+    path. On a cold cache with no exact-version PATH binary — hosted CI, every
+    run, since nothing restores the cache — two concurrent resolvers would race
+    over the same file.
   - `make docs` rmtree's and rebuilds `workflows/scripts/docs/_site` in the
     live checkout, and the whole-tree shell lint walks every `*.sh` with
     `find` from the repository root. A whole-tree write

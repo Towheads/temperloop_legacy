@@ -107,7 +107,10 @@ jobs:
       # No shellcheck install step: scripts/quality-gates.sh -> `make shellcheck`
       # provisions a PINNED shellcheck (scripts/ensure-shellcheck.sh), so the
       # version is identical to what runs locally (temperloop#567 — a local
-      # green must guarantee a CI green on this gate). This bypasses the ubuntu
-      # runner's pre-installed apt shellcheck entirely, and the nightly macOS
-      # workflow provisions the same pin so both legs stay version-identical.
+      # green must guarantee a CI green on this gate). The ubuntu runner's
+      # pre-installed apt shellcheck is ignored unless it reports exactly the
+      # pin (temperloop#2198 — on a self-hosted runner a natively built copy of
+      # the pinned version on PATH is used instead of the release download,
+      # which is ~5x slower on Linux/aarch64), and the nightly macOS workflow
+      # provisions the same pin so both legs stay version-identical.
       - run: bash scripts/quality-gates.sh
