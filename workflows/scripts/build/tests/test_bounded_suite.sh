@@ -621,5 +621,87 @@ grep -q 'wf_progress ""' "$WORKFLOW_SUITE" \
   || fail "8: run_node_case must CLEAR the breadcrumb at case end, or a stall in the inline section AFTER a case is misattributed to that case"
 pass "8 static lockstep: both Makefile targets route through the guard, the bound lives in build.config.sh rather than in a recipe literal, and test_workflow.sh sets and clears the breadcrumb"
 
+# ---------------------------------------------------------------------------
+# 12: POLL CADENCE — a SHORT wrapped command returns promptly (temperloop#2162)
+#
+# WHY THIS IS A TEST AND NOT A TUNING NOTE. temperloop#2162 split
+# `make test-build` / `make test-cli-subcommands` into ~73 PER-SCRIPT gates and
+# wrapped each one in this guard, so the #2184 bound survives at the finer
+# granularity instead of being left behind on a make target the gate set no
+# longer runs. With the original flat `sleep 1` poll, every one of those 73
+# gates paid a fixed ~1s tail it could not observe its own completion inside —
+# roughly 73s of pure latency added to the suite's serial cost, for no
+# bound-related reason. That is exactly the kind of regression that gets the
+# wrapper quietly dropped from the gates again.
+#
+# THE MEASUREMENT IS A DELTA, NOT A CEILING, and the fixture is deliberately
+# NOT instantaneous. Both choices are scars from building this case:
+#
+#   * An absolute ceiling is a load test, not a cadence test. This suite runs
+#     as one of ~73 POOLED gates — under 24-way concurrency an "under 2s"
+#     ceiling measures the host. So the assertion is the DELTA between the
+#     shipped guard and a spliced flat-`sleep 1` copy, measured back to back on
+#     the same host moments apart, where load cancels.
+#   * An INSTANT fixture cannot discriminate at all: the poll tests for $RCF
+#     BEFORE its first sleep, so a command that finishes inside the wrapper's
+#     own start-up (~50ms of `ps` calls) is already done at that first check
+#     and BOTH cadences cost zero sleeps. Measured directly — at 24-way
+#     concurrency an instant fixture produced 1s vs 1s and the control proved
+#     nothing. The fixture therefore takes ~0.4s: long enough that the first
+#     check always misses, short enough that the two cadences differ by the
+#     thing under test (a ~0.2s notice vs a ~1.0s one).
+# ---------------------------------------------------------------------------
+cat > "$TMPD/quick.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "PASS: short case"
+sleep 0.4 2>/dev/null || sleep 1
+exit 0
+EOF
+
+POLL_RUNS=5
+poll_elapsed() {  # poll_elapsed <guard-path> -> whole seconds for $POLL_RUNS runs
+  local guard="$1" t0 t1 i
+  t0="$(date +%s)"
+  i=0
+  while [ "$i" -lt "$POLL_RUNS" ]; do
+    BUILD_SUITE_TIMEOUT_SECS=60 bash "$guard" --label quick -- bash "$TMPD/quick.sh" \
+      >/dev/null 2>/dev/null || fail "12: the short fixture must exit 0 under $guard"
+    i=$((i + 1))
+  done
+  t1="$(date +%s)"
+  echo $((t1 - t0))
+}
+
+# The control: the pre-#2162 flat-`sleep 1` cadence, spliced out of the shipped
+# guard so the two runs differ in exactly one line.
+sed 's/    sleep "\$BS_FAST_SECS" 2>\/dev\/null || sleep 1/    sleep 1/' \
+  "$GUARD" > "$TMPD/guard-flat-poll.sh"
+if ! grep -q 'BS_FAST_POLLS' "$TMPD/guard-flat-poll.sh" \
+  || [ "$(grep -c 'sleep "\$BS_FAST_SECS"' "$TMPD/guard-flat-poll.sh" | tr -d ' ')" != 0 ]; then
+  fail "12: the discrimination splice did not apply — the fast-poll line was not replaced, so the control proves nothing"
+fi
+
+fast_elapsed="$(poll_elapsed "$GUARD")"
+slow_elapsed="$(poll_elapsed "$TMPD/guard-flat-poll.sh")"
+[ $((slow_elapsed - fast_elapsed)) -ge 1 ] \
+  || fail "12: discrimination FAILED — the flat-sleep-1 control took ${slow_elapsed}s vs the shipped guard's ${fast_elapsed}s over $POLL_RUNS runs, so the fast poll is not actually in effect (or the measurement cannot see it)"
+# A catastrophe ceiling only: far outside any plausible load, so it can never be
+# the flaky half. $POLL_RUNS × (0.4s fixture + a fast notice) is ~3s.
+[ "$fast_elapsed" -le 12 ] \
+  || fail "12: $POLL_RUNS short wrapped commands took ${fast_elapsed}s — the per-script gates pay this 73 times"
+pass "12 poll cadence: $POLL_RUNS short wrapped commands cost ${fast_elapsed}s under the shipped guard and ${slow_elapsed}s once the fast poll is spliced back out to a flat 'sleep 1' — the delta is produced by the cadence, measured back to back on this host"
+
+# 12b: the BOUND is unaffected by the cadence — it is computed from `date +%s`,
+# never from a poll count. Re-checked here, not merely inherited from case 3,
+# because this case is the one that changed the loop the bound lives in.
+rc=0
+t0="$(date +%s)"
+BUILD_SUITE_TIMEOUT_SECS=2 bash "$GUARD" --label cadence-bound -- \
+  bash -c 'echo "PASS: one"; sleep 30' >/dev/null 2>/dev/null || rc=$?
+t1="$(date +%s)"
+[ "$rc" -eq 137 ] || fail "12b: the bound must still fire with exit 137 under the new cadence, got $rc"
+[ $((t1 - t0)) -lt 15 ] || fail "12b: a 2s bound took $((t1 - t0))s to fire — the cadence changed the bound"
+pass "12b the bound is still wall-clock, not poll-count: a 2s bound over a 30s hang fires in $((t1 - t0))s with exit 137"
+
 echo ""
 echo "All test_bounded_suite.sh cases passed."

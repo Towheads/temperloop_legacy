@@ -241,6 +241,56 @@ independent. What the audit found:
   worker went idle. A stale hint costs a little scheduling efficiency and can
   never change a verdict.
 
+**Per-script gates: splitting the two umbrella entries (temperloop#2162).**
+The pool schedules per **list entry**, so an entry that loops a directory glob
+*serially inside one slot* is indivisible no matter how wide the pool gets —
+and the two biggest entries in the set were exactly that shape.
+`make test-build` looped 58 `workflows/scripts/build/tests/test_*.sh` scripts
+and `make test-cli-subcommands` looped 15 under `bin/subcommands/tests/`. Both
+are now **glob-expanded at list time** into one gate per script (73 gates;
+`_qg_expand_case_gates` in `scripts/quality-gates.sh`). Measured serially on
+the item's host, those two entries cost 335s and 125s while their slowest
+*individual* script cost 77s and 71s — that gap is the straggler the pool
+could not touch. The `make` targets still exist and still work for local use;
+they are simply no longer the gate.
+
+Four properties are worth knowing:
+
+- **Glob-expanded, never enumerated.** The expansion globs the same two
+  directories the Makefile recipes glob, on every invocation, so a newly added
+  `test_*.sh` becomes a gate with no edit to `quality-gates.sh` and none to
+  `gate-paths.tsv` — whose two rows for these families are **pattern keys**
+  (`bash …/bounded-suite.sh --label * -- bash …/tests/test_*.sh`) for the same
+  reason. Exact keys still win, so a single script can keep its own pinpoint
+  row; the four state-graph suites and `test_dual_build_preflight.sh` do.
+  `scripts/tests/test_quality_gates_scoped.sh` case 22b asserts the expanded
+  set **equals** the on-disk glob, which is what makes "glob-expanded" a
+  checkable property rather than a claim.
+- **Each gate keeps its own wall-clock bound.** Every expanded gate runs
+  through `workflows/scripts/build/bounded-suite.sh` under
+  `$BUILD_SUITE_TIMEOUT_SECS`, not just the umbrella `make` targets. Leaving
+  the bound on the umbrella alone would have left it on a target the gate set
+  no longer runs, reopening temperloop#2184's unbounded-hang defect at a finer
+  granularity and 73 gates wide. The guard's poll cadence was tightened in the
+  same change (a fast first poll, then 1s) so that paying the wrapper 73 times
+  costs ~0.25s each rather than ~1.0s.
+- **Independence was measured, not assumed.** A static pass over all 73 scripts
+  first: every one sandboxes under its own `mktemp -d`, none mutates a live
+  repo file in place, none binds a port, and none writes a fixed shared path.
+  Then twelve full concurrent runs of the pooled set at widths 8/16/24/32.
+- **It found a real coupling, which is the point of running it.** At 32-way,
+  `bin/subcommands/tests/test_tokens_producer.sh` case 15 — which asserts the
+  **whole repo's** `git status` is unchanged across its own run — went red
+  naming `workflows/scripts/build/tests/.review-wait-early.<pid>`, a transient
+  file `test_review_wait.sh` wrote *into the checkout*. Serially the two could
+  never overlap; pooled, they did. The fix was the root cause (move that
+  scratch file to a `mktemp` dir), not a serial-lane pin, because a test
+  writing into a git-tracked directory is a defect in its own right. Four
+  further runs at widths 24–32 were clean afterwards. Note the standing
+  consequence: case 15 *reads global state*, so it is the tripwire any future
+  tree-writing test will hit — its failure message now says so, so the next
+  occurrence is attributed to the writer rather than to the producer.
+
 **The SIGPIPE-under-pipefail hazard — a latent test-suite defect that
 concurrency exposes.** The audit turned up one genuine hazard that isolation
 and lane pinning cannot fix, because it does not live in the scheduler at all.

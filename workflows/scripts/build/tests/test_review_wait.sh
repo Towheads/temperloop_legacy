@@ -27,6 +27,21 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
 WAIT_SH="$REPO_ROOT/workflows/scripts/build/review-wait.sh"
 
+# SCRATCH LIVES OUTSIDE THE REPO TREE (temperloop#2162). Case 3 below needs a
+# file to capture an interrupted run's stdout, and it used to put that file in
+# $HERE — i.e. INSIDE the checkout, under a git-tracked directory. That was
+# harmless while this suite ran serially inside `make test-build`'s single
+# gate-pool slot. temperloop#2162 split that umbrella into ~73 per-script gates
+# that the pool runs CONCURRENTLY, and the transient file immediately collided
+# with a sibling gate that reads GLOBAL state: bin/subcommands/tests/
+# test_tokens_producer.sh case 15 asserts the whole repo's `git status` is
+# unchanged across its own run, and it went red naming
+# `.review-wait-early.<pid>` — a real coupling through the working tree,
+# reproduced at 32-way concurrency. A `mktemp -d` has no such reach, and the
+# assertions below are indifferent to where the file lives.
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/test-review-wait-XXXXXX")"
+trap 'rm -rf "$SCRATCH"' EXIT
+
 FAILED=0
 pass() { printf 'ok   — %s\n' "$1"; }
 fail() { printf 'FAIL — %s\n' "$1" >&2; FAILED=1; }
@@ -75,13 +90,13 @@ fi
 # printed regardless — and a script that printed FIRST and slept after would be
 # indistinguishable from a correct one to every other check here. Cut a long
 # wait short and require that it produced NO elapsed line.
-"$WAIT_SH" 60 > "$HERE/.review-wait-early.$$" 2>/dev/null &
+"$WAIT_SH" 60 > "$SCRATCH/review-wait-early.out" 2>/dev/null &
 early_pid=$!
 sleep 3
 kill -9 "$early_pid" 2>/dev/null
 wait "$early_pid" 2>/dev/null
-early_out="$(cat "$HERE/.review-wait-early.$$" 2>/dev/null || true)"
-rm -f "$HERE/.review-wait-early.$$"
+early_out="$(cat "$SCRATCH/review-wait-early.out" 2>/dev/null || true)"
+rm -f "$SCRATCH/review-wait-early.out"
 case "$early_out" in
   *REVIEW_WAIT_ELAPSED*)
     fail "an interrupted 60s wait reported REVIEW_WAIT_ELAPSED after 3s — the line must follow the interval, never precede it: $early_out" ;;

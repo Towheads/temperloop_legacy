@@ -108,6 +108,18 @@
 #     GATES array, or one of two reserved pseudo-keys:
 #       ALL   — the globs listed escalate the run to the FULL set.
 #       none  — the globs listed are RECOGNISED but affect no gate.
+#   * <key> MAY ALSO BE A PATTERN (temperloop#2162) — a key carrying `*`, `?`
+#     or `[` is matched against each gate command line as a shell glob, so ONE
+#     row can map a whole FAMILY of gates. This exists because quality-gates.sh
+#     now GLOB-EXPANDS two test directories into one gate per script: the whole
+#     point of expanding at list time is that a newly added test_*.sh needs no
+#     registry edit, and a map that demanded a hand-typed row per script would
+#     have put that maintenance trap straight back (check-gate-paths.sh's
+#     completeness check fails an unmapped gate). EXACT KEYS WIN: a gate is
+#     resolved against every literal key first and only falls through to the
+#     pattern keys if no literal key names it — so a single script inside an
+#     expanded family can still carry its own pinpoint row, which is exactly
+#     what the four state-graph suites and test_dual_build_preflight.sh do.
 #   * The single token `ALWAYS` in place of a glob list marks a gate that runs
 #     on every scoped run (a whole-tree scanner). An `ALWAYS` row contributes
 #     NOTHING to path recognition — otherwise a whole-tree gate's `**` would
@@ -511,6 +523,31 @@ _gs_in_list() {
   return 1
 }
 
+# --- key/gate matching (exact, or a PATTERN key — temperloop#2162) -----------
+# `_gs_key_is_pattern <key>` is the single place that decides what makes a key
+# a pattern, so the map loader, the resolver and check-gate-paths.sh cannot
+# drift on that question.
+_gs_key_is_pattern() {
+  case "$1" in
+    *'*'*|*'?'*|*'['*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# `_gs_key_matches_gate <key> <gate>` — true when the row keyed <key> governs
+# the gate command <gate>. A literal key matches only itself; a pattern key
+# matches as a shell glob. Callers that need exact-wins precedence must make
+# a literal pass FIRST — this predicate alone does not rank them.
+_gs_key_matches_gate() {
+  local key="$1" gate="$2"
+  [[ "$key" == "$gate" ]] && return 0
+  if _gs_key_is_pattern "$key"; then
+    # shellcheck disable=SC2053  # RHS is a glob on purpose
+    [[ "$gate" == $key ]] && return 0
+  fi
+  return 1
+}
+
 # --- the selection itself ----------------------------------------------------
 # GATE_SELECTION_MODE / _REASON / _SELECTED / _MATCHED are OUT-PARAMS: written
 # here, read by the sourcing caller (this is a sourced lib, not a program), so
@@ -695,27 +732,53 @@ gate_selection_resolve() {
 
   # Emit in the caller's run order, and keep any gate the map does not mention
   # (defense 4 in the header: an unmapped gate over-runs, never under-runs).
-  local gate ordered="" left_out="" mapped always keep
+  local gate ordered="" left_out="" mapped always keep mapped_key
   while IFS= read -r gate; do
     [[ -n "$gate" ]] || continue
     mapped=0
     always=0
+    mapped_key=""
+    # EXACT KEYS FIRST, then pattern keys (temperloop#2162). A gate inside a
+    # glob-expanded family may ALSO carry its own pinpoint row; that row has to
+    # win, or the family row's much wider globs would silently widen it.
     i=0
     while [[ $i -lt ${#_GS_KEYS[@]} ]]; do
       if [[ "${_GS_KEYS[$i]}" == "$gate" ]]; then
         mapped=1
+        mapped_key="${_GS_KEYS[$i]}"
         [[ "${_GS_GLOBS[$i]}" == "ALWAYS" ]] && always=1
         break
       fi
       i=$((i + 1))
     done
+    if [[ $mapped -eq 0 ]]; then
+      i=0
+      while [[ $i -lt ${#_GS_KEYS[@]} ]]; do
+        if _gs_key_is_pattern "${_GS_KEYS[$i]}" \
+          && _gs_key_matches_gate "${_GS_KEYS[$i]}" "$gate"; then
+          mapped=1
+          mapped_key="${_GS_KEYS[$i]}"
+          [[ "${_GS_GLOBS[$i]}" == "ALWAYS" ]] && always=1
+          break
+        fi
+        i=$((i + 1))
+      done
+    fi
     keep=0
     if [[ $mapped -eq 0 ]]; then
       keep=1                       # unmapped gate — over-run, never under-run
     elif [[ $always -eq 1 ]]; then
       keep=1                       # whole-tree scanner — runs every scoped run
     elif _gs_in_list "$gate" "$selected"; then
-      keep=1                       # selected by a changed path
+      # The gate's own command line is in $selected. That happens on a
+      # registration-only diff, whose union names REAL gate command lines
+      # rather than row keys.
+      keep=1
+    elif [[ -n "$mapped_key" ]] && _gs_in_list "$mapped_key" "$selected"; then
+      # Selected through the row that GOVERNS this gate — which for an
+      # expanded family is the pattern key, and for a gate carrying its own
+      # pinpoint row is that row and ONLY that row (exact-wins, above).
+      keep=1
     fi
     if [[ $keep -eq 1 ]]; then
       ordered="${ordered:+$ordered$'\n'}$gate"

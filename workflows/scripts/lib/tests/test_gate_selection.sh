@@ -922,5 +922,101 @@ $got23" ;; esac
 done
 echo "PASS: 23b an uncommitted (staged) rename lists both the source and the destination path"
 
+# --- 24. PATTERN KEYS (temperloop#2162) --------------------------------------
+# quality-gates.sh now glob-expands two test directories into one gate PER
+# SCRIPT. The map cannot carry a literal row per script without reinstating the
+# hand-enumeration trap the expansion exists to remove, so a row key may be a
+# PATTERN that globs a whole family of gates — with EXACT keys still winning,
+# so one script inside a family can keep its own pinpoint row.
+#
+# ONE RULE, stated once: a gate is governed by the first row that NAMES it,
+# every literal row considered before any pattern row. 24b and 24c are the
+# cases that make that rule load-bearing rather than decorative.
+PMAP="$TMP/gate-paths-pattern.tsv"
+cat >"$PMAP" <<'EOF'
+# fixture map: one family row, plus a pinpoint row for one family member
+ALL	Makefile
+none	LICENSE
+make test-always	ALWAYS
+bash suite.sh --run tests/test_*.sh	src/**
+bash suite.sh --run tests/test_special.sh	fixtures/special.json
+make test-docs	docs/**
+EOF
+PGATES='make test-always
+bash suite.sh --run tests/test_alpha.sh
+bash suite.sh --run tests/test_beta.sh
+bash suite.sh --run tests/test_special.sh
+make test-docs'
+
+reset_pattern_env() {
+  unset QUALITY_GATES_SCOPE GITHUB_EVENT_NAME GATE_SELECTION_CHANGED GATE_SELECTION_DIFF_TEXT
+  GATE_SELECTION_ROOT="$TMP"
+  GATE_SELECTION_MAP_FILE="$PMAP"
+  GATE_SELECTION_ALL_GATES="$PGATES"
+  GATE_SELECTION_BASE=""
+  QUALITY_GATES_SCOPE=diff
+}
+
+# 24a — one pattern row maps a whole family. A `src/**` change selects the two
+#       members the family row governs; test_special.sh is governed by its OWN
+#       row (exact wins) and that row does not claim src/**, so it stays out.
+reset_pattern_env
+GATE_SELECTION_CHANGED='src/thing.sh'
+gate_selection_resolve
+[ "$GATE_SELECTION_MODE" = "diff" ] || fail "24a: expected a diff-scoped run (got $GATE_SELECTION_MODE / $GATE_SELECTION_REASON)"
+expected24a='make test-always
+bash suite.sh --run tests/test_alpha.sh
+bash suite.sh --run tests/test_beta.sh'
+[ "$GATE_SELECTION_SELECTED" = "$expected24a" ] || fail "24a: a pattern key must select the family it governs, and only that:
+got:
+$GATE_SELECTION_SELECTED
+want:
+$expected24a"
+echo "PASS: 24a a pattern row maps the whole family it governs"
+
+# 24b — the family is genuinely SCOPED, not merely unmapped. Without pattern
+#       matching every member would have no row at all and defense 4 would keep
+#       it unconditionally: the run would look narrowed while the biggest
+#       family in the set ran on every diff. So an unrelated change must SKIP
+#       the members, and the skip must be NAMED.
+reset_pattern_env
+GATE_SELECTION_CHANGED='docs/a.md'
+gate_selection_resolve
+case "$GATE_SELECTION_SELECTED" in
+  *test_alpha*) fail "24b: an unrelated change must SKIP the family — the pattern row was not honoured as a mapping:
+$GATE_SELECTION_SELECTED" ;;
+esac
+case "$GATE_SELECTION_SKIPPED" in
+  *test_alpha*) : ;;
+  *) fail "24b: the skipped list must NAME the un-run family member:
+$GATE_SELECTION_SKIPPED" ;;
+esac
+echo "PASS: 24b a pattern-mapped gate is genuinely scoped (skipped, and named, on an unrelated change)"
+
+# 24c — EXACT KEYS WIN. `fixtures/special.json` is claimed by the pinpoint row
+#       alone. If the family row were allowed to answer for a gate that has its
+#       own row, this would drag alpha and beta in as well and the pinpoint row
+#       would be decorative.
+reset_pattern_env
+GATE_SELECTION_CHANGED='fixtures/special.json'
+gate_selection_resolve
+expected24c='make test-always
+bash suite.sh --run tests/test_special.sh'
+[ "$GATE_SELECTION_SELECTED" = "$expected24c" ] || fail "24c: an exact row must beat the family pattern:
+got:
+$GATE_SELECTION_SELECTED
+want:
+$expected24c"
+echo "PASS: 24c an exact key beats a pattern key that also matches the gate"
+
+# 24d — pattern keys leave the reserved rows alone: a `none` path still selects
+#       the ALWAYS floor and nothing else, rather than escalating.
+reset_pattern_env
+GATE_SELECTION_CHANGED='LICENSE'
+gate_selection_resolve
+[ "$GATE_SELECTION_MODE" = "diff" ] || fail "24d: a none-row path must not escalate (got $GATE_SELECTION_MODE)"
+[ "$GATE_SELECTION_SELECTED" = "make test-always" ] || fail "24d: a recognised no-gate path must select the ALWAYS floor alone:
+$GATE_SELECTION_SELECTED"
+echo "PASS: 24d pattern keys leave the none/ALWAYS rows untouched"
 
 echo "OK — gate-selection.sh: all cases passed"
