@@ -555,6 +555,10 @@ const SPINE_OUTCOME_SCHEMA = {
     dirty_paths: { type: 'array', items: { type: 'string' } },
     rebase_in_progress: { type: 'boolean' },
     aborted: { type: 'boolean' },
+    // temperloop#2149: FRESHNESS_REBASED's own re-stamp verdict — did the
+    // freshness step move the §3e prior-reviewed-SHA marker onto the
+    // post-rebase base (and write the paired rebase notice)?
+    review_marker_restamped: { type: ['boolean', 'string'] },
     // 3e.6 activation-gate passthrough (temperloop#1219): the `proof:` — see build-level.design-notes.md#3e-6-activation-gate-passthrough-temperloop-1219-the-pr
     exitCode: { type: ['number', 'string'] },
     // REVIEW_DIFF passthrough (temperloop#1430) — the changed-file list (rep — see build-level.design-notes.md#review-diff-passthrough-temperloop-1430-the-changed-fil
@@ -586,6 +590,12 @@ const SPINE_OUTCOME_SCHEMA = {
     // `<prior-sha>..HEAD` diff instruction, so it is declared here rather
     // than left to `additionalProperties`.
     review_prior_sha: { type: 'string' },
+    // temperloop#2149: whether an upstream rebase landed BETWEEN the prior §3e
+    // round and this one — read by reviewDiffCmd from the notice marker
+    // gateFreshnessCmd's re-stamp writes. `['boolean','string']` for the same
+    // relay-hardening reason every numeric field here accepts a string: the
+    // machinery relay has been observed to stringify scalars.
+    review_prior_rebased: { type: ['boolean', 'string'] },
     // 3e.5 sliced-gate fields (temperloop#1021). resumeAt — the 0-based gate — see build-level.design-notes.md#3e-5-sliced-gate-fields-temperloop-1021-resumeat-the-0-
     resumeAt: { type: ['number', 'string'] },
     failed: { type: ['number', 'string'] },
@@ -2913,6 +2923,20 @@ function reviewDiffCmd(wt, bump = true) {
     `    review_prior_sha=""`,
     `  fi`,
     `fi`,
+    // temperloop#2149 — the REBASE NOTICE marker, written beside the prior-sha
+    // marker by gateFreshnessCmd()'s re-stamp whenever the §3e.5-pre freshness
+    // step actually rebased between rounds. It is what lets the continuation
+    // prompt SAY the base moved, so the tighter `<prior-sha>..HEAD` range the
+    // re-stamp buys can never be read as "the reviewer already saw this tree".
+    // Consumed (and cleared) by the bumping call below — the round about to run
+    // IS the one that carries the notice, and once it has stamped its own HEAD
+    // no later round is owed one.
+    `rebased_file=""`,
+    `[ -n "$gd" ] && rebased_file="$gd/build-review-rounds-rebased"`,
+    `review_prior_rebased=false`,
+    `if [ -n "$rebased_file" ] && [ -f "$rebased_file" ]; then`,
+    `  review_prior_rebased=true`,
+    `fi`,
     // temperloop#2129 — the DELTA the prior round did not see: the files tha — see build-level.design-notes-7.md#temperloop-2129-the-delta-the-prior-round-did-not-see-the-fi
     `since_json='[]'`,
     `if [ -n "$review_prior_sha" ]; then`,
@@ -2934,6 +2958,14 @@ function reviewDiffCmd(wt, bump = true) {
           // Record THIS round's HEAD for the NEXT round to read as its prior — see build-level.design-notes-3.md#record-this-round-s-head-for-the-next-round-to-read-as-its-p
           `if [ -n "$sha_file" ] && [ -n "$__k2127_head" ]; then`,
           `  { printf '%s\\n' "$__k2127_head" > "$sha_file"; } 2>/dev/null || true`,
+          `fi`,
+          // temperloop#2149 — consume the rebase notice. Cleared UNCONDITIONALLY
+          // on the bumping arm (not only when the sha write above succeeded):
+          // the notice describes the window between the PRIOR round and this
+          // one, and this round closes it either way. `review_prior_rebased`
+          // was already read above, so this round still reports it.
+          `if [ -n "$rebased_file" ]; then`,
+          `  rm -f "$rebased_file" 2>/dev/null || true`,
           `fi`,
         ]
       : []),
@@ -2958,7 +2990,7 @@ function reviewDiffCmd(wt, bump = true) {
     `  tsv_rows=0`,
     `  tsv_checksum=0`,
     `fi`,
-    `printf '{"outcome":"REVIEW_DIFF","files":%s,"files_since_prior":%s,"tsv_lines":%s,"tsv_rows":%s,"tsv_checksum":%s,"review_rounds":%s,"review_prior_sha":"%s","review_head_sha":"%s"}\\n' "$files_json" "$since_json" "$tsv_json" "$tsv_rows" "$tsv_checksum" "$review_rounds" "$review_prior_sha" "$__k2127_head"`,
+    `printf '{"outcome":"REVIEW_DIFF","files":%s,"files_since_prior":%s,"tsv_lines":%s,"tsv_rows":%s,"tsv_checksum":%s,"review_rounds":%s,"review_prior_sha":"%s","review_head_sha":"%s","review_prior_rebased":%s}\\n' "$files_json" "$since_json" "$tsv_json" "$tsv_rows" "$tsv_checksum" "$review_rounds" "$review_prior_sha" "$__k2127_head" "$review_prior_rebased"`,
   ].join('\n');
 }
 
@@ -3086,6 +3118,26 @@ function reviewCarryForward(routes, ctx) {
 // reviewContinuationSection — temperloop#2127. The delta-aware instructi — see build-level.design-notes-3.md#reviewcontinuationsection-temperloop-2127-the-delta-aware-in
 function reviewContinuationSection(priorContext) {
   const hasFindings = Boolean(priorContext.findings && priorContext.findings.trim());
+  // temperloop#2149 — BOTH HALVES SHIP TOGETHER. The re-stamp in
+  // gateFreshnessCmd() buys this round a `<prior-sha>..HEAD` range whose base
+  // is the POST-rebase tree, which is exactly the CI fix and nothing else —
+  // but the prior round never saw that tree. Stating the rebase is what stops
+  // the tighter range from implying it did; the range without this notice is
+  // the dishonest version of the same message.
+  const rebased = priorContext.rebased === true;
+  const rebaseNotice = rebased
+    ? `UPSTREAM REBASE BETWEEN ROUNDS: after round ${priorContext.round} ran, this worktree was rebased ` +
+      'onto the default branch by the pre-gate freshness step, so the commits that round reviewed no ' +
+      'longer exist as it saw them. ' +
+      (priorContext.sha
+        ? 'The prior reviewed commit named below was re-stamped to the POST-REBASE base, so the range in ' +
+          `step ${hasFindings ? 2 : 1} covers ONLY the work done since the rebase — NOT the upstream delta ` +
+          'the rebase brought in, which no round of this review has seen. '
+        : '') +
+      'Treat anything the prior round concluded as made against a PRE-REBASE tree: re-check it against the ' +
+      'code as it stands now rather than assuming the rebase left it untouched, and rely on the full-branch ' +
+      'sweep below to cover the upstream delta.'
+    : null;
   const premise = hasFindings
     ? `Round ${priorContext.round} found blocking finding(s), reproduced below; a fix round has since run.`
     : `Round ${priorContext.round} of this item's §3e review recorded NO blocking findings, so there is ` +
@@ -3111,6 +3163,7 @@ function reviewContinuationSection(priorContext) {
   return [
     `## Continuation — round ${priorContext.round + 1} of this item's §3e review (delta-aware)`,
     premise,
+    ...(rebaseNotice ? [rebaseNotice] : []),
     steps.length === 3 ? 'Do all three of the following, IN ORDER:' : 'Do BOTH of the following, IN ORDER:',
     ...steps.map((step, i) => `${i + 1}. ${step}`),
     '',
@@ -3421,11 +3474,20 @@ async function runReviewers(item, wt, priorFindingsText) {
       ? diffOut.review_head_sha
       : null;
   // `priorContext` — null on round 1 (the ONLY thing that keeps reviewProm — see build-level.design-notes-3.md#priorcontext-null-on-round-1-the-only-thing-that-keeps-revie
+  // temperloop#2149 — did an upstream rebase land between the prior round and
+  // this one? Read from the same relay as the two SHAs above and normalised
+  // the same defensive way (a stringified `true` counts; anything else is
+  // false), so a mangled field can only ever LOSE the notice, never fabricate
+  // one. Paired with `priorSha` by construction: gateFreshnessCmd writes the
+  // notice marker BEFORE it re-stamps the sha, so a re-stamped range always
+  // arrives with its notice.
+  const priorRebased = diffOut.review_prior_rebased === true || diffOut.review_prior_rebased === 'true';
   const isContinuationRound = round > 1;
   const priorContext = isContinuationRound
     ? {
         round: priorRounds,
         sha: priorSha,
+        rebased: priorRebased,
         findings: typeof priorFindingsText === 'string' ? priorFindingsText : '',
       }
     : null;
@@ -4106,7 +4168,37 @@ function gateFreshnessCmd(wt, qgBin) {
     `fi`,
     `if __out="$(git rebase origin/main 2>&1)"; then`,
     `  __base="$(git rev-parse HEAD 2>/dev/null)"`,
-    `  jq -cn --arg base "$__base" --arg main "$__main" '{outcome:"FRESHNESS_REBASED",worktree_base:$base,main:$main}'`,
+    // temperloop#2149 — RE-STAMP the §3e prior-reviewed-SHA marker to the
+    // POST-REBASE base. The phase order is: §3e review (stamps the marker at
+    // the then-current HEAD) -> this step (rebases) -> push/CI -> the §3g
+    // CI-fix re-review (reads the marker). Without this, the marker names a
+    // commit the rebase orphaned, reviewDiffCmd's `--is-ancestor` fail-safe
+    // (temperloop#2127) correctly rejects it, and the re-review loses its
+    // `<prior-sha>..HEAD` range entirely. Re-stamping recovers a range whose
+    // base IS the post-rebase tree, so it spans exactly the CI fix.
+    //
+    // ONLY when the marker ALREADY EXISTS: nothing to re-stamp before a §3e
+    // round has stamped anything, and minting one here would invent a prior
+    // round that never ran.
+    //
+    // NOTICE-MARKER FIRST, THEN THE SHA — the write order is load-bearing.
+    // The tighter range is only honest alongside the notice that the base
+    // moved (the reviewer never saw the post-rebase tree), so if the notice
+    // marker cannot be written the SHA is left at its pre-rebase value and
+    // the #2127 fail-safe degrades the round to its range-free wording. A
+    // range can never ship without its notice; the reverse is harmless.
+    `  __restamped=false`,
+    `  __gd="$(git rev-parse --git-dir 2>/dev/null)"`,
+    `  if [ -n "$__gd" ] && [ -n "$__base" ] && [ -f "$__gd/build-review-rounds-sha" ]; then`,
+    `    if { printf '%s\\n' "$__base" > "$__gd/build-review-rounds-rebased"; } 2>/dev/null; then`,
+    `      if { printf '%s\\n' "$__base" > "$__gd/build-review-rounds-sha"; } 2>/dev/null; then`,
+    `        __restamped=true`,
+    `      else`,
+    `        rm -f "$__gd/build-review-rounds-rebased" 2>/dev/null || true`,
+    `      fi`,
+    `    fi`,
+    `  fi`,
+    `  jq -cn --arg base "$__base" --arg main "$__main" --argjson restamped "$__restamped" '{outcome:"FRESHNESS_REBASED",worktree_base:$base,main:$main,review_marker_restamped:$restamped}'`,
     `else`,
     // round 3 (MEDIUM, shell): rename the captured var (was the unused `out` — see build-level.design-notes-4.md#round-3-medium-shell-rename-the-captured-var-was-the-un
     `  __conflicts_raw="$(git diff --name-only --diff-filter=U 2>/dev/null)"`,
@@ -4219,7 +4311,13 @@ async function runGateFreshness(item, wt, qgBin) {
     });
   }
   if (out.outcome === 'FRESHNESS_REBASED') {
-    log(`[${item.slug}] pre-gate freshness — rebased onto origin/main (worktree_base ${String(out.worktree_base ?? '').slice(0, 12)}, main ${String(out.main ?? '').slice(0, 12)}) before running §3e.5`);
+    // temperloop#2149 — the re-stamp verdict is LOGGED, never re-derived here:
+    // the marker write happens inside the emitted shell (the only place that
+    // can see the worktree's git dir), so this driver reports what that shell
+    // said. `false` is the #2127 fail-safe path, not an error — the CI-fix
+    // re-review simply falls back to its range-free wording.
+    const restamped = out.review_marker_restamped === true || out.review_marker_restamped === 'true';
+    log(`[${item.slug}] pre-gate freshness — rebased onto origin/main (worktree_base ${String(out.worktree_base ?? '').slice(0, 12)}, main ${String(out.main ?? '').slice(0, 12)}) before running §3e.5; §3e review marker ${restamped ? 're-stamped to the post-rebase base (the CI-fix re-review keeps its delta range, and is told the base moved)' : 'NOT re-stamped (no prior round had stamped one, or the marker could not be written) — a CI-fix re-review degrades to the range-free wording'}`);
   } else if (out.outcome === 'FRESHNESS_CURRENT') {
     log(`[${item.slug}] pre-gate freshness — worktree already at or ahead of origin/main (${String(out.main ?? '').slice(0, 12)}); no rebase needed`);
   } else {
