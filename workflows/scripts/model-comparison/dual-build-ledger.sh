@@ -31,7 +31,32 @@
 #   override { applied, scope, reason },
 #   loss_reason ∈ {gate,judge,infra,incomplete,null},
 #   cross_read_attempted, guard_armed ∈ {ARMED,UNARMED,UNKNOWN},
-#   machinery_version, operator, host
+#   machinery_version, operator, host, repo
+#
+# `repo` (temperloop#2119) is ADDITIVE and BACKWARD-COMPATIBLE: it is the
+# absolute `git rev-parse --show-toplevel` of the cwd the row was appended
+# from (null when that cannot be resolved — e.g. an explicit `--dir` used
+# outside any checkout), assigned here exactly like `operator`/`host`: a
+# caller-supplied value is respected verbatim, an omitted one is filled in.
+# Every reader MUST treat it as OPTIONAL: rows written before this field
+# existed carry no `repo` key at all, and `read`, the tally in
+# `report-producers/dual-build`, and `calibrate-*` all continue to parse,
+# count and render them unchanged (test_dual_build_ledger.sh § 30 and
+# test_dual_build_report.sh § 13 pin exactly that old-row case). The full
+# PATH is kept rather than a `basename` label because two independent
+# clones of the same repo share a basename (the sibling
+# `report-producers/tokens` header documents this machine carrying three
+# independent temperloop clones) — a display label is `basename`, derivable
+# from the path, never the reverse.
+#
+# WHY IT EXISTS: the default ledger dir is now per-repo (§ DATA-DIR vs
+# SETTINGS RESOLUTION BOUNDARY below), so new rows no longer mix. But a
+# ledger already mixed by the pre-#2119 $0 climb — or one a caller
+# deliberately shares by pointing two repos at a single explicit
+# `DUAL_BUILD_LEDGER_DIR` — can now be SPLIT by this field rather than
+# discarded. Pre-#2119 rows carry no `repo`, so such a split separates what
+# it can and leaves the rest identifiable as unattributed; that is the
+# honest outcome, not a reason to widen the field into a guess.
 #
 # `machinery_version` rides every row — not itself a dual-build field, but
 # kept per the epic Contract's "Supersedes D12 (K#1924 piggyback) ... rows
@@ -164,9 +189,42 @@
 #       (Re)computes and writes the pinned calibration.json, and prints it.
 #
 # `--dir` (or env `DUAL_BUILD_LEDGER_DIR`) overrides the ledger root; default
-# is `<repo-root>/.temperloop/model-comparison/dual-build`, `<repo-root>`
-# derived from this script's own on-disk location (same convention as the
-# sibling `lake-sweep.sh`'s `MODEL_USAGE_RAW_DIR`/`REPO_ROOT` derivation).
+# is `<invoking-repo-root>/.temperloop/model-comparison/dual-build`, where
+# `<invoking-repo-root>` is `git rev-parse --show-toplevel` of the CWD — see
+# § DATA-DIR vs SETTINGS RESOLUTION BOUNDARY immediately below.
+#
+# ── DATA-DIR vs SETTINGS RESOLUTION BOUNDARY (temperloop#2119) ──────────────
+# Two resolutions live in this file and they deliberately DISAGREE:
+#
+#   SETTINGS (BUILD_CONFIG → build.config.sh) climb from $0/BASH_SOURCE, so
+#   they always come from the KERNEL checkout this script ships in. That is
+#   the temperloop#980 boundary, and it is CORRECT: an adopter must not be
+#   able to fork the kernel's own settings by editing a vendored copy.
+#
+#   DATA (LEDGER_DIR — rows.jsonl, archives/, calibration-pairs.jsonl,
+#   calibration.json, and archive-check's default `--repo`) resolves from
+#   `git rev-parse --show-toplevel` of the CWD, i.e. the repo actually being
+#   built/reported on. report.contract.md:65 fixes that invariant for the
+#   read side ("invoked with no arguments, cwd = the target repo"), and the
+#   sibling `report-producers/tokens` (temperloop#980) and
+#   `report-producers/dual-build` already use this same idiom.
+#
+# Until #2119 the DATA dir followed the SETTINGS climb too, so an adopter's
+# rows, patch archives and calibration.json landed in the KERNEL checkout's
+# `.temperloop/`, and two repos dual-building on one host silently shared a
+# single ledger with no field to separate the rows afterwards. The read side
+# (`report-producers/dual-build`) was already cwd-scoped, so the two halves
+# disagreed: the writer wrote to the kernel and the reader looked in the
+# adopter — an adopter now honestly sees an EMPTY ledger under its own
+# heading instead of the kernel's numbers. Do NOT "fix" the settings
+# resolution to match; the disagreement is the design.
+#
+# DEGRADE, NOT GUESS: when the cwd is not inside a git working tree, this
+# script does NOT silently fall back to the $0 climb (that is the bug) —
+# LEDGER_DIR is left UNRESOLVED and any command that would need the default
+# refuses with a named error. An explicit `--dir`/`DUAL_BUILD_LEDGER_DIR`
+# always wins and works anywhere, including outside a checkout, which is
+# what every fixture in this repo's test suites passes.
 #
 # Exit 0 on success. `read`/`archive-check` exit non-zero on a real negative
 # verdict (records missing / patch does not apply) as well as on usage error.
@@ -180,6 +238,9 @@
 set -uo pipefail
 
 HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SETTINGS ONLY (temperloop#980/#2119): this $0 climb resolves the KERNEL
+# checkout and is used for nothing but BUILD_CONFIG below. Ledger DATA never
+# follows it — see § DATA-DIR vs SETTINGS RESOLUTION BOUNDARY in the header.
 REPO_ROOT="$(cd -P "$HERE/../../.." && pwd)"
 
 BUILD_CONFIG="${BUILD_CONFIG:-$REPO_ROOT/workflows/scripts/build/build.config.sh}"  # setting:exempt — fixture-isolation override point (lets a test point this at an absent path to assert the genuinely-unconfigured-environment refusal, independent of what build.config.sh happens to declare); not a project-configurable setting
@@ -193,7 +254,6 @@ ARCHIVES_SUBDIR="archives"
 # and the PINNED calibration.json path this item's acceptance names.
 CALIBRATION_PAIRS_FILE_NAME="calibration-pairs.jsonl"
 CALIBRATION_STATUS_FILE_NAME="calibration.json"
-LEDGER_DIR="${DUAL_BUILD_LEDGER_DIR:-$REPO_ROOT/.temperloop/model-comparison/dual-build}"
 
 die() { echo "dual-build-ledger.sh: $1" >&2; exit 1; }
 
@@ -203,6 +263,39 @@ usage() {
 
 command -v jq >/dev/null 2>&1 || die "jq not found"
 command -v git >/dev/null 2>&1 || die "git not found"
+
+# ── DATA-DIR RESOLUTION (temperloop#2119) ───────────────────────────────────
+# See § DATA-DIR vs SETTINGS RESOLUTION BOUNDARY in the header. `git -C
+# "$PWD"` rather than a bare `git` so this reads explicitly off the
+# invocation cwd regardless of any later `cd` in this file — the identical
+# call site and comment as report-producers/dual-build's own resolution, so
+# the writer and the reader provably agree on which repo a ledger belongs to.
+INVOKING_REPO_ROOT="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || INVOKING_REPO_ROOT=""
+
+# ONE SEAM, deliberately. check-setting-registry.sh's equality lint compares
+# EVERY `${DUAL_BUILD_LEDGER_DIR:-...}`-shaped seam in this file against the
+# registry row's default column, so the override is read exactly once, below.
+# This pre-check therefore uses `+x` (a set/unset test the lint does not
+# treat as a seam) rather than a second `${NAME:-}` read.
+_ledger_dir_overridden=0
+[ -n "${DUAL_BUILD_LEDGER_DIR+x}" ] && [ -n "${DUAL_BUILD_LEDGER_DIR}" ] && _ledger_dir_overridden=1
+
+LEDGER_DIR="${DUAL_BUILD_LEDGER_DIR:-$INVOKING_REPO_ROOT/.temperloop/model-comparison/dual-build}"
+
+# Degenerate-expansion guard: with no override AND no resolvable checkout,
+# the seam above expands to a bare "/.temperloop/model-comparison/dual-build"
+# — an absolute path at the FILESYSTEM ROOT that is nobody's ledger, and one
+# `mkdir -p` away from being silently created. Blank it instead: the default
+# stays UNRESOLVED and every command that needs it refuses by name
+# (_require_dir). Never a silent fallback to the $0 climb — that is the bug.
+[ "$_ledger_dir_overridden" -eq 1 ] || [ -n "$INVOKING_REPO_ROOT" ] || LEDGER_DIR=""
+
+# _require_dir <subcommand> <dir> — the one place the unresolved-default
+# refusal is worded. Every subcommand calls it after its own arg parse, so
+# an explicit `--dir` (or $DUAL_BUILD_LEDGER_DIR) always satisfies it.
+_require_dir() {
+  [ -n "$2" ] || die "$1: no ledger dir — cwd is not inside a git working tree, so the per-repo default (<repo-root>/.temperloop/model-comparison/dual-build) cannot be resolved; pass --dir DIR or set DUAL_BUILD_LEDGER_DIR"
+}
 
 _operator_default() { echo "${USER:-${LOGNAME:-unknown}}"; }  # setting:exempt — OS-identity passthrough (who is running this process), not a project-configurable override point
 _host_default() { hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown; }
@@ -305,6 +398,11 @@ _validate_row() {
       elif ($r.pick != null and ($r.pick | type) != "object") then "pick must be null or an object"
       elif ($r.override | type) != "object" then "override must be an object"
       elif (($r.override | has("applied")) | not) then "override must carry an \"applied\" key"
+      # `repo` (temperloop#2119) is OPTIONAL, never required: a pre-#2119 row
+      # has no such key and must still validate. Only a SUPPLIED value is
+      # type-checked, and null stays legal (a row appended from outside any
+      # git working tree).
+      elif (($r | has("repo")) and ($r.repo != null) and (($r.repo | type) != "string")) then "repo must be a string or null when supplied"
       else empty
       end
   '
@@ -320,6 +418,7 @@ cmd_append() {
       *) die "append: unknown argument $1" ;;
     esac
   done
+  _require_dir append "$dir"
   [ -n "$row_json" ] || die "append: --row <json>|- is required"
   [ "$row_json" != "-" ] || row_json="$(cat)"
   jq -e . >/dev/null 2>&1 <<<"$row_json" || die "append: --row is not valid JSON"
@@ -354,13 +453,21 @@ cmd_append() {
   max="$(_ledger_max_seq "$rows_file")"
   next_seq=$((max + 1))
 
-  local created_at op host final_row
+  local created_at op host repo final_row
   created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   op="$(_operator_default)"
   host="$(_host_default)"
+  # `repo` (temperloop#2119): the invoking repo's own toplevel, resolved ONCE
+  # at load time from the cwd — the same resolution the default ledger dir
+  # uses, so a row always names the repo whose ledger it landed in even when
+  # an explicit `--dir`/$DUAL_BUILD_LEDGER_DIR points several repos at one
+  # shared ledger. Empty (not inside a checkout) becomes JSON null below,
+  # never the empty string, so a reader's `.repo // "unattributed"` and a
+  # `select(.repo == $r)` split both behave.
+  repo="$INVOKING_REPO_ROOT"
 
   final_row="$(jq -c --argjson seq "$next_seq" --arg schema_version "$SCHEMA_VERSION" \
-    --arg created_at "$created_at" --arg op "$op" --arg host "$host" '
+    --arg created_at "$created_at" --arg op "$op" --arg host "$host" --arg repo "$repo" '
     . as $r
     | {
         schema_version: ($schema_version | tonumber),
@@ -383,7 +490,10 @@ cmd_append() {
         guard_armed: $r.guard_armed,
         machinery_version: $r.machinery_version,
         operator: ($r.operator // $op),
-        host: ($r.host // $host)
+        host: ($r.host // $host),
+        repo: (if ($r | has("repo")) then $r.repo
+               elif $repo == "" then null
+               else $repo end)
       }' <<<"$row_json")" || { _lock_release "$dir"; die "append: could not build final row"; }
 
   printf '%s\n' "$final_row" >>"$rows_file" || { _lock_release "$dir"; die "append: write failed to $rows_file"; }
@@ -401,6 +511,7 @@ cmd_read() {
       *) die "read: unknown argument $1" ;;
     esac
   done
+  _require_dir read "$dir"
   case "${expect:-0}" in ''|*[!0-9]*) die "read: --expect must be a non-negative integer" ;; esac
 
   local rows_file="$dir/$ROWS_FILE_NAME"
@@ -483,6 +594,7 @@ cmd_archive() {
       *) die "archive: unknown argument $1" ;;
     esac
   done
+  _require_dir archive "$dir"
   [ -n "$slug" ] && [ -n "$arm" ] || die "archive: usage: archive <slug> <arm> --from <patch-file>|-"
   case "$slug" in ''|*[!A-Za-z0-9._-]*) die "archive: slug must match [A-Za-z0-9._-]+ (it becomes a filesystem path component)" ;; esac
   case "$arm" in baseline|candidate) : ;; *) die "archive: arm must be baseline or candidate" ;; esac
@@ -502,7 +614,11 @@ cmd_archive() {
 }
 
 cmd_archive_check() {
-  local dir="$LEDGER_DIR" slug="" arm="" repo="$REPO_ROOT" base=""
+  # The default `--repo` is DATA, not settings: the checkout a patch is
+  # test-applied against is the repo being built, so it follows the same
+  # cwd resolution as LEDGER_DIR (§ DATA-DIR vs SETTINGS RESOLUTION
+  # BOUNDARY), never the $0 climb to the kernel checkout.
+  local dir="$LEDGER_DIR" slug="" arm="" repo="$INVOKING_REPO_ROOT" base=""
   if [ $# -ge 2 ]; then
     case "$1" in --*) : ;; *) slug="$1"; shift ;; esac
     if [ -n "$slug" ]; then
@@ -518,6 +634,8 @@ cmd_archive_check() {
       *) die "archive-check: unknown argument $1" ;;
     esac
   done
+  _require_dir archive-check "$dir"
+  [ -n "$repo" ] || die "archive-check: no --repo given and cwd is not inside a git working tree, so the repo to test-apply the patch against cannot be resolved; pass --repo PATH"
   [ -n "$slug" ] && [ -n "$arm" ] || die "archive-check: usage: archive-check <slug> <arm> [--base SHA] [--repo PATH]"
   case "$slug" in ''|*[!A-Za-z0-9._-]*) die "archive-check: slug must match [A-Za-z0-9._-]+ (it becomes a filesystem path component)" ;; esac
   local patch="$dir/$ARCHIVES_SUBDIR/${slug}@${arm}.patch"
@@ -674,6 +792,7 @@ cmd_calibrate_sample() {
       *) die "calibrate-sample: unknown argument $1" ;;
     esac
   done
+  _require_dir calibrate-sample "$dir"
   [ -n "$count" ] || count="${DUAL_BUILD_CALIBRATE_PAIRS_PER_LEVEL:-}"  # setting:exempt — declared/owned by the sibling dual-build-settings item (#2071); a defensive, no-default read (§ NAMED-SETTING CONVENTION)
   case "$count" in
     ''|*[!0-9]*) die "calibrate-sample: no sample count configured — pass --count N or set DUAL_BUILD_CALIBRATE_PAIRS_PER_LEVEL (workflows/scripts/build/build.config.sh)" ;;
@@ -727,6 +846,7 @@ cmd_calibrate_record() {
       *) die "calibrate-record: unknown argument $1" ;;
     esac
   done
+  _require_dir calibrate-record "$dir"
   [ -n "$slug" ] || die "calibrate-record: --slug is required"
   case "$preference" in
     baseline|candidate|tie) : ;;
@@ -822,6 +942,7 @@ cmd_calibrate_status() {
       *) die "calibrate-status: unknown argument $1" ;;
     esac
   done
+  _require_dir calibrate-status "$dir"
   _cal_write_status "$dir"
 }
 
@@ -835,6 +956,7 @@ cmd_purge() {
       *) die "purge: unknown argument $1" ;;
     esac
   done
+  _require_dir purge "$dir"
   if [ ! -e "$dir" ]; then
     printf 'dual-build-ledger.sh: purge: nothing at %s (already clean)\n' "$dir"
     exit 0
@@ -858,6 +980,7 @@ cmd_prune() {
       *) die "prune: unknown argument $1" ;;
     esac
   done
+  _require_dir prune "$dir"
   # See § NAMED-SETTING CONVENTION above — bare reference only, no local default.
   [ -n "$retention" ] || retention="${DUAL_BUILD_ARCHIVE_RETENTION_DAYS:-}"  # setting:exempt — declared/owned/registered by the sibling dual-build-settings item (temperloop#2071) in build.config.sh; this is a defensive, no-default read of a setting this script does not own (order-independent of which of the two sibling PRs merges first)
   case "$retention" in

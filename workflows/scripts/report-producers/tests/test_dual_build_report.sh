@@ -34,6 +34,9 @@
 #  12   ledger-dir scoping: default-path resolution reads the INVOKING
 #       repo's own ledger (cwd-scoped via `git rev-parse --show-toplevel`),
 #       and a DIFFERENT repo's cwd never reads it (review round 1 [HIGH])
+#  13   backward compatibility (temperloop#2119): a ledger of PRE-`repo`
+#       rows -- no `repo` key at all -- still reads, tallies and RENDERS
+#       identically to the same rows carrying one
 #
 # Usage: bash workflows/scripts/report-producers/tests/test_dual_build_report.sh
 set -uo pipefail
@@ -302,6 +305,37 @@ outB="$(cd "$REPO_B" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && [[ "$outB" == "skipped -- dual-build: no ledger rows found"* ]] \
   && ok "12b: default-path resolution from a DIFFERENT repo's cwd (repo B) does not read repo A's ledger" \
   || fail "12b: rc=$rc outB=$outB"
+
+# ── 13. old rows (no `repo` key) still tally and render ────────────────────
+# temperloop#2119 added an ADDITIVE `repo` field to the row schema. Rows
+# written before it exists carry no such key, and this producer must render
+# them unchanged -- the acceptance's explicit backward-compatibility case.
+# The fixture is built by STRIPPING the key off real appended rows, so it
+# can never drift from the writer's own shape.
+D13_NEW="$WORK/d13-new"; D13_OLD="$WORK/d13-old"
+for i in 1 2 3; do
+  append "$D13_NEW" "old$i" baseline pass candidate candidate
+  append "$D13_NEW" "old$i" candidate pass candidate candidate
+done
+mkdir -p "$D13_OLD"
+jq -c 'del(.repo)' "$D13_NEW/rows.jsonl" >"$D13_OLD/rows.jsonl"
+
+count
+grep -q '"repo"' "$D13_OLD/rows.jsonl" && fail "13-guard: the old-row fixture still carries a repo key"
+outNew="$(sut "$D13_NEW" 2>&1)"; rcNew=$?
+outOld="$(sut "$D13_OLD" 2>&1)"; rcOld=$?
+[ "$rcNew" -eq 0 ] && [ "$rcOld" -eq 0 ] \
+  || fail "13: expected exit 0 for both renders (new=$rcNew old=$rcOld)"
+jq -e . >/dev/null 2>&1 <<<"$outOld" \
+  || fail "13a: the old-row render is not valid JSON: $outOld"
+[ "$(jq -r '.tiers[0].honesty.total_dual_built_items' <<<"$outOld")" = "3" ] \
+  || fail "13b: old rows did not tally (got $(jq -r '.tiers[0].honesty.total_dual_built_items' <<<"$outOld"))"
+# Byte-identical apart from the `repo`-bearing ledger's own path/label, which
+# both fixtures share (same DUAL_BUILD_LEDGER_DIR shape) -- so the rendered
+# payloads must match exactly.
+[ "$(jq -S . <<<"$outOld")" = "$(jq -S . <<<"$outNew")" ] \
+  || fail "13c: the old-row render differs from the same rows carrying a repo key"
+ok "13: a ledger of rows with NO repo key reads, tallies and renders identically to one with it (backward compatibility)"
 
 echo
 echo "== $pass/$total passed =="

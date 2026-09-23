@@ -34,6 +34,16 @@
 #         a caller — a forged seq/schema_version in the input row is ignored
 #   26    operator/host: caller-supplied values are respected verbatim;
 #         omitted values fall back to the environment
+#   27-29 the DATA-DIR vs SETTINGS resolution boundary (temperloop#2119):
+#         the default ledger dir follows the CWD's git toplevel, a row
+#         written from repo A is invisible from repo B (and still visible
+#         from A — both states), a decoy build.config.sh in the cwd repo is
+#         NOT sourced (settings keep the $0 climb), and a cwd outside any
+#         checkout REFUSES by name instead of silently falling back to the
+#         kernel checkout
+#   30    the `repo` row field (temperloop#2119): assigned from the cwd,
+#         caller-supplied respected verbatim, and a pre-existing row with
+#         NO `repo` key still reads and tallies (backward compatibility)
 #
 # Usage: bash workflows/scripts/model-comparison/tests/test_dual_build_ledger.sh
 set -uo pipefail
@@ -333,6 +343,95 @@ r="$(sut append --dir "$D5" --row "$(row forged2 baseline)")" || fail "26b: appe
 [ -n "$(jq -r .operator <<<"$r")" ] && [ "$(jq -r .operator <<<"$r")" != "null" ] || fail "26b: an omitted operator was not defaulted"
 [ -n "$(jq -r .host <<<"$r")" ] && [ "$(jq -r .host <<<"$r")" != "null" ] || fail "26b: an omitted host was not defaulted"
 ok "26 operator/host are respected verbatim when supplied, and defaulted from the environment when omitted"
+
+# ── 27-29. DATA-DIR vs SETTINGS resolution boundary (temperloop#2119) ──────
+# Before #2119 the ledger DATA dir climbed from $0 to the kernel checkout,
+# exactly like BUILD_CONFIG still does — so an adopter's rows, archives and
+# calibration.json landed in the KERNEL's .temperloop/, and two repos
+# dual-building on one host silently shared one ledger. Two throwaway git
+# repos discriminate the fix directly, in BOTH states (principle 1): repo A's
+# row must be visible from repo A's cwd and invisible from repo B's.
+REPO_A="$WORK/repoA"; REPO_B="$WORK/repoB"
+mkdir -p "$REPO_A" "$REPO_B"
+gitc init -q --initial-branch=main "$REPO_A"
+gitc init -q --initial-branch=main "$REPO_B"
+# The kernel checkout this SUT actually lives in — the dir the OLD $0 climb
+# resolved to. Nothing this section writes may land under it.
+KERNEL_ROOT="$(cd -P "$HERE/../../../.." && pwd)"
+KERNEL_ROWS="$KERNEL_ROOT/.temperloop/model-comparison/dual-build/rows.jsonl"
+# Fingerprint of the kernel checkout's own ledger BEFORE this section runs —
+# "absent" when there is none. The old $0 climb wrote exactly here, so this
+# is the file that must not move.
+kernel_rows_fingerprint() {
+  if [ -f "$KERNEL_ROWS" ]; then shasum -a 256 "$KERNEL_ROWS" | awk '{print $1}'; else echo absent; fi
+}
+KERNEL_ROWS_BEFORE="$(kernel_rows_fingerprint)"
+
+count
+outA="$(cd "$REPO_A" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" append --row "$(row cwdscope baseline)")" \
+  || fail "27: append from repo A's cwd with no --dir failed"
+[ -f "$REPO_A/.temperloop/model-comparison/dual-build/rows.jsonl" ] \
+  || fail "27a: the row did not land under repo A's OWN .temperloop/model-comparison/dual-build/"
+[ "$(kernel_rows_fingerprint)" = "$KERNEL_ROWS_BEFORE" ] \
+  || fail "27b: the append touched the KERNEL checkout's ledger at $KERNEL_ROWS — the \$0 climb is still in play"
+[ "$(jq -r .seq <<<"$outA")" = "1" ] || fail "27c: the first row in repo A's own ledger must be seq 1"
+ok "27 the default ledger dir resolves from the CWD's git toplevel, not the \$0 climb to the kernel checkout"
+
+count
+nA="$(cd "$REPO_A" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" read | jq 'length')" || fail "28: read from repo A failed"
+nB="$(cd "$REPO_B" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" read | jq 'length')" || fail "28: read from repo B failed"
+[ "$nA" = "1" ] || fail "28a: repo A's own row is NOT visible when read with cwd = repo A (got $nA)"
+[ "$nB" = "0" ] || fail "28b: repo A's row LEAKED into a read with cwd = repo B (got $nB)"
+ok "28 a row written with cwd = repo A is visible from repo A and NOT visible from repo B (isolation, both states)"
+
+count
+# The settings half of the boundary, discriminated rather than asserted: a
+# DECOY build.config.sh planted inside repo A would redirect the ledger if
+# settings followed the cwd. They must keep climbing from $0, so it is never
+# sourced and the row still lands in repo A's own default ledger dir.
+mkdir -p "$REPO_A/workflows/scripts/build"
+printf 'DUAL_BUILD_LEDGER_DIR=%s\n' "$WORK/decoy-ledger" >"$REPO_A/workflows/scripts/build/build.config.sh"
+( cd "$REPO_A" && env -u DUAL_BUILD_LEDGER_DIR -u BUILD_CONFIG bash "$SUT" append --row "$(row decoy candidate)" ) >/dev/null \
+  || fail "29: append from repo A with a decoy build.config.sh failed"
+[ ! -e "$WORK/decoy-ledger" ] \
+  || fail "29a: the cwd repo's DECOY build.config.sh was sourced — settings must keep the \$0 climb (temperloop#980)"
+[ "$(cd "$REPO_A" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" read | jq 'length')" = "2" ] \
+  || fail "29b: the second row did not land in repo A's own ledger"
+# And a cwd outside any checkout REFUSES by name rather than falling back.
+out="$(cd "$WORK" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" read 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [[ "$out" == *"no ledger dir"* ]] \
+  || fail "29c: a cwd outside any git checkout must refuse by name, not fall back (got rc=$rc: $out)"
+[ "$(kernel_rows_fingerprint)" = "$KERNEL_ROWS_BEFORE" ] \
+  || fail "29d: the un-resolvable-cwd path fell back to the kernel checkout's ledger"
+ok "29 settings keep the \$0 climb (a decoy build.config.sh in the cwd repo is never sourced) and an un-resolvable cwd refuses by name"
+
+# ── 30. the additive, backward-compatible `repo` row field ─────────────────
+count
+r="$(cd "$REPO_A" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" append --row "$(row repofield baseline)")" \
+  || fail "30: append failed"
+[ "$(jq -r .repo <<<"$r")" = "$(cd "$REPO_A" && pwd -P)" ] \
+  || fail "30a: repo was not stamped with the invoking repo's toplevel (got $(jq -r .repo <<<"$r"))"
+r="$(cd "$REPO_A" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" append --row "$(row repofield candidate | jq -c '.repo="/elsewhere/repoZ"')")" \
+  || fail "30: append with a caller-supplied repo failed"
+[ "$(jq -r .repo <<<"$r")" = "/elsewhere/repoZ" ] \
+  || fail "30b: a caller-supplied repo was not respected verbatim"
+# BACKWARD COMPATIBILITY: a ledger of PRE-#2119 rows — no `repo` key at all —
+# must still read, self-check and tally. Built by stripping the key from real
+# appended rows, so this fixture can never drift from the writer's own shape.
+DOLD="$WORK/d-oldrows"
+mkdir -p "$DOLD"
+( cd "$REPO_A" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" read ) \
+  | jq -c '.[] | del(.repo)' >"$DOLD/rows.jsonl" || fail "30: could not build the old-row fixture"
+grep -q '"repo"' "$DOLD/rows.jsonl" && fail "30c-guard: the old-row fixture still carries a repo key"
+old_n="$(sut read --dir "$DOLD" | jq 'length')" || fail "30c: reading a ledger of rows with NO repo field failed"
+[ "$old_n" = "4" ] || fail "30c: expected 4 old-style rows to read back, got $old_n"
+[ "$(sut read --dir "$DOLD" | jq '[.[] | select(has("repo"))] | length')" = "0" ] \
+  || fail "30d: read invented a repo key on rows that never had one"
+sut read --dir "$DOLD" --expect 4 >/dev/null || fail "30e: the --expect self-check failed over old-style rows"
+# And a NEW row appends cleanly onto an old-style ledger (mixed file).
+sut append --dir "$DOLD" --row "$(row mixed baseline)" >/dev/null || fail "30f: appending onto an old-style ledger failed"
+[ "$(sut read --dir "$DOLD" | jq 'length')" = "5" ] || fail "30g: the mixed old+new ledger did not read back"
+ok "30 repo is stamped from the cwd, respected verbatim when supplied, and rows with NO repo key still read, self-check and accept new appends"
 
 printf '\ntest_dual_build_ledger.sh: %d/%d checks passed\n' "$pass" "$total"
 [ "$pass" -eq "$total" ] || exit 1
