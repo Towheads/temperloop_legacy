@@ -120,15 +120,31 @@ test-board:
 		if out="$$(env -u TMUX -u TMUX_PANE -u CMUX_WORKSPACE_ID bash "$$t" 2>&1)"; then echo "  [ok] $$(basename $$t)"; else echo "  [FAIL] $$(basename $$t)"; printf '%s\n' "$$out" | sed 's/^/      /'; exit 1; fi; \
 	done
 
+# WALL-CLOCK BOUND (temperloop#2184). This target and test-build-workflow
+# below both run through workflows/scripts/build/bounded-suite.sh: neither had
+# any bound, so a hang inside a test ran forever with nothing going red (the
+# observed incident: ~50h and two orphaned process trees). The bound itself is
+# the NAMED SETTING $$BUILD_SUITE_TIMEOUT_SECS (build.config.sh), never a
+# literal in this recipe — see CLAUDE.kernel.md § Named-setting convention.
+# The loop writes the test script it is about to run to $$SUITE_PROGRESS_FILE
+# so a timeout report names the case that was RUNNING, not the last one that
+# passed.
 test-build:
 	@echo "==> Running build toolkit tests..."
-	@for t in $(BUILD_SRC)/tests/test_*.sh; do \
-		if out="$$(bash "$$t" 2>&1)"; then echo "  [ok] $$(basename $$t)"; else echo "  [FAIL] $$(basename $$t)"; printf '%s\n' "$$out" | sed 's/^/      /'; exit 1; fi; \
-	done
+	@bash "$(BUILD_SRC)/bounded-suite.sh" --label test-build -- \
+		bash -c 'for t in "$$1"/tests/test_*.sh; do \
+			printf "%s\n" "$$(basename "$$t")" > "$${SUITE_PROGRESS_FILE:-/dev/null}"; \
+			if out="$$(bash "$$t" 2>&1)"; then echo "  [ok] $$(basename "$$t")"; else echo "  [FAIL] $$(basename "$$t")"; printf "%s\n" "$$out" | sed "s/^/      /"; exit 1; fi; \
+		done' _ "$(BUILD_SRC)"
 
+# Bounded exactly like test-build above (temperloop#2184). --case-source lets
+# the guard name the running case even for the suite's inline sections, which
+# announce nothing until they pass.
 test-build-workflow:
 	@echo "==> Running build-level.mjs offline harness..."
-	@bash $(BUILD_SRC)/tests/test_workflow.sh
+	@bash "$(BUILD_SRC)/bounded-suite.sh" --label test-build-workflow \
+		--case-source "$(BUILD_SRC)/tests/test_workflow.sh" \
+		-- bash "$(BUILD_SRC)/tests/test_workflow.sh"
 
 # Glob-based, same rationale as test-board above (F#836): kernel coverage
 # can never trail whichever tests/test_*.sh files are actually vendored.
