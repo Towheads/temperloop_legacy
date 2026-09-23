@@ -14,7 +14,7 @@
 #
 #   dual-build-preflight.sh --tier <tier> --items-file <path|-> \
 #       --baseline <model> --candidate <model> \
-#       [--provider <name>] [--execution live|recorded]
+#       [--judge-model <id>] [--provider <name>] [--execution live|recorded]
 #
 #   --tier         the plan `model:` tier under test (e.g. "sonnet").
 #   --items-file   a JSON array of the LEVEL's plan items, each
@@ -25,6 +25,23 @@
 #                  two fields it needs per item.
 #   --baseline     the tier's own current model (the arm NOT under test).
 #   --candidate    the candidate model under test.
+#   --judge-model  OPTIONAL (temperloop#2203) — the model the PAIRWISE JUDGE
+#                  itself runs on for this run, and this run only. Omitted
+#                  (the default) the field is null, the emitted `dualBuild`
+#                  object carries NO `judgeModel` key at all, and
+#                  `build-level.mjs` invokes `judge.sh pairwise` with the
+#                  byte-identical command it emitted before this flag
+#                  existed — judge.sh then resolves its own
+#                  MODEL_COMPARISON_JUDGE_MODEL default. Given, the value
+#                  rides the emitted object through to `judge.sh pairwise
+#                  --model <id>`, and is named on `cumulative_spend_line`
+#                  so the consent prompt discloses WHICH instrument is
+#                  about to read the two arms. Per-invocation by design:
+#                  the alternative — editing build.config.sh or a
+#                  machine-local override — changes the judge for every
+#                  other run on the host and outlives this one. An empty
+#                  value is refused (CANNOT_EVALUATE), never silently
+#                  treated as absent.
 #   --provider     the CANDIDATE's provider name, as registered in
 #                  candidate-session.sh's `_CS_PROVIDER_TABLE` (default:
 #                  "anthropic", candidate-session.sh's own `_CS_DEFAULT_
@@ -80,7 +97,7 @@
 #     comparison script's convention; RC_CANNOT_EVALUATE=2 is the shared
 #     LIBRARY FUNCTION's own return value, a distinct contract — see
 #     workflows/scripts/lib/cannot-evaluate.sh's header)
-#   {"outcome":"PREFLIGHT", tier, baseline, candidate, provider,
+#   {"outcome":"PREFLIGHT", tier, baseline, candidate, provider, judge_model,
 #    in_scope_n, min_inscope_items, in_scope_slugs,
 #    arms_n:2, tokens_per_replay, estimated_total_tokens,
 #    ceiling_tokens, ceiling_setting:"REPLAY_PREFLIGHT_CEILING_TOKENS",
@@ -88,8 +105,14 @@
 #    credential_ok, credential_error,
 #    spend_account, spend_org,
 #    stop, stop_reason: null|"below_min_inscope"|"no_credential"|"ceiling_exceeded",
-#    dualBuild: null | {tier, baseline, candidate, inScope:[slug,...]},
+#    dualBuild: null | {tier, baseline, candidate, inScope:[slug,...]
+#                       [, judgeModel]},
 #    cumulative_spend_line}
+#
+# `judge_model` is null and `dualBuild.judgeModel` is ABSENT unless
+# --judge-model was given — the no-override path emits exactly the object it
+# emitted before temperloop#2203, so a caller that never passes the flag sees
+# no shape change at all.
 #   exit 0 when stop=false (PROCEED); exit 3 when stop=true (mirrors
 #   replay.sh preflight's own `[ "$stop" = "false" ] || return 3` — a
 #   distinct non-zero code from RC_CANNOT_EVALUATE (2), so a caller can tell
@@ -167,13 +190,15 @@ command -v jq >/dev/null 2>&1 || { cannot_evaluate_emit "dual-build-preflight.sh
 _dbp_ce() { cannot_evaluate_emit "dual-build-preflight.sh" "$1"; exit 1; }
 
 # ── arg parse ────────────────────────────────────────────────────────────────
-tier="" items_file="" baseline="" candidate="" provider="anthropic" execution="live"
+tier="" items_file="" baseline="" candidate="" judge_model="" provider="anthropic" execution="live"
+judge_model_given=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --tier)        [ $# -ge 2 ] || { printf 'dual-build-preflight.sh: --tier needs a value\n' >&2; exit 2; }; tier="$2"; shift 2 ;;
     --items-file)  [ $# -ge 2 ] || { printf 'dual-build-preflight.sh: --items-file needs a value\n' >&2; exit 2; }; items_file="$2"; shift 2 ;;
     --baseline)    [ $# -ge 2 ] || { printf 'dual-build-preflight.sh: --baseline needs a value\n' >&2; exit 2; }; baseline="$2"; shift 2 ;;
     --candidate)   [ $# -ge 2 ] || { printf 'dual-build-preflight.sh: --candidate needs a value\n' >&2; exit 2; }; candidate="$2"; shift 2 ;;
+    --judge-model) [ $# -ge 2 ] || { printf 'dual-build-preflight.sh: --judge-model needs a value\n' >&2; exit 2; }; judge_model="$2"; judge_model_given=true; shift 2 ;;
     --provider)    [ $# -ge 2 ] || { printf 'dual-build-preflight.sh: --provider needs a value\n' >&2; exit 2; }; provider="$2"; shift 2 ;;
     --execution)
       [ $# -ge 2 ] || { printf 'dual-build-preflight.sh: --execution needs a value\n' >&2; exit 2; }
@@ -190,6 +215,12 @@ done
 [ -n "$items_file" ]  || _dbp_ce "no --items-file given"
 [ -n "$baseline" ]    || _dbp_ce "no --baseline given"
 [ -n "$candidate" ]   || _dbp_ce "no --candidate given"
+# temperloop#2203 — an EMPTY --judge-model is refused rather than read as
+# absent: a run that named a judge and silently got the host default is
+# indistinguishable, afterwards, from one that never named one.
+if [ "$judge_model_given" = "true" ]; then
+  [ -n "$judge_model" ] || _dbp_ce "--judge-model was given an empty value; omit the flag to judge under judge.sh's own default"
+fi
 
 # ── read + validate the level's items ────────────────────────────────────────
 items_json=""
@@ -285,9 +316,14 @@ elif [ "$ceiling_exceeded" = "true" ]; then
 fi
 
 cumulative_spend_line="Cumulative dual-build spend projected for this level: $estimated_total_tokens cost-weighted token units across $in_scope_n in-scope item(s) tagged model: $tier (2 arms x $REPLAY_PREFLIGHT_TOKENS_PER_REPLAY per item), against a ceiling of $REPLAY_PREFLIGHT_CEILING_TOKENS (REPLAY_PREFLIGHT_CEILING_TOKENS — the replay harness's own shared ceiling setting, not a dual-build-specific one). Spend lands on account '$spend_account' (org: $spend_org)."
+# temperloop#2203 — disclose the INSTRUMENT on the consent prompt, but only
+# when this run selected one: with no --judge-model the line is byte-identical
+# to the pre-#2203 one, so no existing consent text changes.
+[ -n "$judge_model" ] && cumulative_spend_line="$cumulative_spend_line Pairwise judge for this run: $judge_model (per-invocation --judge-model; no host default was changed)."
 
 payload="$(jq -n \
   --arg tier "$tier" --arg baseline "$baseline" --arg candidate "$candidate" --arg provider "$provider" \
+  --arg judge_model "$judge_model" \
   --argjson in_scope_n "$in_scope_n" --argjson min_inscope_items "$DUAL_BUILD_MIN_INSCOPE_ITEMS" \
   --argjson in_scope_slugs "$in_scope_slugs_json" \
   --argjson arms_n "$arms_n" --argjson tokens_per_replay "$REPLAY_PREFLIGHT_TOKENS_PER_REPLAY" \
@@ -299,6 +335,7 @@ payload="$(jq -n \
   --arg cumulative_spend_line "$cumulative_spend_line" \
   '{outcome:"PREFLIGHT",
     tier:$tier, baseline:$baseline, candidate:$candidate, provider:$provider,
+    judge_model: (if $judge_model == "" then null else $judge_model end),
     in_scope_n:$in_scope_n, min_inscope_items:$min_inscope_items, in_scope_slugs:$in_scope_slugs,
     arms_n:$arms_n, tokens_per_replay:$tokens_per_replay,
     estimated_total_tokens:$estimated_total_tokens,
@@ -308,7 +345,10 @@ payload="$(jq -n \
     credential_ok:$credential_ok, credential_error: (if $credential_error == "" then null else $credential_error end),
     spend_account:$spend_account, spend_org:$spend_org,
     stop:$stop, stop_reason: (if $stop_reason == "" then null else $stop_reason end),
-    dualBuild: (if $stop then null else {tier:$tier, baseline:$baseline, candidate:$candidate, inScope:$in_scope_slugs} end),
+    dualBuild: (if $stop then null
+                else {tier:$tier, baseline:$baseline, candidate:$candidate, inScope:$in_scope_slugs}
+                     + (if $judge_model == "" then {} else {judgeModel:$judge_model} end)
+                end),
     cumulative_spend_line:$cumulative_spend_line}')" || _dbp_ce "failed to emit the PREFLIGHT record"
 
 printf '%s\n' "$payload"

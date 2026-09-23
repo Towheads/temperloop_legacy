@@ -505,6 +505,18 @@ cumulative spend line. Doubling a run's spend carries no safe default, so
 this ask is never timed — on an operator-absent run the question is posted
 and the run **parks** rather than proceeding on a timeout.
 
+**Selecting the judge for one run.** The pairwise judge is the harness's
+measuring instrument, so `/build --dual-build-judge <id>` names the model it
+runs on for that invocation and no other — forwarded to
+`dual-build-preflight.sh --judge-model <id>`, echoed on the consent prompt so
+the operator sees which judge is about to read the two arms, and carried
+through to `judge.sh pairwise --model <id>`. Omit it and the judge resolves
+`MODEL_COMPARISON_JUDGE_MODEL` exactly as before. Without this flag the only
+ways to vary the judge were editing tracked config or a machine-local
+override, both of which outlive the run and change the default for every
+other run on the host — which is what made judge-sensitivity (does this
+verdict depend on the judge as well as on the two arms?) unmeasurable.
+
 **The level barrier.** A dual-built level cannot interleave build → gate → PR
 per item the way a single-arm level does: both arms build, locally gate, and
 get pairwise-judged on **every** in-scope item before a single PR opens for

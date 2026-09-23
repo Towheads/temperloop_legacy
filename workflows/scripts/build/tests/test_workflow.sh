@@ -14271,6 +14271,107 @@ if (callLog.length !== 0)
 console.log(JSON.stringify({ ok: true }));
 "
 
+# ---------------------------------------------------------------------------
+# K2203: the PER-RUN pairwise judge model. judge.sh has documented and
+# implemented `pairwise --model <id>` all along; build-level.mjs — its only
+# caller on a dual-build run — never passed it, so the judge always resolved
+# MODEL_COMPARISON_JUDGE_MODEL and the only way to vary the measuring
+# instrument was a config mutation that outlived the run. Three states, all
+# asserted, because the pass-through's whole value is that the ABSENT state
+# did not move: SET (the flag is emitted, with the right id), ABSENT (no
+# --model anywhere, and the command byte-identical to the SET one minus that
+# argument), MALFORMED (refused loudly, never read as absent).
+# ---------------------------------------------------------------------------
+run_node_case "K2203 judge model: dualBuild.judgeModel emits judge.sh --model ONLY when set — absent, the emitted command is byte-identical to the pre-#2203 one" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+// Emit the driver's OWN judge command for one in-scope item, under the given
+// dualBuild overlay. The SAME slug both times, so the two commands differ in
+// nothing but the seam under test — that is what makes the byte comparison a
+// real regression guard rather than a diff of two unrelated strings.
+const emitJudge = async (over) => {
+  greenArm('jm', 'baseline'); greenArm('jm', 'candidate');
+  itemBarrier('jm');
+  const base = dualArgs(['jm']);
+  const before = callLog.length;
+  globalThis.args = { ...base, dualBuild: { ...base.dualBuild, ...over }, items: [
+    { slug: 'jm', branch: 'build/jm', title: 'JM', kind: 'impl', acceptance: ['c'] },
+  ]};
+  const mod = await loadLevel();
+  const result = await mod.default();
+  const c = callLog.slice(before).find(x => x.opts.label === 'judge:jm');
+  return { cmd: c ? c.promptFull.split('\\nCommand:\\n')[1] : null, result };
+};
+
+const bail = (r) => { console.log(JSON.stringify({ ok: false, reason: r })); process.exit(0); };
+
+const off = await emitJudge({});
+if (!off.cmd) bail('no judge:jm call was spawned on the no-override run');
+if (off.cmd.indexOf('--model') !== -1)
+  bail('the no-override run emitted a --model flag — the pre-#2203 path must be byte-identical: ' + off.cmd);
+if (off.cmd.indexOf('--live --repo ') === -1)
+  bail('could not find the judge.sh invocation to anchor the byte comparison: ' + off.cmd);
+
+const on = await emitJudge({ judgeModel: 'claude-haiku-9' });
+if (!on.cmd) bail('no judge:jm call was spawned on the judgeModel run');
+if (on.cmd.indexOf(\"--model 'claude-haiku-9'\") === -1)
+  bail('a set judgeModel did not reach judge.sh as --model <id>: ' + on.cmd);
+// THE regression guard: the ONLY difference between the two commands is the
+// inserted argument. A pass-through that also reordered, re-quoted or dropped
+// anything else fails here even though the grep above passed.
+const expected = off.cmd.replace(' --live --repo ', \" --live --model 'claude-haiku-9' --repo \");
+if (on.cmd !== expected)
+  bail('the judgeModel run differs from the no-override run by more than the --model argument: ' + JSON.stringify({ off: off.cmd, on: on.cmd }));
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2203 judge model: a PRESENT-BUT-UNUSABLE judgeModel REFUSES the level — an empty string and a non-string alike, never silently read as absent" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+// Both shapes reach the same state: str() scrubs them to '', but the key IS
+// present, which is a run that asked for a named instrument. Degrading to the
+// host default there is indistinguishable, afterwards, from never asking.
+for (const bad of ['', '   ', 42]) {
+  globalThis.args = { ...baseArgs, dualBuild: { tier: 'sonnet', baseline: 'b', candidate: 'c', inScope: ['jbad'], judgeModel: bad }, items: [
+    { slug: 'jbad', branch: 'build/jbad', title: 'JBad', kind: 'impl', acceptance: ['c'] },
+  ]};
+  const mod = await loadLevel();
+  const result = await mod.default();
+  const esc = (result.escalations ?? []).find(e => e.slug === 'jbad');
+  if (!esc || esc.kind !== 'dual-build-input-invalid')
+    { console.log(JSON.stringify({ ok: false, reason: 'judgeModel=' + JSON.stringify(bad) + ' must REFUSE the level: ' + JSON.stringify(result) })); process.exit(0); }
+  if (!/judgeModel/.test(String(esc.payload.reason)))
+    { console.log(JSON.stringify({ ok: false, reason: 'the refusal must name judgeModel: ' + JSON.stringify(esc.payload) })); process.exit(0); }
+  if (callLog.length !== 0)
+    { console.log(JSON.stringify({ ok: false, reason: 'a refused level must spawn nothing: ' + JSON.stringify(callLog.map(c => c.opts.label)) })); process.exit(0); }
+}
+
+// …and an ABSENT judgeModel is NOT a refusal — the control, without which the
+// three cases above are satisfied by a seam that refuses unconditionally.
+greenArm('jok', 'baseline'); greenArm('jok', 'candidate');
+itemBarrier('jok');
+globalThis.args = { ...dualArgs(['jok']), items: [
+  { slug: 'jok', branch: 'build/jok', title: 'JOk', kind: 'impl', acceptance: ['c'] },
+]};
+const okRun = await (await loadLevel()).default();
+if ((okRun.escalations ?? []).some(e => e.kind === 'dual-build-input-invalid'))
+  { console.log(JSON.stringify({ ok: false, reason: 'an ABSENT judgeModel must not refuse: ' + JSON.stringify(okRun.escalations) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# K2203 STATIC GUARD: the pass-through itself. The runtime cases above prove the
+# behaviour end to end, but a refactor that re-hard-codes the judge invocation
+# would have to delete this line, and this guard says so at the file level.
+grep -q "judgeModelArg" "$MJS" \
+  || fail "#2203: the judge invocation must interpolate the optional per-run --model argument, not hard-code a flagless judge.sh call"
+grep -q "dual.judgeModel ? \` --model " "$MJS" \
+  || fail "#2203: the --model argument must be emitted ONLY when dualBuild.judgeModel is set (empty otherwise, so the no-override command stays byte-identical)"
+echo "PASS: #2203 static guard — the judge command composes an optional --model argument, empty unless the run named a judge model"
+
 # --- temperloop#2080 static guards ------------------------------------------
 # The runtime cases above prove the behaviour. These pin the two STRUCTURAL
 # facts a future edit could undo while every case above still passed: that the
