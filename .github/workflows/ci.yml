@@ -103,19 +103,42 @@ jobs:
             echo "No RUNNER_PAT secret — routing checks to hosted ubuntu-latest."
             echo "runs_on=$HOSTED" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          # Count runners labelled `ci-mini` that are registered, online AND idle.
-          idle=$(curl -sf \
-            -H "Authorization: Bearer $RUNNER_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runners?per_page=100" \
+          runners() {  # <owner/repo> → that repo's runner list (JSON), or non-zero
+            curl -sf \
+              -H "Authorization: Bearer $RUNNER_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$1/actions/runners?per_page=100"
+          }
+          # 1. This repo's `ci-mini` runner must be registered, online AND idle.
+          idle=$(runners "${{ github.repository }}" \
             | jq -r '[.runners[]? | select(.status=="online" and .busy==false)
                        | select([.labels[].name] | index("ci-mini"))] | length') || idle=""
-          if [ "${idle:-0}" -ge 1 ] 2>/dev/null; then
-            echo "Self-hosted runner ci-mini is online and idle — routing checks to it."
-            echo "runs_on=$SELF" >> "$GITHUB_OUTPUT"
-          else
+          if ! [ "${idle:-0}" -ge 1 ] 2>/dev/null; then
             echo "No idle ci-mini runner (count='${idle:-}') — routing checks to hosted ubuntu-latest."
+            echo "runs_on=$HOSTED" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # 2. ONE LANE across the VM (foundation#1941): every adopter's runner is a
+          #    process in the same 6-vCPU VM, and GitHub's `busy` is per runner, so
+          #    a sibling repo's running job must send this one hosted — measured
+          #    overlap roughly triples per-gate time. A sibling the PAT cannot see
+          #    (403, network) is logged and treated as idle, so a narrower PAT
+          #    degrades to the per-repo check above, never to always-hosted.
+          busy_elsewhere=""
+          for sib in Towheads/foundation Towheads/temperloop Towheads/stageFind Towheads/subsetwiki; do
+            [ "$sib" = "${{ github.repository }}" ] && continue
+            n=$(runners "$sib" | jq -r '[.runners[]? | select(.busy==true)
+                                          | select([.labels[].name] | index("ci-mini"))] | length') || n=""
+            case "$n" in
+              '' | *[!0-9]*) echo "  $sib: runners not visible to RUNNER_PAT — assumed idle"; continue ;;
+            esac
+            [ "$n" -ge 1 ] && busy_elsewhere="$busy_elsewhere $sib"
+          done
+          if [ -n "$busy_elsewhere" ]; then
+            echo "VM lane busy (${busy_elsewhere# } has a running ci-mini job) — routing checks to hosted ubuntu-latest."
             echo "runs_on=$HOSTED" >> "$GITHUB_OUTPUT"
+          else
+            echo "Self-hosted runner ci-mini is online and idle, VM lane free — routing checks to it."
+            echo "runs_on=$SELF" >> "$GITHUB_OUTPUT"
           fi
 
   checks:
