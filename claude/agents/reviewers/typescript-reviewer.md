@@ -46,8 +46,13 @@ matter which tier the calling drive runs on — the guarantee `inherit`
 structurally cannot give (temperloop#1456). Stated plainly rather than papered
 over: a cheap autonomous drive that reached §3e would run this seat cheap. That
 residual is accepted for this seat and deliberately not accepted for
-`architecture-reviewer`. The sibling `shell-reviewer.md` records the same open
-question about its own `inherit` declaration.
+`architecture-reviewer` — nor, since temperloop#2179, for the sibling catalog
+seats `shell-reviewer.md` and `python-reviewer.md`, which once recorded the
+same open question about their own `inherit` and have now **pinned** `opus`
+instead. Their basis does not reach this seat: it is the "no second reviewer
+stands behind it" argument `architecture-reviewer` runs on, while this seat's
+`inherit` rests on temperloop#2132's gate-bearing reasoning with a paired
+measurement still parked to temperloop#2134.
 
 ## What I review
 
