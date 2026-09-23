@@ -659,7 +659,21 @@ exit 0
 EOF
 
 POLL_RUNS=5
-poll_elapsed() {  # poll_elapsed <guard-path> -> whole seconds for $POLL_RUNS runs
+POLL_ELAPSED=""
+# An OUT-PARAM, not a command substitution (temperloop#2194). `fail()` is
+# `exit 1`, and an exit inside `$( )` kills only the substitution's SUBSHELL:
+# the parent carried on with POLL_ELAPSED unset-as-empty, bash arithmetic reads
+# an empty-but-set variable as 0 even under `set -u`, and the delta assertion
+# below then evaluated `0 - 0` and blamed the TIMING — "the flat-sleep-1
+# control took s vs the shipped guard's s" — for what was actually the fixture
+# failing under the guard. The suite still went red; the operator was just sent
+# to the wrong place, with the real cause printed from the dead subshell where
+# it reads as noise. Running in the CALLER'S shell keeps both the out-param and
+# fail()'s exit, exactly as gate_selection_local_changed_to_file does for its
+# own out-param (temperloop#1663), and as the sibling suite's own note at
+# test_gate_selection.sh warns: "No subshell: fail() exits, and an exit inside
+# `( )` would leave the suite printing OK on a red case."
+poll_elapsed() {  # poll_elapsed <guard-path> -> POLL_ELAPSED = whole seconds for $POLL_RUNS runs
   local guard="$1" t0 t1 i
   t0="$(date +%s)"
   i=0
@@ -669,7 +683,7 @@ poll_elapsed() {  # poll_elapsed <guard-path> -> whole seconds for $POLL_RUNS ru
     i=$((i + 1))
   done
   t1="$(date +%s)"
-  echo $((t1 - t0))
+  POLL_ELAPSED=$((t1 - t0))
 }
 
 # The control: the pre-#2162 flat-`sleep 1` cadence, spliced out of the shipped
@@ -681,8 +695,8 @@ if ! grep -q 'BS_FAST_POLLS' "$TMPD/guard-flat-poll.sh" \
   fail "12: the discrimination splice did not apply — the fast-poll line was not replaced, so the control proves nothing"
 fi
 
-fast_elapsed="$(poll_elapsed "$GUARD")"
-slow_elapsed="$(poll_elapsed "$TMPD/guard-flat-poll.sh")"
+poll_elapsed "$GUARD";                   fast_elapsed="$POLL_ELAPSED"
+poll_elapsed "$TMPD/guard-flat-poll.sh"; slow_elapsed="$POLL_ELAPSED"
 [ $((slow_elapsed - fast_elapsed)) -ge 1 ] \
   || fail "12: discrimination FAILED — the flat-sleep-1 control took ${slow_elapsed}s vs the shipped guard's ${fast_elapsed}s over $POLL_RUNS runs, so the fast poll is not actually in effect (or the measurement cannot see it)"
 # A catastrophe ceiling only: far outside any plausible load, so it can never be
