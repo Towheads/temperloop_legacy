@@ -524,8 +524,14 @@ bash scripts/tests/test_lint_bash32_ctlesc_ifs.sh	scripts/lint-bash32-ctlesc-ifs
 bash scripts/lint-argloop-shift2.sh	*.sh bin/** .temperloop/** workflows/scripts/report-producers/**
 bash scripts/tests/test_lint_argloop_shift2.sh	scripts/lint-argloop-shift2.sh scripts/tests/test_lint_argloop_shift2.sh
 bash workflows/scripts/tests/test_argloop_trailing_flag.sh	*.sh bin/** .temperloop/** workflows/scripts/report-producers/**
-make shellcheck	*.sh
+# `make shellcheck` is scripts/shellcheck-tree.sh since temperloop#2164 (the
+# bounded fan-out that replaced the serial `xargs` pass), so a change to the
+# runner itself must select the gate as well as a change to any linted *.sh.
+# The runner IS a *.sh, so the glob already covers it; the Makefile is not,
+# and it holds the target's only invocation.
+make shellcheck	*.sh Makefile
 bash scripts/tests/test_ensure_shellcheck.sh	scripts/ensure-shellcheck.sh scripts/tests/test_ensure_shellcheck.sh
+bash scripts/tests/test_shellcheck_tree.sh	scripts/shellcheck-tree.sh scripts/tests/test_shellcheck_tree.sh scripts/ensure-shellcheck.sh workflows/scripts/lib/gate-pool.sh
 bash workflows/scripts/validate-docs-footer.sh	README.md docs/** workflows/scripts/validate-docs-footer.sh
 bash workflows/scripts/tests/test_validate_docs_footer.sh	workflows/scripts/validate-docs-footer.sh workflows/scripts/tests/test_validate_docs_footer.sh
 bash workflows/scripts/validate-agent-charter-links.sh	claude/agents/** workflows/scripts/validate-agent-charter-links.sh

@@ -537,6 +537,12 @@ quality-gates scripts/tests/test_lint_argloop_shift2.sh
 quality-gates workflows/scripts/tests/test_argloop_trailing_flag.sh
 quality-gates scripts/ensure-shellcheck.sh
 quality-gates scripts/tests/test_ensure_shellcheck.sh
+# Whole-tree shell lint runner (temperloop#2164) — `make shellcheck` is a
+# bounded fan-out over the same file set instead of one serial shellcheck
+# process (43s -> 14s at four workers), with the report byte-identical to the
+# serial pass and the verdict fail-closed on a lost chunk.
+quality-gates scripts/shellcheck-tree.sh
+quality-gates scripts/tests/test_shellcheck_tree.sh
 quality-gates workflows/scripts/config/*
 quality-gates workflows/scripts/kernel/*
 quality-gates workflows/scripts/lint-pr-body.sh
