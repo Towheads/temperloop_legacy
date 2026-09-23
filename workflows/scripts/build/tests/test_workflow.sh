@@ -10410,6 +10410,17 @@ if (callLog.indexOf(ctl[0]) > callLog.indexOf(acts[0])) bad('the merge-base cont
 if (!/a phrase this item removed/.test(ctl[0].promptFull)) bad('the control ran a different predicate than the item declared');
 if (!/a phrase this item removed/.test(acts[0].promptFull)) bad('the worktree run used a different predicate than the item declared');
 
+// temperloop#1431: a PASS is RECORDED, not merely logged — the parked record is
+// this gate's execution signal, and \`merge_base\` proves the #944 control ran
+// against a real base rather than being asserted.
+const act = result.parked[0].activation;
+if (!act) bad('a class-A PASS must stamp \`activation\` on the parked record — without it the run cannot prove the gate ran');
+if (act.class !== 'A') bad('activation.class wrong: ' + JSON.stringify(act));
+if (!/a phrase this item removed/.test(String(act.proof))) bad('activation.proof must be the item predicate VERBATIM: ' + JSON.stringify(act));
+if (act.absence_asserting !== true) bad('an absence-asserting proof must record absence_asserting:true: ' + JSON.stringify(act));
+if (act.merge_base !== 'deadbeefcafe') bad('activation.merge_base must name the sha the control actually ran against: ' + JSON.stringify(act));
+if (act.exit_code !== 0) bad('a PASS records exit_code 0: ' + JSON.stringify(act));
+
 console.log(JSON.stringify({ ok: true }));
 "
 
@@ -10474,6 +10485,50 @@ if (ran.includes('push')) bad('must not reach 3f: ' + JSON.stringify(ran));
 console.log(JSON.stringify({ ok: true }));
 "
 
+# --- c3. a PRESENCE proof PASSES: recorded, and NO control pass (temperloop#1431)
+# The other half of the record's state space. A presence proof is false on an
+# untouched tree by construction, so it takes no #944 control run at all — the
+# record must therefore carry merge_base:null and absence_asserting:false, and
+# zero activation-control agents may be spawned. Asserting only the absence case
+# (arm c) would pass even if the record hard-coded absence_asserting:true.
+run_node_case "1431 activation: a class-A PRESENCE proof that passes is RECORDED on the parked record with merge_base null and no control pass" "
+$PREAMBLE
+
+setMachinery('item-act-pres',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/item-act-pres' },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'ACTIVATION_PASS', exitCode: 0, detail: '' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'ab91' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'ab91', branch: 'build/item-act-pres' },
+  { outcome: 'PR_OPENED', pr_number: 881 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('item-act-pres');
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-act-pres', branch: 'build/item-act-pres', title: 'Presence proof', kind: 'impl',
+    activation: { class: 'A', proof: 'grep -q GeminiRunner evals/runners/__init__.py', locus: 'evals/runners/__init__.py' } },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+const bad = (r) => { console.log(JSON.stringify({ ok: false, reason: r })); process.exit(0); };
+
+if ((result.escalations ?? []).length !== 0) bad('expected 0 escalations: ' + JSON.stringify(result.escalations));
+if ((result.parked ?? []).length !== 1) bad('expected the item to park: ' + JSON.stringify(result));
+const ctl = callLog.filter(c => /^activation-control:/.test(String(c.opts.label || '')));
+if (ctl.length !== 0) bad('a PRESENCE proof must take NO merge-base control pass, got ' + ctl.length);
+const act = result.parked[0].activation;
+if (!act) bad('a class-A PASS must stamp \`activation\` on the parked record');
+if (act.absence_asserting !== false) bad('a presence proof must record absence_asserting:false: ' + JSON.stringify(act));
+if (act.merge_base !== null) bad('a presence proof runs no control, so merge_base must be null: ' + JSON.stringify(act));
+if (act.proof !== 'grep -q GeminiRunner evals/runners/__init__.py') bad('activation.proof must be the predicate VERBATIM: ' + JSON.stringify(act));
+
+console.log(JSON.stringify({ ok: true }));
+"
+
 # --- d. regression guard: no block / class B / class C are UNAFFECTED --------
 # build-level.mjs is the default driver for EVERY item; a change that perturbs
 # the common path would be worse than the gap it closes. All three items below
@@ -10505,6 +10560,12 @@ if ((result.escalations ?? []).length !== 0) bad('expected 0 escalations: ' + JS
 if ((result.parked ?? []).length !== 3) bad('all three must park green: ' + JSON.stringify(result));
 const touched = callLog.filter(c => /^activation(-control)?:/.test(String(c.opts.label || '')));
 if (touched.length !== 0) bad('the gate must not spawn ANY agent for a non-class-A item, got ' + touched.length);
+// temperloop#1431: the record's DISCRIMINATING state — the key must be ABSENT,
+// not merely falsy. An implementation that always stamped \`activation\` would
+// pass every assertion in arm c and fail only here.
+for (const pk of result.parked) {
+  if ('activation' in pk) bad('a non-class-A item must carry NO activation key at all (byte-identical path): ' + pk.slug + ' -> ' + JSON.stringify(pk.activation));
+}
 
 console.log(JSON.stringify({ ok: true }));
 "
@@ -10526,6 +10587,17 @@ grep -q 'runActivationGate' "$MJS" \
   || fail "#1219: build-level.mjs must implement the §3e.6 class-A activation gate (runActivationGate)"
 grep -q 'ACTIVATION_CONTROL_VACUOUS' "$MJS" \
   || fail "#1219/#944: the merge-base control pass must be implemented — an absence proof with no control run proves nothing"
+# temperloop#1431: the PASS record is the gate's EXECUTION SIGNAL (kernel
+# § Mandatory-step birth rule) — a log line alone cannot be checked after the
+# run. Both surfaces must name it, so deleting either half fails here.
+grep -q 'parked.activation = activation' "$MJS" \
+  || fail "#1431: park() must stamp the §3e.6 class-A PASS record on the parked record — a gate whose only trace is a log line has no execution signal"
+grep -q 'absence_asserting' "$MJS" \
+  || fail "#1431: the activation PASS record must carry absence_asserting — without it the #944 control's applicability is unreadable from the record"
+grep -q 'activation: { class, proof,' "$MJS" \
+  || fail "#1431: build-level.mjs's I/O CONTRACT header must document the optional parked \`activation\` field, like discrimination_gaps and host_config_deferrals"
+grep -q 'absence_asserting' "$K1219_BUILD_MD" \
+  || fail "#1431: build.md §3e.6's Pass bullet must name the recorded PASS fields — lockstep with build-level.mjs"
 echo "PASS: #1219 boundary guard — \`activation\` crosses the orchestrator->workflow contract in both surfaces, and the gate + its #944 control exist"
 
 # Ordering — §3e.6 runs strictly BETWEEN 3e.5's gate and 3f's push/PR-open. This

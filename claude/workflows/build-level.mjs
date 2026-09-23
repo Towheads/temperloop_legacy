@@ -247,6 +247,17 @@
 //   orchestrator rolls the list into the Step 6 summary tally (build.md §3f
 //   step 2's sibling verification_surface degraded-case pattern).
 //
+//   A parked record MAY additionally carry `activation: { class, proof,
+//   absence_asserting, merge_base, exit_code }` (temperloop#1431) — present
+//   ONLY when this item declared `activation: class: A` and its §3e.6 proof
+//   PASSED against the worker's worktree. It is that gate's execution signal:
+//   a log line cannot be checked after the run, so this record is what lets
+//   the orchestrator prove the gate ran rather than take it on faith, and
+//   `merge_base` names the sha the temperloop#944 control pass ran against
+//   (null for a presence proof, which takes no control pass). An item with no
+//   activation block, or class B/C, carries no such key — its record is
+//   byte-identical to the pre-#1431 shape.
+//
 //   A parked record MAY additionally carry `host_config_deferrals:
 //   [{ criterion, host_config }, ...]` (temperloop#1182) — one entry per
 //   acceptance criterion the worker reported DEFERRED because it turns on a
@@ -2678,7 +2689,7 @@ function hostConfigDeferrals(acceptanceResults) {
 }
 
 // park()'s trailing three arguments (discriminationGapList, review, cost — see build-level.design-notes-3.md#park-s-trailing-three-arguments-discriminationgaplist-review
-function park(slug, pr, pushedSha, acceptanceResults, noCi, recovery, discriminationGapList, review, cost) {
+function park(slug, pr, pushedSha, acceptanceResults, noCi, recovery, discriminationGapList, review, cost, activation) {
   const parked = { slug, pr, pushed_sha: pushedSha, acceptance_results: acceptanceResults ?? [] };
   // temperloop#939: a record reconstructed from observable side-effects after a
   // lost worker return carries its provenance EXPLICITLY. `acceptance_unverified`
@@ -2721,6 +2732,11 @@ function park(slug, pr, pushedSha, acceptanceResults, noCi, recovery, discrimina
     parked.retry_count = cost.retry_count ?? 0;
     parked.recovery = !!cost.recovery;
   }
+  // temperloop#1431: the §3e.6 class-A activation gate's PASS record — the
+  // per-run execution signal proving the gate RAN against this item's worktree
+  // (kernel § Mandatory-step birth rule). Present ONLY for a class-A item that
+  // passed; no block or class B/C carries no such key at all.
+  if (activation) parked.activation = activation;
   // temperloop#1182: derived from `acceptanceResults` rather than threaded — see build-level.design-notes-7.md#temperloop-1182-derived-from-acceptanceresults-rather-than-t
   const hostDeferrals = hostConfigDeferrals(acceptanceResults);
   if (hostDeferrals.length > 0) parked.host_config_deferrals = hostDeferrals;
@@ -4170,7 +4186,7 @@ async function runGateFreshness(item, wt, qgBin) {
 }
 
 // runActivationGate(item, wt) — the §3e.6 gate. Returns an ESCALATION ob — see build-level.design-notes-7.md#runactivationgate-item-wt-the-3e-6-gate-returns-an-escalatio
-async function runActivationGate(item, wt) {
+async function runActivationGate(item, wt, sink = {}) {
   if (activationClass(item) !== 'A') return null; // no block, or class B/C — byte-identical path
 
   const proof = typeof item.activation.proof === 'string' ? item.activation.proof.trim() : '';
@@ -4185,6 +4201,10 @@ async function runActivationGate(item, wt) {
 
   const absence = isAbsenceProof(proof);
   const base = { class: 'A', proof, absenceAsserting: absence, locus: item.activation.locus ?? null };
+  // temperloop#1431: the merge-base sha the #944 control pass actually ran
+  // against, carried into the PASS record below. null for a presence proof,
+  // which takes no control pass by construction.
+  let controlBase = null;
 
   if (absence) {
     const ctl = await runMachinery(activationControlCmd(wt, proof), {
@@ -4218,6 +4238,7 @@ async function runActivationGate(item, wt) {
         reason: 'the merge-base control pass could not be established, so an absence-asserting proof cannot be trusted either way; re-run once the merge-base worktree can be materialized',
       });
     }
+    controlBase = ctl.base ?? null;
     log(`[${item.slug}] 3e.6 activation control PASS — the absence proof FAILS at merge base ${String(ctl.base ?? '').slice(0, 12)}, so it discriminates`);
   }
 
@@ -4244,6 +4265,18 @@ async function runActivationGate(item, wt) {
       reason: 'the class: A activation proof did not pass against the worker\'s worktree — the built thing is not reachable on the running path. Add the missing wiring; do NOT weaken the predicate.',
     });
   }
+  // temperloop#1431: the PASS is RECORDED, not merely logged. A log line cannot
+  // be checked after the run, so without this the claim "the gate ran" is
+  // unprovable from the item's own output (kernel § Mandatory-step birth rule).
+  // Set ONLY on a class-A pass — a non-class-A item returned at this function's
+  // first line and never reaches here, so its record is byte-identical.
+  sink.record = {
+    class: 'A',
+    proof,
+    absence_asserting: absence,
+    merge_base: controlBase,
+    exit_code: out.exitCode ?? 0,
+  };
   log(`[${item.slug}] 3e.6 activation gate PASS — class A${absence ? ' (absence-asserting, control-verified at merge base)' : ''}`);
   return null;
 }
@@ -6305,7 +6338,8 @@ async function driveItemBuildPhase(item, arm, box) {
   // whole gate lives in runActivationGate() above (with its rationale); this is
   // the ONE line the ordering contract is about. A non-class-A item returns null
   // from its first line: no agent spawn, no log, path unchanged.
-  const activationEscalation = await runActivationGate(item, wt);
+  const activationSink = {};
+  const activationEscalation = await runActivationGate(item, wt, activationSink);
   if (activationEscalation) return activationEscalation;
 
   // ===== END OF PHASE 1 (temperloop#2080) =============================== — see build-level.design-notes-5.md#end-of-phase-1-temperloop-2080
@@ -6319,6 +6353,9 @@ async function driveItemBuildPhase(item, arm, box) {
     reviewSummarySuffix,
     discGaps,
     mainCost,
+    // temperloop#1431 — the §3e.6 class-A PASS record, or null. Carried to
+    // phase 2 so park() can stamp it on the parked record.
+    activation: activationSink.record ?? null,
     // Read by the dual-build ledger row only; the PR phase ignores them.
     wtBase,
     wtGuard,
@@ -6335,6 +6372,7 @@ async function driveItemBuildPhase(item, arm, box) {
 async function driveItemPr(ctx) {
   const {
     item, wt, verdict, recovery, review, reviewSummarySuffix, discGaps, mainCost,
+    activation,
   } = ctx;
   const { repoRoot, planLink } = input;
   const ownerRepo = input.ownerRepo; // "owner/repo" — passed by the orchestrator
@@ -6669,7 +6707,7 @@ async function driveItemPr(ctx) {
     retry_count: ciResult.retryCount ?? 0,
     recovery: !!recovery,
   };
-  return park(item.slug, pr, ciResult.finalSha ?? pushedSha, verdict.acceptance_results, ciResult.noCi === true, recovery, discGaps, reviewSummary, cost);
+  return park(item.slug, pr, ciResult.finalSha ?? pushedSha, verdict.acceptance_results, ciResult.noCi === true, recovery, discGaps, reviewSummary, cost, activation);
 }
 
 // ciPollLoop — bounded short-slice CI poll (DESIGN NOTE 2). — see build-level.design-notes-6.md#cipollloop-bounded-short-slice-ci-poll-design-note-2
