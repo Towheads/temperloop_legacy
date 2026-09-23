@@ -383,11 +383,19 @@ fi
 # false failure (temperloop#1144). Scope the assertion to the kernel's own
 # checkout; every other check in this section is a genuinely shared invariant
 # and keeps running in a consumer.
+#
+# Since temperloop#2165 the workflow carries TWO jobs: `runner-preflight`, a
+# hosted routing helper that picks `checks`'s `runs-on`, and `checks` itself,
+# still on the single-entry matrix. A status context is named from the job name
+# plus its matrix values — never from `runs-on` — so the preflight job does not
+# move `checks (ubuntu-latest)`. The assertion therefore pins the exact job SET
+# and the matrix line, rather than counting jobs.
 if [ -f "$CI" ] && [ ! -f "$REPO_ROOT/.kernel-pin" ]; then
-  if grep -q 'os: \[ubuntu-latest\]' "$CI" && [ "$(grep -c '^  [a-z-]*:$' "$CI")" -le 2 ]; then
-    pass "CI still runs ONE job on a single-entry matrix (required context unchanged)"
+  ci_jobs="$(awk '/^jobs:/{f=1; next} f && /^  [a-z-]+:$/{sub(/^  /, ""); sub(/:$/, ""); print}' "$CI" | tr '\n' ' ')"
+  if grep -q 'os: \[ubuntu-latest\]' "$CI" && [ "$ci_jobs" = "runner-preflight checks " ]; then
+    pass "CI still runs the gate set as ONE matrix job, 'checks', behind the runner-preflight router (required context unchanged)"
   else
-    fail "CI's job/matrix shape changed — the required 'checks (ubuntu-latest)' context may have moved"
+    fail "CI's job/matrix shape changed (jobs: '${ci_jobs}') — the required 'checks (ubuntu-latest)' context may have moved"
   fi
 elif [ -f "$CI" ]; then
   skip "CI job/matrix shape — required-context shape is a per-repo contract (vendoring consumer, .kernel-pin present)"

@@ -29,7 +29,27 @@ name: CI
 # purpose: a matrix job's status context is `checks (ubuntu-latest)`,
 # which is the exact context name branch protection requires; deleting
 # the matrix would rename the context to plain `checks` and the required
-# check would then never report. Do not "simplify" it away.
+# check would then never report. Do not "simplify" it away. Since
+# temperloop#2165 the matrix value names the CONTEXT only — where the job
+# actually runs is decided by `runner-preflight` below (a status context
+# takes its name from the job name plus the matrix values, never from
+# `runs-on`, so the context is unchanged whichever machine picks it up).
+#
+# WHERE `checks` RUNS (temperloop#2165) — the mini's Linux CI VM when its
+# runner is online and idle, hosted `ubuntu-latest` otherwise. The
+# `runner-preflight` job (hosted, ~10 s) lists this repo's self-hosted
+# runners through the `RUNNER_PAT` secret (a fine-grained PAT with
+# Administration: Read on this repo only — the workflow's own GITHUB_TOKEN
+# cannot list runners) and emits the `runs-on` value `checks` consumes.
+# Without the secret, or with the VM stopped, wedged or already busy,
+# every run routes hosted and nothing else changes — the self-hosted path
+# is an accelerator, never a dependency. Measured on foundation's
+# identical arrangement: 250 gates in 324 s on the VM (4 workers) against
+# 1247 s hosted (2 workers). The VM itself is owned by foundation's
+# `infra/ci-runner/` (provisioning, autostart, uninstall); this workflow
+# owns only the routing. `checks` carries `timeout-minutes: 30` so a
+# wedged self-hosted job can never hold the merge queue for GitHub's
+# 6-hour default.
 #
 # WHICH GATES RUN, BY EVENT (temperloop#1024) — the workflow itself is
 # unchanged here; the split lives inside scripts/quality-gates.sh, so the
@@ -67,8 +87,45 @@ on:
     branches: [main]
 
 jobs:
+  runner-preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      runs_on: ${{ steps.pick.outputs.runs_on }}
+    steps:
+      - id: pick
+        env:
+          RUNNER_PAT: ${{ secrets.RUNNER_PAT }}
+        run: |
+          set -uo pipefail
+          HOSTED='"ubuntu-latest"'
+          SELF='["self-hosted","ci-mini"]'
+          if [ -z "${RUNNER_PAT:-}" ]; then
+            echo "No RUNNER_PAT secret — routing checks to hosted ubuntu-latest."
+            echo "runs_on=$HOSTED" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Count runners labelled `ci-mini` that are registered, online AND idle.
+          idle=$(curl -sf \
+            -H "Authorization: Bearer $RUNNER_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runners?per_page=100" \
+            | jq -r '[.runners[]? | select(.status=="online" and .busy==false)
+                       | select([.labels[].name] | index("ci-mini"))] | length') || idle=""
+          if [ "${idle:-0}" -ge 1 ] 2>/dev/null; then
+            echo "Self-hosted runner ci-mini is online and idle — routing checks to it."
+            echo "runs_on=$SELF" >> "$GITHUB_OUTPUT"
+          else
+            echo "No idle ci-mini runner (count='${idle:-}') — routing checks to hosted ubuntu-latest."
+            echo "runs_on=$HOSTED" >> "$GITHUB_OUTPUT"
+          fi
+
   checks:
-    runs-on: ${{ matrix.os }}
+    needs: [runner-preflight]
+    # Dynamic runner (temperloop#2165): the mini's Linux VM when online + idle,
+    # else hosted ubuntu-latest — resolved by runner-preflight above. The job
+    # body is identical on both targets; only the machine differs. The matrix
+    # below still names the required context — see the header.
+    runs-on: ${{ fromJSON(needs.runner-preflight.outputs.runs_on) }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
