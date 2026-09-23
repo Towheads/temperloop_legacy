@@ -108,8 +108,10 @@ jobs:
       #
       # No shellcheck install step, same as ci.yml: quality-gates.sh ->
       # `make shellcheck` provisions the PINNED shellcheck
-      # (scripts/ensure-shellcheck.sh, temperloop#567), bypassing brew, so
-      # this leg checks the identical version the merge gate does.
+      # (scripts/ensure-shellcheck.sh, temperloop#567) — brew's copy is used
+      # only if it reports exactly the pinned version (temperloop#2198), else
+      # the pinned release is downloaded — so this leg checks the identical
+      # version the merge gate does.
       #
       # QUALITY_GATES_STEP_SUMMARY=1 (temperloop#968): publish the full
       # per-gate wall-clock table to $GITHUB_STEP_SUMMARY, in addition to the

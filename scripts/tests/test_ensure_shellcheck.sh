@@ -68,6 +68,39 @@ else
   pass "helper fails loudly for an unresolvable pinned version (no silent host fallback)"
 fi
 
+# ---------------------------------------------------------------------------
+# T4 — a PATH shellcheck reporting EXACTLY the pinned version is used first, with
+# no download (temperloop#2198). Pinned to a version that has no release asset
+# and no cache, so the ONLY way the helper can succeed is the PATH binary —
+# network-independent, and it proves precedence over the download in one shot.
+# ---------------------------------------------------------------------------
+fake_dir="$(mktemp -d)"
+trap 'rm -rf "$fake_dir"' EXIT
+cat > "$fake_dir/shellcheck" <<'FAKE'
+#!/usr/bin/env bash
+[ "${1:-}" = "--version" ] && { printf 'ShellCheck - shell script analysis tool\nversion: 77.77.77\n'; exit 0; }
+exit 0
+FAKE
+chmod +x "$fake_dir/shellcheck"
+got="$(SHELLCHECK_VERSION="77.77.77" PATH="$fake_dir:$PATH" bash "$SCRIPT" 2>/dev/null)"
+if [ "$got" = "$fake_dir/shellcheck" ]; then
+  pass "a PATH shellcheck reporting exactly the pinned version is used first (no download)"
+else
+  fail "expected the PATH binary [$fake_dir/shellcheck], got [$got]"
+fi
+
+# ---------------------------------------------------------------------------
+# T5 — a PATH shellcheck of a DIFFERENT version is ignored: with the pin set to
+# an unresolvable version, the helper must still fail rather than use it. This
+# is T3's guarantee restated against an explicit, present, wrong-version host
+# binary — the case the PATH-first step must never regress.
+# ---------------------------------------------------------------------------
+if SHELLCHECK_VERSION="99.99.99" PATH="$fake_dir:$PATH" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "helper used a PATH shellcheck of the WRONG version (77.77.77 for pin 99.99.99)"
+else
+  pass "a PATH shellcheck of a different version is ignored, never a silent fallback"
+fi
+
 echo "  ---"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

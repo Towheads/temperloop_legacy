@@ -17,6 +17,16 @@
 # Self-contained: needs only curl (or wget), tar, and sha256sum (or shasum) — no
 # uv, no docker. The binary is cached under <repo>/.cache/shellcheck/<version>/
 # (gitignored) and verified against a known SHA-256 before it is trusted.
+#
+# Resolution order (temperloop#2198): a `shellcheck` already on PATH that
+# reports EXACTLY the pinned version wins first — no download, no cache. The
+# parity contract is the VERSION, not the download: an exact-version host
+# binary gives the same verdicts, and on Linux/aarch64 the official release
+# asset is ~5x slower than a natively built one (124 s vs 23 s over the same
+# 150 files in foundation's CI VM), so a host that provisioned a native build
+# must be allowed to use it. Any OTHER version on PATH is ignored, never used —
+# the #567 no-silent-host-fallback guarantee is untouched. Then the in-repo
+# cache, then the pinned download.
 set -euo pipefail
 
 # The single source of truth for the pin. Override via env for a deliberate bump.
@@ -27,6 +37,14 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd)"
 CACHE_DIR="${REPO_ROOT}/.cache/shellcheck/${SHELLCHECK_VERSION}"
 BIN="${CACHE_DIR}/shellcheck"
+
+# Fastest path: a PATH shellcheck reporting exactly the pinned version. The
+# `command -v` result may be a symlink — print it as found; callers only exec it.
+if sys_bin="$(command -v shellcheck 2>/dev/null)" && [ -n "$sys_bin" ] \
+   && "$sys_bin" --version 2>/dev/null | grep -xF "version: ${SHELLCHECK_VERSION}" >/dev/null; then
+  printf '%s\n' "$sys_bin"
+  exit 0
+fi
 
 # Fast path: a cached binary of the pinned version that reports that version.
 # No network. `--version` prints a `version: <v>` line we match exactly.
