@@ -43,7 +43,10 @@ name: CI
 # cannot list runners) and emits the `runs-on` value `checks` consumes.
 # Without the secret, or with the VM stopped, wedged or already busy,
 # every run routes hosted and nothing else changes — the self-hosted path
-# is an accelerator, never a dependency. Measured on foundation's
+# is an accelerator, never a dependency. That holds at the JOB-GRAPH level
+# too, since temperloop#2211: `checks` carries `if: ${{ !cancelled() }}` and
+# a hosted `runs-on` fallback, so a preflight that fails or skips outright
+# still leaves the required context published from hosted ubuntu-latest. Measured on foundation's
 # identical arrangement: 250 gates in 324 s on the VM (4 workers) against
 # 1247 s hosted (2 workers). The VM itself is owned by foundation's
 # `infra/ci-runner/` (provisioning, autostart, uninstall); this workflow
@@ -143,11 +146,34 @@ jobs:
 
   checks:
     needs: [runner-preflight]
+    # JOB-GRAPH GUARD (temperloop#2211). `needs:` alone makes the router a
+    # DEPENDENCY of the required context: a `needs` job that fails is not
+    # propagated as a failure, it SKIPS the dependent job — and a skipped job
+    # never publishes `checks (ubuntu-latest)`, the repo's only required
+    # context. The preflight's own script is fail-open on every path it
+    # controls, but the job can still die outside the script (runner
+    # allocation, an expression-evaluation error, an Actions incident), and
+    # the accelerator would then have become a dependency after all.
+    #
+    # `!cancelled()` rather than `always()`, deliberately: both restore the
+    # job past a failed/skipped `needs`, but `always()` ALSO overrides
+    # cancellation, so a cancelled workflow run would keep burning a runner
+    # (and, on the self-hosted VM, hold the single lane) until the gate set
+    # finished. `!cancelled()` is GitHub's own recommendation for exactly this
+    # case: run on success and on failure, stop on cancel.
+    if: ${{ !cancelled() }}
     # Dynamic runner (temperloop#2165): the mini's Linux VM when online + idle,
     # else hosted ubuntu-latest — resolved by runner-preflight above. The job
     # body is identical on both targets; only the machine differs. The matrix
     # below still names the required context — see the header.
-    runs-on: ${{ fromJSON(needs.runner-preflight.outputs.runs_on) }}
+    #
+    # The `||` fallback is the other half of the guard above: a preflight that
+    # failed or skipped wrote no output, so `needs.…outputs.runs_on` is the
+    # EMPTY STRING and a bare `fromJSON('')` errors the job out — turning the
+    # required check red on every PR instead of just skipping it. The default
+    # literal is therefore valid JSON *including its quotes*: single-quoted
+    # shell-level string CONTAINING the double quotes fromJSON needs.
+    runs-on: ${{ fromJSON(needs.runner-preflight.outputs.runs_on || '"ubuntu-latest"') }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
