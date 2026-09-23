@@ -14,13 +14,28 @@
 #     find . -name '*.sh' -not -path './.git/*' -not -path '*/tests/*' -print0 \
 #       | xargs -0 --no-run-if-empty "$bin" -e SC1091
 #
-# i.e. ONE single-threaded shellcheck process over ~223 files, and it is pinned
+# i.e. ONE single-threaded shellcheck process over ~224 files, and it is pinned
 # to the gate pool's serial lane (scripts/quality-gates.sh § SERIAL_LANE_PINS),
 # so its whole wall time lands on the critical path. Once temperloop#2162 split
 # the test-build / test-cli-subcommands umbrellas into ~73 per-script gates,
-# nothing else in the pool was long enough to hide behind — measured on the
-# item's host (2026-09-22, 10 cores, 223 files): 33s serial, the longest single
-# gate left in the set. This script is the same lint, fanned out.
+# nothing else in the pool was long enough to hide behind: it was the longest
+# single gate left in the set.
+#
+# THE ONE MEASUREMENT, stated here and referenced (never restated with a
+# different number) by docs/features/quality-gates.md, the feature manifest and
+# the changelog fragment. Item host, 2026-09-23, macOS on 10 cores, 224 files,
+# the pinned shellcheck 0.11.0, median of consecutive whole-tree runs:
+#
+#     old serial one-liner (no -x)  43s   (3 runs, 43.5-43.9s)
+#     this script, --jobs 1         42s   (7 runs, 35-44s)
+#     this script, --jobs 2         21s   (2 runs, 21.2-21.4s)
+#     this script, --jobs 4 (auto)  14s   (4 runs, 11.0-14.5s)
+#
+# Two things that table is load-bearing for. The serial figure is NOISY on this
+# host (a 9s spread run to run) while the parallel ones are not, so compare
+# medians, not single runs. And `-x` — the sharding enabler below — costs
+# nothing measurable: --jobs 1 WITH it is indistinguishable from the old
+# one-liner WITHOUT it. This script is the same lint, fanned out.
 #
 # ── The correctness trap this exists to avoid (read before editing) ──────
 # A shellcheck finding is NOT per-file — findings depend on WHICH OTHER FILES

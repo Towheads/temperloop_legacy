@@ -2,8 +2,8 @@
   single-threaded pass** (#2164). It was the longest gate left in
   `scripts/quality-gates.sh` once the `test-build` / `test-cli-subcommands`
   umbrellas were split into per-script gates (#2162), and it sits on the pool's
-  serial lane, so its whole wall time was on the critical path: 36s → 12s at
-  four workers on the reference host (19s at two), over the same file set with
+  serial lane, so its whole wall time was on the critical path: 43s → 14s at
+  four workers on the reference host (21s at two), over the same file set with
   a byte-identical report. `SHELLCHECK_JOBS` picks the worker count —
   `auto` (the default) resolves the host's cores through the same portable
   resolver the gate pool uses, and `SHELLCHECK_JOBS=1` restores the

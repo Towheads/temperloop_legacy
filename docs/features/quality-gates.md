@@ -210,11 +210,13 @@ independent. What the audit found:
   `workflows/scripts/model-comparison/replay.sh` in place and restore it —
   which is exactly why they are pinned to the serial lane below
   (temperloop#1379).
-- **Seven gates are pinned to a dedicated serial lane** (`SERIAL_LANE_PINS` in
-  `scripts/quality-gates.sh`). The lane makes them mutually exclusive *with each
-  other* while still overlapping the rest of the pool, so pinning costs
+- **Nine gates are pinned to a dedicated serial lane** (`SERIAL_LANE_PINS` in
+  `scripts/quality-gates.sh` — the array is the authority; the bullets below
+  account for every entry in it). The lane makes them mutually exclusive *with
+  each other* while still overlapping the rest of the pool, so pinning costs
   essentially no wall time:
-  - `make shellcheck`, `bash scripts/tests/test_ensure_shellcheck.sh` and
+  - `make shellcheck`, `bash scripts/tests/test_ensure_shellcheck.sh`,
+    `bash workflows/scripts/board-consumer-shellcheck.sh` and
     `bash scripts/tests/test_shellcheck_tree.sh` all
     resolve the pinned shellcheck through `scripts/ensure-shellcheck.sh`, which
     downloads and `mv`s the binary into one shared cache path. On a cold cache —
@@ -226,10 +228,11 @@ independent. What the audit found:
     racing a whole-tree walk is the classic transient "No such file or
     directory"; `docs` is the only tree-mutating gate in the set, so sharing a
     lane with the only whole-tree-walking gate closes it entirely.
-  - The three replay suites whose mutation proofs edit the LIVE
+  - The four replay suites whose mutation proofs edit the LIVE
     `workflows/scripts/model-comparison/replay.sh` in place
     (`test_replay_isolation.sh`, `test_replay_preflight.sh`,
-    `test_replay_preflight_two_arm.sh`) contend over that one shared file:
+    `test_replay_preflight_two_arm.sh`, `test_replay_preflight_cost_unit.sh`)
+    contend over that one shared file:
     concurrently, one suite executes a copy another has temporarily broken, or
     its `mutate_file` finds the anchor text already rewritten. Measured, not
     assumed — six concurrent runs of two of them produced four failures
@@ -517,16 +520,26 @@ that never sources that file.
 
 `make shellcheck` runs [`scripts/shellcheck-tree.sh`](../../scripts/shellcheck-tree.sh),
 not a single `xargs -0 shellcheck` pass (temperloop#2164). Before the split it
-was one single-threaded shellcheck process over ~223 files pinned to the serial
-lane above — 36s on the item's host, and once temperloop#2162 broke the
-`test-build` / `test-cli-subcommands` umbrellas into ~73 per-script gates, the
-longest gate left in the set. Measured on that host, same tree, same findings:
+was one single-threaded shellcheck process over ~224 files pinned to the serial
+lane above and, once temperloop#2162 broke the `test-build` /
+`test-cli-subcommands` umbrellas into ~73 per-script gates, the longest gate
+left in the set. Measured on the item's host (2026-09-23, macOS on 10 cores,
+224 files, the pinned shellcheck 0.11.0), same tree, same findings, as the
+**median of consecutive whole-tree runs** — `scripts/shellcheck-tree.sh`'s own
+header records this same run and nothing re-measures it independently:
 
-| worker count | wall |
-|---|---|
-| 1 (`--jobs 1`, the pre-parallel pass) | 37s |
-| 2 | 19s |
-| 4 (`auto` on this host, clamped by the pool's resolver) | 12s |
+| worker count | wall (median) | spread |
+|---|---|---|
+| the pre-parallel one-liner (no `-x`) | 43s | 3 runs, 43.5–43.9s |
+| 1 (`--jobs 1` — this script's serial mode) | 42s | 7 runs, 35–44s |
+| 2 | 21s | 2 runs, 21.2–21.4s |
+| 4 (`auto` on this host, clamped by the pool's resolver) | 14s | 4 runs, 11.0–14.5s |
+
+Read the medians, not any single run: the serial pass swings ~9s run to run on
+this host while the parallel ones hold inside a second. The first two rows are
+the reason `-x` (below) is free — the new serial mode *with* it is
+indistinguishable from the old one-liner *without* it, so the ~3x is fan-out,
+not a changed lint.
 
 Three properties it has to keep, and how:
 

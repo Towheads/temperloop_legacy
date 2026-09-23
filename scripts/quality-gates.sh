@@ -1966,11 +1966,12 @@ KERNEL_GATES=(
   "bash scripts/tests/test_ensure_shellcheck.sh"
   # Whole-tree shell lint. Since temperloop#2164 the target is a BOUNDED
   # FAN-OUT (scripts/shellcheck-tree.sh) rather than one serial shellcheck
-  # process: it was 36s on the item's host and, once #2162 split the
-  # test-build/test-cli-subcommands umbrellas into per-script gates, the
-  # longest gate left in the set — sitting on the serial lane's critical path.
-  # 36s -> 12s at four workers, with the report byte-identical to the serial
-  # pass. The suite beside it pins the three ways a fanned-out linter can go
+  # process: once #2162 split the test-build/test-cli-subcommands umbrellas
+  # into per-script gates it was the longest gate left in the set, sitting on
+  # the serial lane's critical path. 43s -> 14s at four workers, with the
+  # report byte-identical to the serial pass. (That pair is the ONE
+  # measurement, recorded with its method in scripts/shellcheck-tree.sh's
+  # header — never re-measured independently here.) The suite beside it pins the three ways a fanned-out linter can go
   # silently wrong (drifted findings, a lost verdict, a reordered report).
   "make shellcheck"
   "bash scripts/tests/test_shellcheck_tree.sh"
