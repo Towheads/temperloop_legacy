@@ -397,8 +397,38 @@ if [ -f "$CI" ] && [ ! -f "$REPO_ROOT/.kernel-pin" ]; then
   else
     fail "CI's job/matrix shape changed (jobs: '${ci_jobs}') — the required 'checks (ubuntu-latest)' context may have moved"
   fi
+
+  # SKIP-GUARD (temperloop#2211). `needs: [runner-preflight]` without a status
+  # guard makes the router a DEPENDENCY of the only required context: a `needs`
+  # job that fails or is skipped does not fail the dependent job, it SKIPS it,
+  # and a skipped job never publishes `checks (ubuntu-latest)`. Both halves of
+  # the guard are asserted here so deleting either one goes red:
+  #   a. an `if:` using a status-check function (`!cancelled()`, or `always()`),
+  #      without which a failed preflight silently un-gates the branch;
+  #   b. a `runs-on` fallback, without which the restored job immediately dies
+  #      on `fromJSON('')` — the preflight wrote no output — which is a red
+  #      required check on EVERY PR, strictly worse than the bug.
+  # Scoped to the `checks` job's own block: a guard on some other job is not
+  # this guard.
+  checks_block="$(awk '
+    /^  checks:$/ { inblock = 1; next }
+    inblock && /^  [a-z-]+:$/ { inblock = 0 }
+    inblock { print }
+  ' "$CI")"
+  if printf '%s\n' "$checks_block" \
+    | grep -E "^ *if: .*(!cancelled\(\)|always\(\))" >/dev/null; then
+    pass "the 'checks' job carries a status-function 'if:' guard — a failed/skipped runner-preflight cannot skip the required context"
+  else
+    fail "the 'checks' job has no status-function 'if:' guard — a failed or skipped runner-preflight would SKIP it, and a skipped job never publishes 'checks (ubuntu-latest)'"
+  fi
+  if printf '%s\n' "$checks_block" \
+    | grep -E "^ *runs-on: .*outputs\.runs_on *\|\| *'\"ubuntu-latest\"'" >/dev/null; then
+    pass "the 'checks' job's runs-on carries the hosted JSON fallback — a preflight that wrote no output routes to ubuntu-latest, not to fromJSON('')"
+  else
+    fail "the 'checks' job's runs-on has no \"ubuntu-latest\" fallback literal — when runner-preflight writes no output, fromJSON('') errors the required check red on every PR"
+  fi
 elif [ -f "$CI" ]; then
-  skip "CI job/matrix shape — required-context shape is a per-repo contract (vendoring consumer, .kernel-pin present)"
+  skip "CI job/matrix shape + the checks skip-guard — required-context shape is a per-repo contract (vendoring consumer, .kernel-pin present)"
 fi
 
 # ---------------------------------------------------------------------------
