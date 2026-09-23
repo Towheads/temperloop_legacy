@@ -210,11 +210,12 @@ independent. What the audit found:
   `workflows/scripts/model-comparison/replay.sh` in place and restore it —
   which is exactly why they are pinned to the serial lane below
   (temperloop#1379).
-- **Six gates are pinned to a dedicated serial lane** (`SERIAL_LANE_PINS` in
+- **Seven gates are pinned to a dedicated serial lane** (`SERIAL_LANE_PINS` in
   `scripts/quality-gates.sh`). The lane makes them mutually exclusive *with each
   other* while still overlapping the rest of the pool, so pinning costs
   essentially no wall time:
-  - `make shellcheck` and `bash scripts/tests/test_ensure_shellcheck.sh` both
+  - `make shellcheck`, `bash scripts/tests/test_ensure_shellcheck.sh` and
+    `bash scripts/tests/test_shellcheck_tree.sh` all
     resolve the pinned shellcheck through `scripts/ensure-shellcheck.sh`, which
     downloads and `mv`s the binary into one shared cache path. On a cold cache —
     which is every CI run, since nothing restores it — two concurrent resolvers
@@ -510,6 +511,56 @@ masked flake nor a saved retry is invisible. All three settings are declared
 with their defaults in `workflows/scripts/build/build.config.sh`; the script
 keeps byte-identical fallbacks so it still runs standalone in a consuming repo
 that never sources that file.
+
+
+### The whole-tree shell lint is itself a fan-out
+
+`make shellcheck` runs [`scripts/shellcheck-tree.sh`](../../scripts/shellcheck-tree.sh),
+not a single `xargs -0 shellcheck` pass (temperloop#2164). Before the split it
+was one single-threaded shellcheck process over ~223 files pinned to the serial
+lane above — 36s on the item's host, and once temperloop#2162 broke the
+`test-build` / `test-cli-subcommands` umbrellas into ~73 per-script gates, the
+longest gate left in the set. Measured on that host, same tree, same findings:
+
+| worker count | wall |
+|---|---|
+| 1 (`--jobs 1`, the pre-parallel pass) | 37s |
+| 2 | 19s |
+| 4 (`auto` on this host, clamped by the pool's resolver) | 12s |
+
+Three properties it has to keep, and how:
+
+- **The same findings as the serial pass.** This is not free. shellcheck
+  follows a `source`d file only when that file is *also named as an input on
+  the same command line* — which is exactly what an `SC1091` "was not specified
+  as input" means — so a naive shard silently changes the verdict: sharded,
+  `scripts/quality-gates.sh` is no longer linted beside
+  `workflows/scripts/lib/gate-selection.sh`, its `GATE_SELECTION_*`
+  assignments read as dead, and four SC2034/SC2329 findings appear that the
+  serial pass never emitted. The runner therefore passes `-x`
+  (`--external-sources`), which resolves each `source` from disk and makes
+  every finding invocation-independent. `-x` widens what is read for *context*,
+  never what is *linted* — the `*/tests/*` exclusion is untouched — and on the
+  tree at adoption time the whole-tree run was byte-identical with and without
+  it.
+- **A readable, stable report.** Chunks are contiguous slices of the file list
+  in `find` order; each chunk's output is captured to its own file and
+  concatenated back in chunk order. Two concurrent linters never write into one
+  stream, so the BSD-vs-GNU `xargs -P` interleaving difference cannot reach the
+  report, and the output is byte-identical to the pre-parallel command's.
+- **A fail-closed verdict.** Each chunk records its own status and always exits
+  0, so a lint finding never aborts the fan-out; the parent fails the run if any
+  chunk's status is non-zero, unparseable or *missing*. A chunk killed before it
+  could report is a lost verdict, never a pass.
+
+Worker count comes from `$SHELLCHECK_JOBS` (default `auto`), resolved through
+the same portable `gate_pool_resolve_jobs` the pool itself uses — so no
+`nproc`, which stock macOS does not ship. `SHELLCHECK_JOBS=1` restores the
+pre-parallel serial pass exactly, which is the bisect mode.
+[`scripts/tests/test_shellcheck_tree.sh`](../../scripts/tests/test_shellcheck_tree.sh)
+pins all three properties, and pins the `-x` invariant in *both* directions —
+that the naive shard really does drift, and that `-x` really does fix it — so
+the test cannot quietly stop discriminating.
 
 ## Integration
 

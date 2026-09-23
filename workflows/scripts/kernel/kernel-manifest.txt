@@ -96,6 +96,7 @@ kernel scripts/lint-argloop-shift2.sh
 kernel scripts/update-kernel.sh
 kernel scripts/assemble-changelog.sh
 kernel scripts/ensure-shellcheck.sh
+kernel scripts/shellcheck-tree.sh
 kernel scripts/tests/*
 overlay scripts/quality-gates.d/*
 

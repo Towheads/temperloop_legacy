@@ -1964,7 +1964,16 @@ KERNEL_GATES=(
   # runs the same shellcheck locally and in CI, closing the false-green skew that
   # let CI-ubuntu's 0.9.0 flag an SC2015 that local/brew 0.11.0 did not (#550).
   "bash scripts/tests/test_ensure_shellcheck.sh"
+  # Whole-tree shell lint. Since temperloop#2164 the target is a BOUNDED
+  # FAN-OUT (scripts/shellcheck-tree.sh) rather than one serial shellcheck
+  # process: it was 36s on the item's host and, once #2162 split the
+  # test-build/test-cli-subcommands umbrellas into per-script gates, the
+  # longest gate left in the set — sitting on the serial lane's critical path.
+  # 36s -> 12s at four workers, with the report byte-identical to the serial
+  # pass. The suite beside it pins the three ways a fanned-out linter can go
+  # silently wrong (drifted findings, a lost verdict, a reordered report).
   "make shellcheck"
+  "bash scripts/tests/test_shellcheck_tree.sh"
   # Consumer-parity shellcheck (temperloop#915, follow-up to the SYSTEMIC half
   # of temperloop#905, which fixed one file and left the class open): the
   # `make shellcheck` gate above EXCLUDES */tests/* and passes -e SC1091
@@ -2316,6 +2325,10 @@ SERIAL_LANE_PINS=(
   "make shellcheck"
   "bash scripts/tests/test_ensure_shellcheck.sh"
   "bash workflows/scripts/board-consumer-shellcheck.sh"
+  # Same lane for the same reason: T4 of this suite resolves the REAL pinned
+  # binary through ensure-shellcheck.sh to prove the -x invocation-independence
+  # invariant, so it contends over the same single shared cache path.
+  "bash scripts/tests/test_shellcheck_tree.sh"
   # The four replay suites that take their MUTATION PROOFS against the LIVE
   # workflows/scripts/model-comparison/replay.sh — each one edits that single
   # shared file in place (disabling the ceiling check, breaking $STATS_SH,

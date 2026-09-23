@@ -409,6 +409,7 @@ CHECK_PRODUCER_EGRESS_KERNEL_ROOT	$(cd "$SCRIPT_DIR/../../.." && pwd)	path	kerne
 CHECK_PRODUCER_EGRESS_OVERLAY_DIR		path	kernel	workflows/scripts/kernel/check-producer-egress.sh	Optional overlay-report dir cross-checked against the kernel root
 GITLEAKS_VERSION	8.30.1	string	kernel	workflows/scripts/kernel/install-gitleaks.sh	Pinned gitleaks release version to install/resolve
 SHELLCHECK_VERSION	0.11.0	string	kernel	scripts/ensure-shellcheck.sh	Pinned shellcheck release version make shellcheck resolves/downloads; keeps local == CI (temperloop#567)
+SHELLCHECK_JOBS	auto	string	kernel	scripts/shellcheck-tree.sh	How many shellcheck processes `make shellcheck` fans out over the tree (temperloop#2164); `auto` = detected cores clamped by gate-pool.sh's resolver, an integer overrides, 1 restores the pre-parallel serial pass
 KNOWLEDGE_SEARCH_BM_MCP_URL	http://127.0.0.1:8766/mcp	url	kernel	workflows/scripts/lib/knowledge_search_mcp.sh	basic-memory MCP daemon endpoint
 KNOWLEDGE_SEARCH_BM_MCP_PROTO	2025-03-26	string	kernel	workflows/scripts/lib/knowledge_search_mcp.sh	MCP protocol version sent in the handshake
 KNOWLEDGE_SEARCH_BM_MCP_CONNECT_TIMEOUT	2	seconds	kernel	workflows/scripts/lib/knowledge_search_mcp.sh	curl connect timeout to the MCP daemon
