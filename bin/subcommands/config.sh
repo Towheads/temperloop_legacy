@@ -183,27 +183,49 @@ _config_list_bulk_source() {
   )
 }
 
-# _config_list_lookup <map> <name> -> rc 0 if <name> appears in <map>
-# (name<TAB>value lines, one per line), setting global CFG_LOOKUP_VAL to its
-# value; rc 1 if absent. Portable line-scan (bash 3.2, no associative arrays).
-# Sets a global rather than printing so the per-row call sites below can invoke
-# it directly instead of via a `$(…)` command substitution — that subshell
-# fork, paid up to 3× per registry row across ~190 rows, was part of what made
-# `config list` slow (K305).
-_config_list_lookup() {
-  local map="$1" name="$2" lname lval
-  CFG_LOOKUP_VAL=""
-  [ -n "$map" ] || return 1
+# _config_list_index <prefix> <map> -> turn a name<TAB>value map into one
+# `<prefix><name>` shell variable per entry, so the per-row probes below are
+# O(1) hash lookups instead of a scan of the whole map.
+#
+# WHY AN INDEX AT ALL (temperloop#2163). The three maps are probed up to three
+# times per registry row, and at 434 rows every probe that MISSES used to walk
+# the entire map — first as a `read` line-loop, and no better as a `case`
+# substring match, which bash evaluates character-by-character against a
+# leading-`*` pattern. Either way it is O(rows x map-size) and measured at ~1s
+# of `config list`'s runtime, a cost `test_config.sh` pays ten times over and
+# `test_score_gate_env.sh` then pays twice more on top of that. Indexing once
+# turns the whole walk into ~434 assignments.
+#
+# A registry name is a legal shell identifier by construction — the validation
+# below is FATAL on a row whose name is not, precisely because the name-built
+# assignment here, the `${!key}` read in _config_list_lookup and the
+# bulk-source probe above all reject one. `printf -v` rather than `eval`: the
+# value is passed as an argument instead of re-parsed as shell. Same
+# `IFS=$'\t' read` split the map is written with. Bash-3.2-portable (printf -v
+# is bash 3.1+): an index of plain variables, never an associative array.
+_config_list_index() {
+  local prefix="$1" map="$2" lname lval
+  [ -n "$map" ] || return 0
   while IFS=$'\t' read -r lname lval; do
     [ -n "$lname" ] || continue
-    if [ "$lname" = "$name" ]; then
-      CFG_LOOKUP_VAL="$lval"
-      return 0
-    fi
+    printf -v "${prefix}${lname}" '%s' "$lval"
   done <<EOF
 $map
 EOF
-  return 1
+}
+
+# _config_list_lookup <prefix> <name> -> rc 0 if the <prefix>-indexed map holds
+# <name>, setting global CFG_LOOKUP_VAL to its value; rc 1 if absent. Sets a
+# global rather than printing so the per-row call sites below can invoke it
+# directly instead of via a `$(…)` command substitution — that subshell fork,
+# paid up to 3x per registry row, was part of what made `config list` slow
+# (K305).
+_config_list_lookup() {
+  local key="$1$2"
+  CFG_LOOKUP_VAL=""
+  [ -n "${!key+x}" ] || return 1
+  CFG_LOOKUP_VAL="${!key}"
+  return 0
 }
 
 # Validate the registry BEFORE the union walk, and print the validator's
@@ -232,10 +254,13 @@ all_names="$(printf '%s\n' "$rows" | awk -F'\t' 'NF>0{print $1}' | sort -u)"
 
 # shellcheck disable=SC2086  # intentional word-split: a space-separated name list
 machine_conf_map="$(_config_list_bulk_source "$machine_conf_file" $all_names)"
+_config_list_index CFG_MC_ "$machine_conf_map"
 # shellcheck disable=SC2086
 repo_local_map="$(_config_list_bulk_source "$repo_local_file" $all_names)"
+_config_list_index CFG_RL_ "$repo_local_map"
 # shellcheck disable=SC2086
 tracked_repo_map="$(_config_list_bulk_source "$TRACKED_REPO_FILE" $all_names)"
+_config_list_index CFG_TR_ "$tracked_repo_map"
 
 if [ "$format" = "tsv" ]; then
   printf 'name\tlayer\tvalue\towning-script\tdoc\n'
@@ -260,13 +285,13 @@ while IFS= read -r row; do
   if [ -n "${!name+x}" ]; then
     value="${!name}"
     layer="env"
-  elif _config_list_lookup "$machine_conf_map" "$name"; then
+  elif _config_list_lookup CFG_MC_ "$name"; then
     value="$CFG_LOOKUP_VAL"
     layer="machine-conf"
-  elif _config_list_lookup "$repo_local_map" "$name"; then
+  elif _config_list_lookup CFG_RL_ "$name"; then
     value="$CFG_LOOKUP_VAL"
     layer="repo-local"
-  elif _config_list_lookup "$tracked_repo_map" "$name"; then
+  elif _config_list_lookup CFG_TR_ "$name"; then
     value="$CFG_LOOKUP_VAL"
     layer="tracked-repo"
   else

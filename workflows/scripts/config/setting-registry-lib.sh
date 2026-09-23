@@ -100,7 +100,7 @@ _setting_registry_field_count() {
 # _setting_split_row <tab-row> -> sets globals KR_F1..KR_F7 to fields 1..7 (empty
 # for any field the row lacks) and KR_NF to the field count. Parameter
 # expansion ONLY — no `cut`/`awk` subshells. This is the hot path for
-# setting_registry_validate / _rows / _get, each of which walks all ~190 registry
+# setting_registry_validate / _rows / _get, each of which walks all ~430 registry
 # rows; the previous per-row `$(_setting_registry_field_count …)` + four/one
 # `$(cut …)` subshells were ~5 forks/row and dominated `config list`, the
 # `configure` wizard, and the equality lint's runtime (K305). Deliberately NOT
@@ -108,17 +108,36 @@ _setting_registry_field_count() {
 # tabs and mis-aligns rows with an empty field (field 2 `default` is
 # legitimately empty for many settings, e.g. EVAL_RUN). Parameter expansion
 # preserves empty fields, matching `cut -f` exactly. Bash-3.2-portable.
+#
+# THE FIELD COUNT IS ACCUMULATED, NEVER DERIVED FROM `${r//[!$'\t']/}`
+# (temperloop#2163). That global substitution walks the row CHARACTER BY
+# CHARACTER inside bash, and it measured at ~2ms per row — 0.87s of the 1.03s
+# `setting_registry_validate` spends, and the same again in `config list`'s own
+# row walk, for a count this function's field-splitting loop already produces
+# for free. Counting as we split is O(fields) instead of O(row length), keeps
+# KR_NF exact for a row with MORE than 7 fields (the overlay-table `fc != 7`
+# check depends on that), and preserves every empty field exactly as before.
 _setting_split_row() {
-  local r="$1" tabs="${1//[!$'\t']/}"
-  KR_NF=$(( ${#tabs} + 1 ))
+  local rest="$1" n=0 f
   KR_F1=''; KR_F2=''; KR_F3=''; KR_F4=''; KR_F5=''; KR_F6=''; KR_F7=''
-  KR_F1="${r%%$'\t'*}"; [ "$KR_NF" -ge 2 ] || return 0; r="${r#*$'\t'}"
-  KR_F2="${r%%$'\t'*}"; [ "$KR_NF" -ge 3 ] || return 0; r="${r#*$'\t'}"
-  KR_F3="${r%%$'\t'*}"; [ "$KR_NF" -ge 4 ] || return 0; r="${r#*$'\t'}"
-  KR_F4="${r%%$'\t'*}"; [ "$KR_NF" -ge 5 ] || return 0; r="${r#*$'\t'}"
-  KR_F5="${r%%$'\t'*}"; [ "$KR_NF" -ge 6 ] || return 0; r="${r#*$'\t'}"
-  KR_F6="${r%%$'\t'*}"; [ "$KR_NF" -ge 7 ] || return 0; r="${r#*$'\t'}"
-  KR_F7="${r%%$'\t'*}"
+  while :; do
+    n=$(( n + 1 ))
+    f="${rest%%$'\t'*}"
+    case "$n" in
+      1) KR_F1="$f" ;;
+      2) KR_F2="$f" ;;
+      3) KR_F3="$f" ;;
+      4) KR_F4="$f" ;;
+      5) KR_F5="$f" ;;
+      6) KR_F6="$f" ;;
+      7) KR_F7="$f" ;;
+    esac
+    case "$rest" in
+      *$'\t'*) rest="${rest#*$'\t'}" ;;
+      *) break ;;
+    esac
+  done
+  KR_NF="$n"
 }
 
 # _setting_registry_legal_name <name> -> rc 0 iff <name> is a legal shell
@@ -136,11 +155,28 @@ _setting_registry_legal_name() {
 }
 
 # _setting_registry_in_list <needle> <space-separated list> -> rc 0 if present.
+#
+# ONE quoted-substring `case` match, NOT a `for item in $list` walk (K2163).
+# setting_registry_validate calls this once per registry row against a list it
+# grows by one entry per row, so the walk was quadratic in the registry size:
+# at 434 rows that is ~94k loop iterations plus a re-word-split of an
+# ever-longer string, and it measured as 1.25s of `config list`'s 3.0s — which
+# `test_config.sh` pays ten times over and `test_score_gate_env.sh` then pays
+# twice more on top of that. The substring search is the same membership test
+# done in C.
+#
+# The needle is QUOTED INSIDE the pattern (`*" $needle "*`), so a `*` or `?` in
+# a row's owning-script field is matched literally instead of globbing — the
+# quoted portion of a `case` pattern is never a wildcard. An EMPTY needle
+# returns 1 up front: `$list` carries a leading space, so an unquoted empty
+# needle would match the resulting double space and silently turn a malformed
+# row's empty `type`/`layer` into a legal one. Bash-3.2-portable.
 _setting_registry_in_list() {
-  local needle="$1" list="$2" item
-  for item in $list; do
-    [ "$item" = "$needle" ] && return 0
-  done
+  local needle="$1" list="$2"
+  [ -n "$needle" ] || return 1
+  case " $list " in
+    *" $needle "*) return 0 ;;
+  esac
   return 1
 }
 
