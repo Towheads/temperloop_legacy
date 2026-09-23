@@ -1987,11 +1987,11 @@ cat >"$TO_STUB" <<STUBEOF
 #!/usr/bin/env bash
 set -u
 printf 'timeout-stub %s\n' "\$1" >>"$CAND_LOG"
-# EXEC, not a plain `sleep` (temperloop#2163): replay.sh bounds this runner
+# EXEC, not a plain \`sleep\` (temperloop#2163): replay.sh bounds this runner
 # with run_with_timeout, which kills the process it spawned — this bash. A
-# forked `sleep` would be that bash's CHILD, survive its parent, and outlive
+# forked \`sleep\` would be that bash's CHILD, survive its parent, and outlive
 # the whole suite as an orphan (CI reported them by name at job teardown).
-# `exec` makes the sleep BE the bounded process, so the timeout reaps it.
+# \`exec\` makes the sleep BE the bounded process, so the timeout reaps it.
 exec sleep 5
 STUBEOF
 chmod +x "$TO_STUB"
