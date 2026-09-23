@@ -926,8 +926,9 @@ echo "PASS: 23b an uncommitted (staged) rename lists both the source and the des
 # quality-gates.sh now glob-expands two test directories into one gate PER
 # SCRIPT. The map cannot carry a literal row per script without reinstating the
 # hand-enumeration trap the expansion exists to remove, so a row key may be a
-# PATTERN that globs a whole family of gates — with EXACT keys still winning,
-# so one script inside a family can keep its own pinpoint row.
+# PATTERN that globs a whole family of gates — and one script inside that
+# family may ALSO keep its own exact pinpoint row, whose triggers are UNIONED
+# with the family row's rather than ranked above them.
 #
 # ONE RULE, stated once: a gate runs when ANY row that names it was selected —
 # its own literal row, a pattern row that globs it, or both, UNIONED. The rows
