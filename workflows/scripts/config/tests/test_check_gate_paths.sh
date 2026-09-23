@@ -41,6 +41,12 @@
 #            (CHECK 5, temperloop#1650) — the shape build-level.mjs's
 #            ordinal->name filter silently drops, shifting every later ordinal.
 #            16b: the same list passes once the gate is respelled.
+#  18. A ROW-LESS map still REPORTS instead of aborting — `map has no usable
+#            rows` is recorded, not fatal, so the completeness walk runs on an
+#            empty KEY_BY_INDEX. Under bash 3.2 (macOS `/bin/bash`) that
+#            expansion is an unbound-variable abort unless it is guarded
+#            (temperloop#2194). 18a is the static anti-regression, 18b the
+#            runtime probe under the oldest bash on the host.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -402,5 +408,52 @@ fi
 case "$out" in *'stale row'*) : ;; *) fail "17b: the failure must name it a stale row, got: $out" ;; esac
 case "$out" in *'tests/test_*.sh'*) : ;; *) fail "17b: the failure must name the stale pattern key, got: $out" ;; esac
 echo "PASS: 17b a pattern row that globs no current gate still fails as stale"
+
+# --- 18. a ROW-LESS map reports, it does not abort (temperloop#2194) ---------
+# `_gp_issue "map has no usable rows"` RECORDS and continues — it is not a die
+# — so the completeness walk below it calls `_gp_gate_is_mapped` with
+# KEY_BY_INDEX still empty. bash 3.2 treats `"${arr[@]}"` on a zero-length
+# array as an unbound-variable error under `set -u`, so the unguarded form
+# aborted the check mid-run: the operator saw one finding and a bash error
+# instead of the 288 real ones. Both arms below, because neither alone holds:
+# 18a survives a host with no bash 3.2, and 18b catches a guard that is present
+# but spelled wrong.
+cat >"$TMP/rowless.tsv" <<'EOF'
+# every line a comment: a well-formed file with no usable rows at all
+EOF
+
+# 18a — static: the guarded-expansion idiom is still at the flagged site. A
+#       revert to the bare `"${KEY_BY_INDEX[@]}"` removes the `[@]+` prefix.
+if grep -q 'KEY_BY_INDEX\[@\]+"\${KEY_BY_INDEX\[@\]}"' "$SCRIPT"; then
+  echo "PASS: 18a _gp_gate_is_mapped keeps the bash-3.2 nounset guard \${KEY_BY_INDEX[@]+...}"
+else
+  fail "18a: _gp_gate_is_mapped expands KEY_BY_INDEX without the bash-3.2 nounset guard (\${KEY_BY_INDEX[@]+...})"
+fi
+
+# 18b — runtime: drive the row-less map under the OLDEST bash on this host
+#       (macOS `/bin/bash` is 3.2; elsewhere it is whatever `bash` resolves to,
+#       where the case is a no-op green rather than a false red).
+OLDBASH="bash"
+[ -x /bin/bash ] && OLDBASH=/bin/bash
+out18="$(env GATE_PATHS_FILE="$TMP/rowless.tsv" \
+             GATE_PATHS_GATE_LIST_FILE="$TMP/gates.txt" \
+             GATE_PATHS_TRACKED_FILE="$TMP/tracked.txt" \
+             GATE_PATHS_ROOT="$TMP" \
+             "$OLDBASH" "$SCRIPT" 2>&1)" && \
+  fail "18b: a row-less map must still FAIL the check, got a pass:
+$out18"
+case "$out18" in
+  *'unbound variable'*)
+    fail "18b: the check ABORTED on an empty KEY_BY_INDEX under $OLDBASH ($("$OLDBASH" -c 'echo $BASH_VERSION')) instead of reporting:
+$out18" ;;
+esac
+case "$out18" in *'map has no usable rows'*) : ;; *)
+  fail "18b: the row-less map must be named as such, got: $out18" ;; esac
+# The completeness walk must have RUN, not died before it — every kernel gate
+# in the fixture list is unmapped, so each has to be reported by name.
+case "$out18" in *'gate has no row in the map'*) : ;; *)
+  fail "18b: the completeness walk never ran — no per-gate finding was reported:
+$out18" ;; esac
+echo "PASS: 18b a row-less map reports every unmapped gate under $OLDBASH ($("$OLDBASH" -c 'echo $BASH_VERSION')) instead of aborting on an empty array"
 
 echo "OK — check-gate-paths.sh: all cases passed"

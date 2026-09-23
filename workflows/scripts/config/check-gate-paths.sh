@@ -220,7 +220,13 @@ fi
 _gp_gate_is_mapped() {
   local gate="$1" k
   grep -Fxq -- "$gate" <<<"$KEYS" && return 0
-  for k in "${KEY_BY_INDEX[@]}"; do
+  # `_gp_issue "map has no usable rows"` above RECORDS and continues (it is not
+  # a die), so a degenerate map reaches here with KEY_BY_INDEX empty — and bash
+  # 3.2 (macOS `/bin/bash`) treats "${arr[@]}" on a zero-length array as an
+  # unbound-variable error under `set -u`, aborting mid-check instead of
+  # reporting the finding it already recorded. Same guarded-expansion idiom the
+  # STRAY_PIDS sweep in test_bounded_suite.sh already uses (temperloop#2194).
+  for k in ${KEY_BY_INDEX[@]+"${KEY_BY_INDEX[@]}"}; do
     case "$k" in ALL|none) continue ;; esac
     _gs_key_is_pattern "$k" || continue
     _gs_key_matches_gate "$k" "$gate" && return 0
