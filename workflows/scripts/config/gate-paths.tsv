@@ -210,9 +210,11 @@ bash workflows/scripts/board-consumer-shellcheck.sh	workflows/scripts/board/** s
 # completeness check would go red on the PR that added it. The GLOBS are the
 # umbrella's own, verbatim, so the selected set is unchanged: any of these
 # paths still runs every build-tests script, exactly as `make test-build` did.
-# A single script needing narrower globs takes its own EXACT row instead (the
-# four state-graph rows below, and test_dual_build_preflight.sh's) — exact keys
-# beat this pattern in gate-selection.sh.
+# A single script needing EXTRA triggers takes its own exact row as well (the
+# four state-graph rows below, and test_dual_build_preflight.sh's). Those rows
+# ADD to this one; they do not replace it — gate-selection.sh UNIONS every row
+# that names a gate, so a script with its own row still runs whenever this
+# family row's globs match. A precedence there would narrow a scoped run.
 # test_workflow_path.sh (temperloop#2027) rides this glob, and it also asserts
 # on the three driver specs' workflowPath wiring and on the doctor.sh drift
 # detector it reuses — so those four paths select this gate too, or a spec

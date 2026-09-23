@@ -687,7 +687,11 @@ slow_elapsed="$(poll_elapsed "$TMPD/guard-flat-poll.sh")"
   || fail "12: discrimination FAILED — the flat-sleep-1 control took ${slow_elapsed}s vs the shipped guard's ${fast_elapsed}s over $POLL_RUNS runs, so the fast poll is not actually in effect (or the measurement cannot see it)"
 # A catastrophe ceiling only: far outside any plausible load, so it can never be
 # the flaky half. $POLL_RUNS × (0.4s fixture + a fast notice) is ~3s.
-[ "$fast_elapsed" -le 12 ] \
+# The companion bound is a CATASTROPHE bound, not a cadence assertion — the
+# delta above is what proves the cadence. Expected ~3-3.5s; 30s leaves ~10x
+# headroom so a loaded 24-way pool cannot turn this into a flaky red (a flaky
+# red is real signal to chase, so a test must not manufacture one).
+[ "$fast_elapsed" -le 30 ] \
   || fail "12: $POLL_RUNS short wrapped commands took ${fast_elapsed}s — the per-script gates pay this 73 times"
 pass "12 poll cadence: $POLL_RUNS short wrapped commands cost ${fast_elapsed}s under the shipped guard and ${slow_elapsed}s once the fast poll is spliced back out to a flat 'sleep 1' — the delta is produced by the cadence, measured back to back on this host"
 

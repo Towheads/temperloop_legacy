@@ -929,9 +929,12 @@ echo "PASS: 23b an uncommitted (staged) rename lists both the source and the des
 # PATTERN that globs a whole family of gates — with EXACT keys still winning,
 # so one script inside a family can keep its own pinpoint row.
 #
-# ONE RULE, stated once: a gate is governed by the first row that NAMES it,
-# every literal row considered before any pattern row. 24b and 24c are the
-# cases that make that rule load-bearing rather than decorative.
+# ONE RULE, stated once: a gate runs when ANY row that names it was selected —
+# its own literal row, a pattern row that globs it, or both, UNIONED. The rows
+# are never ranked. 24b, 24c and 24e are the cases that make that rule
+# load-bearing rather than decorative: 24c pins that a pinpoint row does not
+# drag its siblings in, and 24e pins that it does not EXCLUDE its own family
+# row either — the narrowing direction, which is the silent-green one.
 PMAP="$TMP/gate-paths-pattern.tsv"
 cat >"$PMAP" <<'EOF'
 # fixture map: one family row, plus a pinpoint row for one family member
@@ -957,22 +960,26 @@ reset_pattern_env() {
   QUALITY_GATES_SCOPE=diff
 }
 
-# 24a — one pattern row maps a whole family. A `src/**` change selects the two
-#       members the family row governs; test_special.sh is governed by its OWN
-#       row (exact wins) and that row does not claim src/**, so it stays out.
+# 24a — one pattern row maps a whole family. A `src/**` change selects EVERY
+#       member the family row globs — INCLUDING test_special.sh, which also
+#       carries its own pinpoint row. The pinpoint row ADDS a trigger
+#       (fixtures/special.json); it must never SUBTRACT the family row's.
+#       An exact-wins precedence here shipped in the first cut of #2162 and
+#       silently dropped five real suites from a scoped CI run.
 reset_pattern_env
 GATE_SELECTION_CHANGED='src/thing.sh'
 gate_selection_resolve
 [ "$GATE_SELECTION_MODE" = "diff" ] || fail "24a: expected a diff-scoped run (got $GATE_SELECTION_MODE / $GATE_SELECTION_REASON)"
 expected24a='make test-always
 bash suite.sh --run tests/test_alpha.sh
-bash suite.sh --run tests/test_beta.sh'
-[ "$GATE_SELECTION_SELECTED" = "$expected24a" ] || fail "24a: a pattern key must select the family it governs, and only that:
+bash suite.sh --run tests/test_beta.sh
+bash suite.sh --run tests/test_special.sh'
+[ "$GATE_SELECTION_SELECTED" = "$expected24a" ] || fail "24a: a pattern key must select EVERY family member it globs, a member's own pinpoint row notwithstanding:
 got:
 $GATE_SELECTION_SELECTED
 want:
 $expected24a"
-echo "PASS: 24a a pattern row maps the whole family it governs"
+echo "PASS: 24a a pattern row maps the whole family it globs, including a member that has its own row"
 
 # 24b — the family is genuinely SCOPED, not merely unmapped. Without pattern
 #       matching every member would have no row at all and defense 4 would keep
@@ -993,21 +1000,22 @@ $GATE_SELECTION_SKIPPED" ;;
 esac
 echo "PASS: 24b a pattern-mapped gate is genuinely scoped (skipped, and named, on an unrelated change)"
 
-# 24c — EXACT KEYS WIN. `fixtures/special.json` is claimed by the pinpoint row
-#       alone. If the family row were allowed to answer for a gate that has its
-#       own row, this would drag alpha and beta in as well and the pinpoint row
-#       would be decorative.
+# 24c — THE UNION ONLY WIDENS THE GATE THAT IS NAMED. `fixtures/special.json`
+#       is claimed by the pinpoint row alone, so only test_special runs: the
+#       union is over the rows that name ONE gate, never a transitive closure
+#       that would drag alpha and beta in through their shared family row and
+#       make the pinpoint row decorative.
 reset_pattern_env
 GATE_SELECTION_CHANGED='fixtures/special.json'
 gate_selection_resolve
 expected24c='make test-always
 bash suite.sh --run tests/test_special.sh'
-[ "$GATE_SELECTION_SELECTED" = "$expected24c" ] || fail "24c: an exact row must beat the family pattern:
+[ "$GATE_SELECTION_SELECTED" = "$expected24c" ] || fail "24c: a pinpoint row must select its own gate and no sibling:
 got:
 $GATE_SELECTION_SELECTED
 want:
 $expected24c"
-echo "PASS: 24c an exact key beats a pattern key that also matches the gate"
+echo "PASS: 24c a pinpoint row's own path selects that gate alone, not its whole family"
 
 # 24d — pattern keys leave the reserved rows alone: a `none` path still selects
 #       the ALWAYS floor and nothing else, rather than escalating.
@@ -1018,5 +1026,57 @@ gate_selection_resolve
 [ "$GATE_SELECTION_SELECTED" = "make test-always" ] || fail "24d: a recognised no-gate path must select the ALWAYS floor alone:
 $GATE_SELECTION_SELECTED"
 echo "PASS: 24d pattern keys leave the none/ALWAYS rows untouched"
+
+# 24e — THE UNION PROPERTY, STATED DIRECTLY. For a gate named by BOTH a
+#       pinpoint row and a family pattern row, either row selecting is enough.
+#       This is the invariant 24a and 24c each pin one half of; asserting it
+#       on its own makes a future re-ranking of the two rows fail HERE, with
+#       the property named, rather than as a surprising diff in 24a's list.
+for _u in src/thing.sh fixtures/special.json; do
+  reset_pattern_env
+  GATE_SELECTION_CHANGED="$_u"
+  gate_selection_resolve
+  case "$GATE_SELECTION_SELECTED" in
+    *"tests/test_special.sh"*) : ;;
+    *) fail "24e: '$_u' selects a row that names test_special.sh, so test_special.sh must run (union, not precedence):
+$GATE_SELECTION_SELECTED" ;;
+  esac
+done
+echo "PASS: 24e a gate named by both a pinpoint row and a family row runs when EITHER is selected"
+
+# 24f — THE LIVE REGRESSION (temperloop#2162 round 2). Not a fixture: the real
+#       gate-paths.tsv and the real gate list, driven by the one-file diff that
+#       exposed the narrowing. Under exact-wins, `workflows/scripts/build/pr.sh`
+#       stopped selecting the four state-graph suites and
+#       test_dual_build_preflight.sh — five suites the `make test-build`
+#       umbrella had always run, skipped on CI too, since `checks` is itself
+#       diff-scoped. A green run that tested less is the exact silent-green
+#       shape this selector's defenses exist to prevent, so it is pinned with
+#       the production map rather than a model of it.
+QG24F="$REPO_ROOT/scripts/quality-gates.sh"
+if [ ! -x "$QG24F" ]; then
+  echo "SKIP: 24f — no executable $QG24F to drive the live map against"
+else
+  # No subshell: fail() exits, and an exit inside `( )` would leave the suite
+  # printing OK on a red case.
+  out24f="$(GATE_SELECTION_CHANGED=workflows/scripts/build/pr.sh \
+    QUALITY_GATES_SCOPE=diff "$QG24F" --list-selected 2>&1)" \
+    || fail "24f: quality-gates.sh --list-selected failed:
+$out24f"
+  for want24f in test_state_graph.sh test_state_graph_local.sh \
+                 test_state_graph_queries.sh test_state_graph_soak.sh \
+                 test_dual_build_preflight.sh; do
+    case "$out24f" in
+      *"not run (out of scope): bash workflows/scripts/build/bounded-suite.sh --label $want24f "*)
+        fail "24f: a workflows/scripts/build/pr.sh diff must still select $want24f — its own pinpoint row must not cancel the family row that globs it (the round-1 narrowing)" ;;
+    esac
+    case "$out24f" in
+      *"--label $want24f "*) : ;;
+      *) fail "24f: $want24f is absent from --list-selected output entirely — the gate list or its label changed:
+$out24f" ;;
+    esac
+  done
+  echo "PASS: 24f the live map still selects all five pinpoint-rowed suites on a build/pr.sh diff"
+fi
 
 echo "OK — gate-selection.sh: all cases passed"

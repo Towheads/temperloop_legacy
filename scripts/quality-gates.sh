@@ -2209,11 +2209,23 @@ KERNEL_GATES+=("bash scripts/tests/test_quality_gates_parallel.sh")
 # ~1.0s to ~0.25s in the same change (its poll cadence) so that paying it 73
 # times does not show up as a serial-time regression.
 #
-# DEDUPED AGAINST THE LIST ABOVE. Five of these scripts used to ALSO carry a
-# hand-typed literal entry (the four state-graph suites and
-# test_dual_build_preflight.sh). Those literals are removed above; the guard
-# below is the belt that keeps a future re-added literal from silently running
-# its suite twice.
+# DEDUPED AGAINST THE WHOLE LIST, KERNEL AND OVERLAY. Five of these scripts
+# used to ALSO carry a hand-typed literal entry (the four state-graph suites
+# and test_dual_build_preflight.sh). Those literals are removed above; the
+# guard below is the belt that keeps a future re-added literal from silently
+# running its suite twice. The expansion therefore runs AFTER the drop-in
+# sourcing below and scans BOTH arrays: a `scripts/quality-gates.d/*.sh`
+# drop-in that appends a literal for one of these scripts would otherwise slip
+# past a kernel-list-only, expand-first guard entirely.
+#
+# A FILENAME THAT CANNOT SURVIVE THE ROUND TRIP IS REJECTED LOUDLY. Each gate
+# is composed as ONE string that the runner later splits back into argv with
+# `read -ra` (workflows/scripts/lib/gate-retry.sh), so whitespace or a glob
+# metacharacter in a test filename would either mis-execute or, worse, match
+# the wrong dedupe branch and drop the gate from the set — the same
+# silent-green class the selector's own defenses exist to prevent. Name a test
+# script with such a character and this aborts with the filename, rather than
+# quietly running one fewer suite.
 #
 # INDEPENDENCE IS AUDITED, NOT ASSUMED. Pooling only became safe once the 73
 # scripts were checked for shared mutable state — see
@@ -2222,23 +2234,38 @@ KERNEL_GATES+=("bash scripts/tests/test_quality_gates_parallel.sh")
 # repo file in place, binds a fixed port, or writes a fixed shared path) and
 # the repeated concurrent runs that measured it.
 _qg_expand_case_gates() {
-  local dir="$1" f rel gate existing dup
+  local dir="$1" f base rel gate existing dup
   for f in "$REPO_ROOT/$dir"/test_*.sh; do
     [[ -e "$f" ]] || continue
-    rel="$dir/$(basename "$f")"
-    gate="bash workflows/scripts/build/bounded-suite.sh --label $(basename "$f") -- bash $rel"
+    base="$(basename "$f")"
+    # Loud, not silent: a name carrying whitespace or a glob metacharacter
+    # cannot survive the string→argv round trip, and a silently dropped gate
+    # is a green run that tested less.
+    case "$base" in
+      *[[:space:]]*|*'*'*|*'?'*|*'['*|*']'*)
+        echo "quality-gates.sh: refusing to register '$dir/$base' — a test filename may not contain whitespace or a glob metacharacter (it is word-split back into argv by gate-retry.sh)" >&2
+        exit 2
+        ;;
+    esac
+    rel="$dir/$base"
+    gate="bash workflows/scripts/build/bounded-suite.sh --label $base -- bash $rel"
     dup=0
     for existing in "${KERNEL_GATES[@]}"; do
       case "$existing" in
         *" $rel"|*" $rel "*) dup=1; break ;;
       esac
     done
+    if [[ $dup -eq 0 && ${#OVERLAY_GATES[@]} -gt 0 ]]; then
+      for existing in "${OVERLAY_GATES[@]}"; do
+        case "$existing" in
+          *" $rel"|*" $rel "*) dup=1; break ;;
+        esac
+      done
+    fi
     [[ $dup -eq 1 ]] && continue
     KERNEL_GATES+=("$gate")
   done
 }
-_qg_expand_case_gates "workflows/scripts/build/tests"
-_qg_expand_case_gates "bin/subcommands/tests"
 
 # The overlay gate set — empty by default; populated only by drop-ins.
 OVERLAY_GATES=()
@@ -2249,6 +2276,10 @@ if [[ -d "$REPO_ROOT/scripts/quality-gates.d" ]]; then
     source "$dropin"
   done
 fi
+
+# Expand AFTER the drop-ins, so the dedupe above sees whatever they added.
+_qg_expand_case_gates "workflows/scripts/build/tests"
+_qg_expand_case_gates "bin/subcommands/tests"
 
 GATES=("${KERNEL_GATES[@]}")
 # Bash 3.2 (macOS default) treats "${arr[@]}" on a zero-length array as an

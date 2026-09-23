@@ -40,6 +40,10 @@ WAIT_SH="$REPO_ROOT/workflows/scripts/build/review-wait.sh"
 # reproduced at 32-way concurrency. A `mktemp -d` has no such reach, and the
 # assertions below are indifferent to where the file lives.
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/test-review-wait-XXXXXX")"
+# `set -u` does NOT catch a failed mktemp here — the variable IS set, just
+# empty — and this script has no `set -e`, so execution would run on with
+# every redirect below landing at `/` and the trap running `rm -rf ""`.
+[ -n "$SCRATCH" ] && [ -d "$SCRATCH" ] || { echo "mktemp failed" >&2; exit 1; }
 trap 'rm -rf "$SCRATCH"' EXIT
 
 FAILED=0

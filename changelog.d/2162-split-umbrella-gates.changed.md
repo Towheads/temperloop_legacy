@@ -18,7 +18,10 @@
 - **`workflows/scripts/config/gate-paths.tsv` now accepts a wildcard row
   key.** (#2162) A key carrying `*`, `?` or `[` maps a whole family of gates,
   which is what lets the expanded families stay path-scoped without a
-  hand-typed row per script. An exact key still wins over a wildcard one, so a
-  single script can keep its own narrower row, and
+  hand-typed row per script. Every row that names a gate is UNIONED, never
+  ranked: a single script can keep its own row for EXTRA triggers without that
+  row cancelling the family row's — a precedence between the two could only
+  resolve toward less coverage, which is the silent-green direction this
+  selector's degradations are all designed to avoid.
   `workflows/scripts/config/check-gate-paths.sh` still fails a wildcard row
   that matches no current gate.
