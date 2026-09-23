@@ -37,7 +37,7 @@
 #         network) — a throwaway repo with a known user.email and origin
 #         proves both fields
 #   22    stdin items-file (`--items-file -`)
-#   23-26 --judge-model (temperloop#2203): given -> rides .judge_model,
+#   23-28 --judge-model (temperloop#2203): given -> rides .judge_model,
 #         .dualBuild.judgeModel and the consent line; absent -> null field,
 #         NO judgeModel key, byte-identical consent line; empty -> refused
 #
@@ -310,13 +310,17 @@ count
 v="$(printf '%s' "$ITEMS_MIXED" | env DUAL_BUILD_MIN_INSCOPE_ITEMS=2 bash "$DBP" --tier sonnet --items-file - --baseline x --candidate y --execution recorded)"
 [ "$(field "$v" .in_scope_n)" = "3" ] && ok "--items-file - reads the level's items from stdin" || fail "stdin: $(field "$v" .in_scope_n)"
 
-# ── 23-26: --judge-model (temperloop#2203) ───────────────────────────────────
-# The per-run pairwise-judge seam. Three states, all asserted: GIVEN (the id
+# ── 23-28: --judge-model (temperloop#2203) ───────────────────────────────────
+# The per-run pairwise-judge seam. Every input state is asserted: GIVEN (the id
 # rides `dualBuild.judgeModel`, the top-level `judge_model` field and the
 # consent line), ABSENT (no key at all — the object is byte-identical to the
 # pre-#2203 one, which is what keeps a caller that never passes the flag from
-# regressing), and EMPTY (refused loudly, never read as absent).
-echo "--- 23-26: --judge-model per-run pairwise judge ---"
+# regressing), EMPTY and WHITESPACE-ONLY (both refused loudly, never read as
+# absent — the two must agree, because build-level.mjs's own `str()` trims and
+# a gate that did not would refuse them in different places), and PADDED-BUT-
+# REAL (accepted — the control that keeps the two refusals from being satisfied
+# by a gate that simply refuses every value it is given).
+echo "--- 23-28: --judge-model per-run pairwise judge ---"
 
 # run_judge <items-json> <judge-model-args…> — run() plus arbitrary extra SUT
 # flags (run() itself takes only env assignments).
@@ -361,6 +365,29 @@ count; rc=0; v="$(run_judge "$ITEMS_MIXED" --judge-model "")" || rc=$?
   && printf '%s' "$v" | jq -e '.error | test("--judge-model")' >/dev/null \
   && ok "an EMPTY --judge-model is refused (CANNOT_EVALUATE, non-zero), not read as absent" \
   || fail "empty judge-model: outcome=$(field "$v" .outcome) rc=$rc"
+
+# 27: WHITESPACE-ONLY — refused on exactly the same terms as case 26, because
+# the consumer refuses it too. build-level.mjs's `str()` TRIMS before testing,
+# so an untrimmed test here would let '   ' clear this pre-flight and the
+# ask-now consent gate — with the judge's name rendering as blank space on the
+# spend line the operator consents to — and only then be refused at drive time
+# with dual-build-input-invalid. That late refusal is precisely what moving the
+# check forward to the pre-flight exists to prevent, so the two validators must
+# agree on all three input states, not two of them.
+count; rc=0; v="$(run_judge "$ITEMS_MIXED" --judge-model "   ")" || rc=$?
+[ "$(field "$v" .outcome)" = "CANNOT_EVALUATE" ] && [ "$rc" -ne 0 ] \
+  && printf '%s' "$v" | jq -e '.error | test("--judge-model")' >/dev/null \
+  && ok "a WHITESPACE-ONLY --judge-model is refused too — the shell gate trims, matching build-level.mjs's str()" \
+  || fail "whitespace judge-model: outcome=$(field "$v" .outcome) rc=$rc"
+
+# 28: the CONTROL for 26-27 — a judge model that is merely SURROUNDED by
+# whitespace is a real value, not an empty one, and must still be ACCEPTED.
+# Without this, cases 26-27 are equally satisfied by a gate that refuses every
+# --judge-model it is given (temperloop#1706: an assertion that cannot fail).
+count; v="$(run_judge "$ITEMS_MIXED" --judge-model " claude-haiku-9 ")"
+[ "$(field "$v" .outcome)" = "PREFLIGHT" ] \
+  && ok "a padded but non-empty --judge-model is ACCEPTED (the control: the gate does not refuse everything)" \
+  || fail "padded judge-model should be accepted: outcome=$(field "$v" .outcome) judge_model=$(field "$v" .judge_model)"
 
 echo
 echo "test_dual_build_preflight: pass=$pass/$total"

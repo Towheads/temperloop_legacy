@@ -218,8 +218,18 @@ done
 # temperloop#2203 — an EMPTY --judge-model is refused rather than read as
 # absent: a run that named a judge and silently got the host default is
 # indistinguishable, afterwards, from one that never named one.
+#
+# The emptiness test is TRIMMED, and that is the whole point of the `tr`:
+# build-level.mjs's own `str()` trims before testing, so an UNtrimmed test
+# here would disagree with its consumer on exactly one input class — a
+# whitespace-only value. That value would clear this pre-flight, clear the
+# ask-now consent gate with the judge's name rendered as blank space, and
+# only then be refused at drive time with dual-build-input-invalid: the
+# late refusal this early one exists to prevent. `tr -d '[:space:]'` is
+# POSIX and carries no BSD-vs-GNU divergence.
 if [ "$judge_model_given" = "true" ]; then
-  [ -n "$judge_model" ] || _dbp_ce "--judge-model was given an empty value; omit the flag to judge under judge.sh's own default"
+  [ -n "$(printf '%s' "$judge_model" | tr -d '[:space:]')" ] \
+    || _dbp_ce "--judge-model was given an empty or whitespace-only value; omit the flag to judge under judge.sh's own default"
 fi
 
 # ── read + validate the level's items ────────────────────────────────────────
