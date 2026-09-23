@@ -33,9 +33,13 @@
 #
 # Two things that table is load-bearing for. The serial figure is NOISY on this
 # host (a 9s spread run to run) while the parallel ones are not, so compare
-# medians, not single runs. And `-x` — the sharding enabler below — costs
-# nothing measurable: --jobs 1 WITH it is indistinguishable from the old
-# one-liner WITHOUT it. This script is the same lint, fanned out.
+# medians, not single runs. And `-x` — the sharding enabler below — has no
+# overhead detectable HERE: --jobs 1 with it medians 1s under the old one-liner
+# without it, which is far inside that 9s noise band, so what this measurement
+# establishes is "no difference this host can resolve", NOT "zero cost". Read
+# it as a bound on the concern, not a proof it is absent; a quieter host and a
+# larger sample could still find a real number. This script is the same lint,
+# fanned out.
 #
 # ── The correctness trap this exists to avoid (read before editing) ──────
 # A shellcheck finding is NOT per-file — findings depend on WHICH OTHER FILES

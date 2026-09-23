@@ -536,10 +536,12 @@ header records this same run and nothing re-measures it independently:
 | 4 (`auto` on this host, clamped by the pool's resolver) | 14s | 4 runs, 11.0–14.5s |
 
 Read the medians, not any single run: the serial pass swings ~9s run to run on
-this host while the parallel ones hold inside a second. The first two rows are
-the reason `-x` (below) is free — the new serial mode *with* it is
-indistinguishable from the old one-liner *without* it, so the ~3x is fan-out,
-not a changed lint.
+this host while the parallel ones hold inside a second. That noise band is also
+the limit of what the first two rows can say about `-x` (below). The new serial
+mode *with* it medians 1s under the old one-liner *without* it — well inside the
+band — so the honest reading is **no overhead this host can resolve**, not zero
+overhead. It is enough to place `-x` outside the ~3x, which is fan-out and not a
+changed lint; it is not a measurement of `-x` itself.
 
 Three properties it has to keep, and how:
 
