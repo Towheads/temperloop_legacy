@@ -604,6 +604,22 @@ const SPINE_OUTCOME_SCHEMA = {
     slowSecs: { type: ['number', 'string'] },
     // temperloop#865 — the WORKER's own scoped-gate sentinel, classified by  — see build-level.design-notes.md#temperloop-865-the-worker-s-own-scoped-gate-sentinel-cl
     workerGate: { type: 'string' },
+    // temperloop#2208 — the NESTED-OBJECT payloads, and this schema's only
+    // object-typed properties. The sibling of #2205 one level down: that one
+    // fixed the `outcome` ENUM, this one fixes the PAYLOAD SHAPE. An
+    // undeclared property is admitted by `additionalProperties: true` but has
+    // no declared type, so a constrained decode is free to hand it back
+    // JSON-STRINGIFIED — and did. The second live dual-build run returned a
+    // complete pairwise verdict and a real calibration status; both arrived as
+    // strings, and both consumers' `typeof … !== 'object'` reads discarded
+    // them into `judge-unavailable` / `calibration-unreachable`. Declaring the
+    // type IS the contract that makes the decode return an object.
+    // Lockstep-guarded from three sides (the K2208 axis in
+    // workflows/scripts/build/tests/test_workflow.sh): every key the generated
+    // shell interpolates raw as `"<key>":%s` AND reads back through
+    // nestedPayloadShape() must be declared object-typed here, and vice versa.
+    judge: { type: 'object' },
+    calibration: { type: 'object' },
   },
 };
 
@@ -4557,6 +4573,34 @@ function dualBuildCost(armResult) {
   };
 }
 
+// -----------------------------------------------------------------------------
+// nestedPayloadShape / payloadTypeName — the nested-object payload contract
+// (temperloop#2208).
+// -----------------------------------------------------------------------------
+// THREE states, and they must stay distinguishable. `absent` is the producer
+// genuinely having nothing; `object` is the payload arriving as
+// SPINE_OUTCOME_SCHEMA declares it; `mismatch` is the producer having returned
+// a real payload that the structured decode handed back as some OTHER type — a
+// JSON string, most concretely, which is exactly what an undeclared property
+// yields. Collapsing `mismatch` into `absent` IS the #2208 defect: a discarded
+// verdict then reports as an unavailability that never happened, and the
+// diagnostic blames the producer that was working perfectly. Every consumer of
+// an object-typed payload branches through this one predicate, and the K2208
+// lockstep guard reads the call sites to derive which keys the schema must
+// declare object-typed.
+//
+// An ARRAY is a mismatch, not an object: JS `typeof [] === 'object'`, so a bare
+// typeof check would admit one silently.
+function nestedPayloadShape(v) {
+  if (v === undefined || v === null) return 'absent';
+  if (typeof v === 'object' && !Array.isArray(v)) return 'object';
+  return 'mismatch';
+}
+// What the payload ACTUALLY arrived as, for the mismatch diagnostic.
+function payloadTypeName(v) {
+  return Array.isArray(v) ? 'array' : typeof v;
+}
+
 // judgeArms — the pairwise judge call, run AT the barrier (temperloop#20 — see build-level.design-notes-4.md#judgearms-the-pairwise-judge-call-run-at-the-barrier-temperl
 async function judgeArms(item, dual, arms) {
   const a = arms.find((x) => x.arm === 'baseline');
@@ -4625,7 +4669,25 @@ async function judgeArms(item, dual, arms) {
     slug: item.slug,
     phase: enterStage(STAGE_GATE),
   });
-  if (machineryDenied(out) || out.outcome !== 'JUDGED' || !out.judge || typeof out.judge !== 'object') {
+  // temperloop#2208 — the LOUD discard, checked BEFORE the unavailable
+  // fall-through so the two can never be confused. `outcome` is JUDGED, so
+  // judge.sh ran and returned; only the payload's TYPE is wrong. Reporting
+  // that as `judge-unavailable` is what cost real investigation time pointed
+  // at a judge.sh that was working: the old diagnostic said "produced no
+  // verdict", which was false.
+  const judgeShape = nestedPayloadShape(out && out.judge);
+  if (!machineryDenied(out) && out && out.outcome === 'JUDGED' && judgeShape === 'mismatch') {
+    return {
+      judged: false,
+      reason: 'judge-payload-shape-mismatch',
+      detail: `judge.sh pairwise RETURNED a verdict for ${item.slug}, but its \`judge\` payload arrived as a ${payloadTypeName(out.judge)}, not an object — the verdict was DISCARDED at the structured-decode boundary, not missing. SPINE_OUTCOME_SCHEMA must declare \`judge\` object-typed (temperloop#2208).`,
+      judge: null,
+    };
+  }
+  // …and the genuine absence: no payload at all, a denied executor, or some
+  // other outcome. This branch keeps its original name and wording, which are
+  // now TRUE of every case that reaches it.
+  if (machineryDenied(out) || out.outcome !== 'JUDGED' || judgeShape !== 'object') {
     return {
       judged: false,
       reason: (out && out.reason) || 'judge-unavailable',
@@ -5003,11 +5065,30 @@ async function readCalibrationStatus() {
   // `<kind>:<slug>`, and a label with no slug at all is the one shape the
   // transcript (and the offline harness's own label→queue routing) cannot place.
   const out = await runMachinery(cmd, { label: 'level-pick-calibration:_level', phase: enterStage(STAGE_GATE) });
-  if (machineryDenied(out) || out.outcome !== 'CALIBRATION' || !out.calibration || typeof out.calibration !== 'object') {
+  // temperloop#2208 — the LOUD discard, the exact peer of judgeArms'. The
+  // status WAS read and parsed (`outcome` is CALIBRATION); only the payload's
+  // type is wrong. Still fails CLOSED — available:false, status UNKNOWN, the
+  // modal confirm stands — but under its OWN name, so a shape bug is never
+  // read as an unreachable seam.
+  const calShape = nestedPayloadShape(out && out.calibration);
+  if (!machineryDenied(out) && out && out.outcome === 'CALIBRATION' && calShape === 'mismatch') {
+    return {
+      available: false,
+      status: 'UNKNOWN',
+      reason: 'calibration-payload-shape-mismatch',
+      detail: `dual-build-ledger.sh calibrate-status RETURNED a status, but its \`calibration\` payload arrived as a ${payloadTypeName(out.calibration)}, not an object — the status was DISCARDED at the structured-decode boundary, not unreachable. SPINE_OUTCOME_SCHEMA must declare \`calibration\` object-typed (temperloop#2208).`,
+      n: null,
+      agreement_pct: null,
+      bar_pct: null,
+      bar_n: null,
+    };
+  }
+  if (machineryDenied(out) || out.outcome !== 'CALIBRATION' || calShape !== 'object') {
     return {
       available: false,
       status: 'UNKNOWN',
       reason: (out && out.reason) || 'calibration-unreachable',
+      detail: null,
       n: null,
       agreement_pct: null,
       bar_pct: null,
@@ -5019,6 +5100,7 @@ async function readCalibrationStatus() {
     available: true,
     status: typeof c.status === 'string' ? c.status : 'UNKNOWN',
     reason: null,
+    detail: null,
     n: c.n ?? null,
     agreement_pct: c.agreement_pct ?? null,
     bar_pct: c.bar_pct ?? null,
@@ -5451,7 +5533,12 @@ async function driveLevelPick(pickables, dual) {
   const calibrated = calibrationBarMet(cal);
   log(
     `dual-build level-pick calibration gate: status=${cal.status}` +
-      (cal.available ? ` n=${cal.n} agreement=${cal.agreement_pct}% bar=${cal.bar_pct}%/${cal.bar_n}` : ` (UNAVAILABLE: ${cal.reason})`) +
+      (cal.available
+        ? ` n=${cal.n} agreement=${cal.agreement_pct}% bar=${cal.bar_pct}%/${cal.bar_n}`
+        // temperloop#2208: the reason's own detail rides the log line, so a
+        // payload-shape discard names itself here rather than hiding behind a
+        // bare `calibration-unreachable`.
+        : ` (UNAVAILABLE: ${cal.reason}${cal.detail ? ` — ${cal.detail}` : ''})`) +
       ` → an explicit confirm is ${calibrated ? 'OPTIONAL (the override lever)' : 'REQUIRED before any PR opens'}`,
   );
 

@@ -13519,6 +13519,158 @@ console.log(JSON.stringify({ ok: true }));
 "
 
 # ---------------------------------------------------------------------------
+# K2208: the nested-object payload's THREE states, held apart
+# ---------------------------------------------------------------------------
+# The whole point of #2208 is that "the payload arrived as a STRING" and "there
+# was no payload" are different facts with different cures, and the pre-fix code
+# collapsed them into one reason and one (false) diagnostic. These cases assert
+# the three states are DISTINGUISHABLE, not merely that the good one works.
+run_node_case "K2208 judge payload shapes: an OBJECT verdict is read, a STRING (or ARRAY) verdict is a NAMED payload-shape mismatch that never claims judge.sh produced nothing, and a genuinely ABSENT payload is still reported unavailable" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+const logged = [];
+globalThis.log = (m) => logged.push(String(m));
+
+// j-obj — the payload arrives as SPINE_OUTCOME_SCHEMA declares it.
+greenArm('jobj', 'baseline'); greenArm('jobj', 'candidate');
+itemBarrier('jobj', { outcome: 'JUDGED', judge: { preference: 'B', margin: 17.5, order_agreement: true } });
+
+// j-str — exactly the live #2208 shape: a complete verdict, JSON-stringified by
+// the constrained decode because the schema gave the property no type.
+greenArm('jstr', 'baseline'); greenArm('jstr', 'candidate');
+itemBarrier('jstr', { outcome: 'JUDGED', judge: '{\"preference\":\"B\",\"margin\":17.5,\"order_agreement\":true}' });
+
+// j-arr — an ARRAY is a mismatch too. JS \`typeof [] === 'object'\`, so the old
+// bare typeof check would have admitted this one silently.
+greenArm('jarr', 'baseline'); greenArm('jarr', 'candidate');
+itemBarrier('jarr', { outcome: 'JUDGED', judge: [{ preference: 'B' }] });
+
+// j-abs — JUDGED with no payload at all: a genuine absence, and the ONE case
+// the pre-existing 'judge-unavailable' wording is actually true of.
+greenArm('jabs', 'baseline'); greenArm('jabs', 'candidate');
+itemBarrier('jabs', { outcome: 'JUDGED' });
+
+globalThis.args = { ...dualArgs(['jobj','jstr','jarr','jabs']), items: [
+  { slug: 'jobj', branch: 'build/jobj', title: 'JOBJ', kind: 'impl', acceptance: ['c'] },
+  { slug: 'jstr', branch: 'build/jstr', title: 'JSTR', kind: 'impl', acceptance: ['c'] },
+  { slug: 'jarr', branch: 'build/jarr', title: 'JARR', kind: 'impl', acceptance: ['c'] },
+  { slug: 'jabs', branch: 'build/jabs', title: 'JABS', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+const bail = (r) => { console.log(JSON.stringify({ ok: false, reason: r })); process.exit(0); };
+
+// STATE 1 — object accepted: the verdict survives, in full.
+const ok = dualRecordOf(result, 'jobj');
+if (!ok || !ok.judge || ok.judge.preference !== 'B' || ok.judge.margin !== 17.5 || ok.judge.order_agreement !== true)
+  bail('an OBJECT judge payload must be read through intact: ' + JSON.stringify(ok));
+if (ok.judge_unavailable_reason !== null || ok.prefers_arm !== 'candidate')
+  bail('an object verdict must carry no unavailable reason and must route its preference: ' + JSON.stringify(ok));
+
+// STATE 2 — mismatch, under its OWN name, for BOTH wrong types. The reason must
+// differ from state 3's, or the two states are not distinguishable at all.
+for (const slug of ['jstr', 'jarr']) {
+  const mm = dualRecordOf(result, slug);
+  if (!mm || mm.judge !== null)
+    bail(slug + ': a wrong-typed payload must never be passed off as a verdict: ' + JSON.stringify(mm));
+  if (mm.judge_unavailable_reason !== 'judge-payload-shape-mismatch')
+    bail(slug + ': a wrong-typed payload must report the NAMED payload-shape mismatch, not a generic unavailability: ' + JSON.stringify(mm));
+  const line = logged.find(m => m.indexOf('[' + slug + '] dual-build judge:') === 0);
+  if (!line) bail(slug + ': the discard produced no log line at all');
+  // The #2208 second defect: the old diagnostic blamed judge.sh for producing
+  // nothing. It must not fire on a discard.
+  if (line.indexOf('produced no verdict') !== -1)
+    bail(slug + ': the misdirecting \"produced no verdict\" diagnostic still fires on a payload-shape discard: ' + line);
+  if (line.indexOf('DISCARDED at the structured-decode boundary') === -1)
+    bail(slug + ': the discard diagnostic must say the verdict ARRIVED and was discarded: ' + line);
+}
+if (logged.find(m => m.indexOf('[jstr] dual-build judge:') === 0).indexOf('as a string') === -1)
+  bail('the mismatch diagnostic must name the type the payload ACTUALLY arrived as (string)');
+if (logged.find(m => m.indexOf('[jarr] dual-build judge:') === 0).indexOf('as a array') === -1)
+  bail('the mismatch diagnostic must name an array as an array, not as JS bare object');
+
+// STATE 3 — genuine absence: the ORIGINAL reason and the ORIGINAL wording, both
+// of which are true here.
+const ab = dualRecordOf(result, 'jabs');
+if (!ab || ab.judge !== null || ab.judge_unavailable_reason !== 'judge-unavailable')
+  bail('an ABSENT payload must still report judge-unavailable: ' + JSON.stringify(ab));
+const abLine = logged.find(m => m.indexOf('[jabs] dual-build judge:') === 0);
+if (!abLine || abLine.indexOf('produced no verdict') === -1)
+  bail('an absent payload is exactly the case \"produced no verdict\" describes: ' + abLine);
+if (abLine.indexOf('DISCARDED at the structured-decode boundary') !== -1)
+  bail('an absence must not be reported as a discard: ' + abLine);
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2208 calibration payload shapes: an OBJECT status is read field-by-field, a STRING status is a NAMED payload-shape mismatch (never calibration-unreachable), an ABSENT one stays unreachable — and all three still fail CLOSED" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+const logged = [];
+globalThis.log = (m) => logged.push(String(m));
+const bail = (r) => { console.log(JSON.stringify({ ok: false, reason: r })); process.exit(0); };
+
+// One in-scope item with two passing arms is all the level needs to reach the
+// pick phase, which is where the single level-scoped calibration read happens.
+globalThis.calLevel = async (calOut, slug) => {
+  greenArm(slug, 'baseline'); greenArm(slug, 'candidate');
+  itemBarrier(slug);
+  setMachinery('_level', calOut);
+  globalThis.args = { ...dualArgs([slug]), items: [
+    { slug, branch: 'build/' + slug, title: slug.toUpperCase(), kind: 'impl', acceptance: ['c'] },
+  ]};
+  const mod = await loadLevel();
+  const result = await mod.default();
+  const line = logged.find(m => m.indexOf('dual-build level-pick calibration gate:') === 0);
+  logged.length = 0;
+  return { result, line };
+};
+
+// STATE 1 — object accepted: every field is read out of the payload, and the
+// gate still HOLDS (uncalibrated), proving acceptance is not the same as pass.
+const objRun = await calLevel({ outcome: 'CALIBRATION', calibration: { n: 1, agreement_pct: 0, status: 'uncalibrated', bar_pct: 70, bar_n: 5 } }, 'cobj');
+if (!objRun.line) bail('no calibration gate log line for the object case');
+if (objRun.line.indexOf('status=uncalibrated') === -1 || objRun.line.indexOf('n=1') === -1 || objRun.line.indexOf('bar=70%/5') === -1)
+  bail('an OBJECT calibration payload must be read field-by-field: ' + objRun.line);
+if (objRun.line.indexOf('UNAVAILABLE') !== -1)
+  bail('a readable status must not be reported unavailable: ' + objRun.line);
+if ((objRun.result.escalations ?? []).filter(e => e.kind === 'level-pick').length !== 1)
+  bail('an uncalibrated judge must still hold the level for a confirm: ' + JSON.stringify(objRun.result.escalations));
+
+// STATE 2 — the live #2208 shape: a real status, JSON-stringified.
+const strRun = await calLevel({ outcome: 'CALIBRATION', calibration: '{\"n\":0,\"agreement_pct\":null,\"status\":\"NEVER CALIBRATED\",\"bar_pct\":70,\"bar_n\":20}' }, 'cstr');
+if (!strRun.line) bail('no calibration gate log line for the string case');
+if (strRun.line.indexOf('UNAVAILABLE: calibration-payload-shape-mismatch') === -1)
+  bail('a wrong-typed calibration payload must report the NAMED mismatch: ' + strRun.line);
+if (strRun.line.indexOf('calibration-unreachable') !== -1)
+  bail('a discarded status must never be reported as an unreachable seam: ' + strRun.line);
+if (strRun.line.indexOf('DISCARDED at the structured-decode boundary') === -1)
+  bail('the mismatch diagnostic must say the status ARRIVED and was discarded: ' + strRun.line);
+if (strRun.line.indexOf('status=UNKNOWN') === -1 || (strRun.result.escalations ?? []).filter(e => e.kind === 'level-pick').length !== 1)
+  bail('the mismatch must still FAIL CLOSED — status UNKNOWN and the level held: ' + strRun.line);
+
+// STATE 3 — genuinely nothing came back.
+const absRun = await calLevel({ outcome: 'CALIBRATION' }, 'cabs');
+if (!absRun.line) bail('no calibration gate log line for the absent case');
+if (absRun.line.indexOf('UNAVAILABLE: calibration-unreachable') === -1)
+  bail('an ABSENT payload must still report calibration-unreachable: ' + absRun.line);
+if (absRun.line.indexOf('DISCARDED at the structured-decode boundary') !== -1)
+  bail('an absence must not be reported as a discard: ' + absRun.line);
+if ((absRun.result.escalations ?? []).filter(e => e.kind === 'level-pick').length !== 1)
+  bail('an unreachable calibration must hold the level: ' + JSON.stringify(absRun.result.escalations));
+
+// …and the three reasons are genuinely three, not one wearing three hats.
+const reasons = [objRun.line, strRun.line, absRun.line].map(l => (l.match(/UNAVAILABLE: ([a-z-]+)/) || [null, 'READ'])[1]);
+if (new Set(reasons).size !== 3)
+  bail('the three calibration payload states collapsed into fewer than three distinguishable reasons: ' + JSON.stringify(reasons));
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# ---------------------------------------------------------------------------
 # K2080 round-1 review [HIGH]: no item is silently lost to an uncaught throw
 # ---------------------------------------------------------------------------
 # parallel() drops a REJECTED thunk to null and buildLevel's consuming loop then
@@ -16982,6 +17134,75 @@ case "$K2205_OUT" in
 esac
 echo "PASS: #2205 emitted↔enum lockstep — $K2205_OUT"
 unset K2205_OUT
+
+# --- K2208 EMITTED-OBJECT-PAYLOAD <-> SCHEMA lockstep guard (the THIRD axis) --
+#
+# WHY THIS EXISTS. #2205 above fixed the `outcome` ENUM; this axis fixes the
+# PAYLOAD SHAPE one level down. SPINE_OUTCOME_SCHEMA declared ~55 scalar
+# properties and NO object-typed one, including the only two nested-object
+# payloads the generated shell emits. `additionalProperties: true` admits an
+# undeclared property but gives it no TYPE, so a constrained decode is free to
+# return it JSON-STRINGIFIED -- and did. The second live dual-build run emitted
+# {"outcome":"JUDGED","judge":<a complete verdict object>} and
+# {"outcome":"CALIBRATION","calibration":<a real status object>}; both came back
+# as strings and both consumers threw the payload away into
+# `judge-unavailable` / `calibration-unreachable` (temperloop#2208).
+#
+# THE AXIS, re-derived from shipping source on all three sides every run:
+#   C  every key the generated shell interpolates RAW as `"<key>":%s`
+#   B  every key a consumer reads back through nestedPayloadShape() -- the ONE
+#      predicate that distinguishes object / string-mismatch / absent, so its
+#      call sites ARE the file own statement of which payloads are objects
+#   A  every key SPINE_OUTCOME_SCHEMA declares `{ type: object }`
+# and the three lockstep claims: B subset-of A (the #2208 fix: an
+# object-consumed payload the schema does not declare is silently
+# stringifiable), B subset-of C (an object payload nothing emits raw is a dead
+# consumer), A subset-of B (a dangling object declaration nothing reads).
+#
+# Like K2205 it refuses to pass vacuously: both extractions assert a non-zero
+# floor, so a regex that went stale reads as a FAILURE, not as "all clear"
+# (temperloop#1706).
+K2208_OUT="$(EMITTED_SLOT_FLOOR=18 OBJECT_PAYLOAD_FLOOR=2 node -e '
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[1], "utf8");
+const die = (m) => { console.log(JSON.stringify({ ok: false, reason: m })); process.exit(0); };
+
+// --- side A: the schema`s OBJECT-TYPED property names -----------------------
+const schema = src.match(/const SPINE_OUTCOME_SCHEMA = \{[\s\S]*?\n\};/);
+if (!schema) die("could not locate the SPINE_OUTCOME_SCHEMA block in build-level.mjs -- this guard`s extraction anchor moved and it is now inert");
+const declared = [...schema[0].matchAll(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*\{\s*type:\s*\x27object\x27\s*\}/gm)].map((m) => m[1]).sort();
+
+// --- side B: the keys a consumer reads as a nested OBJECT payload -----------
+const consumed = [...new Set(
+  [...src.matchAll(/nestedPayloadShape\(\s*out\s*&&\s*out\.([A-Za-z_][A-Za-z0-9_]*)\s*\)/g)].map((m) => m[1]),
+)].sort();
+const objFloor = Number(process.env.OBJECT_PAYLOAD_FLOOR);
+if (consumed.length < objFloor) die("extracted only " + consumed.length + " nestedPayloadShape() payload reads (floor " + objFloor + ") -- the consumer-side regex has gone stale and this axis would pass vacuously");
+
+// --- side C: every key the generated shell interpolates RAW as "<key>":%s ---
+const emitted = [...new Set(
+  [...src.matchAll(/\\*"([A-Za-z_][A-Za-z0-9_]*)\\*"\s*:\s*%s/g)].map((m) => m[1]),
+)].sort();
+const slotFloor = Number(process.env.EMITTED_SLOT_FLOOR);
+if (emitted.length < slotFloor) die("extracted only " + emitted.length + " distinct `\"<key>\":%s` emission slots (floor " + slotFloor + ") -- the emitted-slot regex has gone stale and this axis would pass vacuously");
+
+const undeclared = consumed.filter((k) => !declared.includes(k));
+if (undeclared.length) die("build-level.mjs reads " + undeclared.length + " nested-object payload(s) that SPINE_OUTCOME_SCHEMA does not declare object-typed, so a constrained decode may hand them back JSON-STRINGIFIED and the consumer will discard the real verdict: " + undeclared.join(", ") + ". Add `<key>: { type: \x27object\x27 }` to SPINE_OUTCOME_SCHEMA.properties -- do NOT JSON.parse the payload back out on the consumer side.");
+
+const unemitted = consumed.filter((k) => !emitted.includes(k));
+if (unemitted.length) die("build-level.mjs reads nested-object payload(s) no emitted printf interpolates raw as `\"<key>\":%s`: " + unemitted.join(", ") + " -- either the emitter was dropped or the key was renamed on one side only.");
+
+const dangling = declared.filter((k) => !consumed.includes(k));
+if (dangling.length) die("SPINE_OUTCOME_SCHEMA declares object-typed propert(ies) nothing reads through nestedPayloadShape(): " + dangling.join(", ") + " -- a declaration with no consumer is drift, and it hides the very lockstep this axis enforces.");
+
+console.log(JSON.stringify({ ok: true, declared, consumed, emittedSlots: emitted.length }));
+' "$MJS")" || fail "#2208: the object-payload/schema lockstep extractor failed to run"
+case "$K2208_OUT" in
+  *'"ok":true'*) : ;;
+  *) fail "#2208 object-payload<->schema lockstep: $K2208_OUT" ;;
+esac
+echo "PASS: #2208 object-payload<->schema lockstep — $K2208_OUT"
+unset K2208_OUT
 
 echo ""
 echo "All test_workflow.sh cases passed."
