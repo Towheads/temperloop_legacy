@@ -98,6 +98,18 @@ REVIEW_ROUNDS_SHA_BEFORE="ABSENT"
 if [ -n "$REVIEW_ROUNDS_SHA_MARKER" ] && [ -f "$REVIEW_ROUNDS_SHA_MARKER" ]; then
   REVIEW_ROUNDS_SHA_BEFORE="$(cat "$REVIEW_ROUNDS_SHA_MARKER" 2>/dev/null || echo UNREADABLE)"
 fi
+# temperloop#2149 — and the THIRD marker of the same family, for the same
+# reason with one extra edge: reviewDiffCmd's bumping arm DELETES this one, so
+# a test run that reached it would not merely inflate production state but
+# destroy it, silently costing a real CI-fix re-review the notice that its base
+# moved. Presence, not content, is what this marker means, so the snapshot
+# records PRESENT/ABSENT.
+REVIEW_ROUNDS_REBASED_MARKER=""
+[ -n "$_rr_gitdir" ] && REVIEW_ROUNDS_REBASED_MARKER="$_rr_gitdir/build-review-rounds-rebased"
+REVIEW_ROUNDS_REBASED_BEFORE="ABSENT"
+if [ -n "$REVIEW_ROUNDS_REBASED_MARKER" ] && [ -f "$REVIEW_ROUNDS_REBASED_MARKER" ]; then
+  REVIEW_ROUNDS_REBASED_BEFORE="PRESENT"
+fi
 
 # temperloop#1014: the machinery executors run as the `machinery-executor` agent,
 # whose definition carries the standing contract the lean prompt no longer
@@ -11947,6 +11959,102 @@ else {
     reason = 'the CI-fix re-review must state the truthful clean-prior-round premise: ' + second.slice(0,900);
   else if (second.indexOf('no findings text was recorded') !== -1)
     reason = 'the self-contradictory placeholder must be gone from the CI-fix path too: ' + second.slice(0,900);
+  // temperloop#2149 NO-REBASE ARM, pinned here so the two arms are asserted
+  // against the SAME fixture: this diff fetch reports no review_prior_rebased,
+  // so the prompt must be byte-for-byte what it was before #2149 — a notice
+  // emitted unconditionally would make the rebase claim FALSE on every
+  // ordinary CI-fix re-review, which is the majority path.
+  else if (second.indexOf('UPSTREAM REBASE BETWEEN ROUNDS') !== -1)
+    reason = 'no rebase happened between rounds on this fixture, so the continuation must carry NO rebase notice: ' + second.slice(0,900);
+}
+if (!reason && (result.escalations ?? []).length !== 0)
+  reason = 'expected 0 escalations: ' + JSON.stringify(result.escalations);
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+# ============================================================================
+# TEST (K2149-cifix-rebased): the SAME CI-fix re-review call site, but with an
+#   upstream rebase having landed between rounds — the temperloop#2149 arm.
+#
+#   Phase order: §3e review (stamps the marker at the then-current HEAD) ->
+#   §3e.5-pre freshness REBASE -> push -> CI -> CI-fix worker -> re-review.
+#   Before #2149 the marker still named the pre-rebase commit the rebase had
+#   orphaned, so reviewDiffCmd's #2127 --is-ancestor fail-safe emptied it and
+#   the re-review lost its range. gateFreshnessCmd now RE-STAMPS the marker to
+#   the post-rebase base and writes a paired notice marker, which reaches this
+#   relay as review_prior_rebased.
+#
+#   BOTH HALVES are asserted here, because the range alone is the dishonest
+#   version: the reviewer never saw the post-rebase tree, so a tighter range
+#   with no notice invites it to read the upstream delta as already-reviewed.
+#   The negative arm lives in the K2127-cifix case directly above, against the
+#   identical fixture minus the flag.
+# ============================================================================
+run_node_case "K2149-cifix-rebased: a CI-fix re-review whose base MOVED gets BOTH the re-stamped <prior-sha>..HEAD range AND an explicit notice that an upstream rebase landed between rounds" "
+$PREAMBLE
+
+setMachinery('cifix-rebased',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/cifix-rebased' },
+  { outcome: 'REVIEW_DIFF', files: ['claude/commands/build.md'], tsv: '', tsv_rows: 0, tsv_checksum: 0 },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'a15e' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'a15e', branch: 'build/cifix-rebased' },
+  { outcome: 'PR_OPENED', pr_number: 702 },
+  { outcome: 'CI_FAILED', failed_run_ids: [1] },
+  // The re-review's OWN diff fetch. 'cafe1234abcd' is the POST-rebase base the
+  // freshness step re-stamped into the marker — not the orphaned pre-rebase
+  // commit — and review_prior_rebased is the paired notice the same re-stamp
+  // wrote beside it.
+  { outcome: 'REVIEW_DIFF', files: ['claude/commands/build.md'], tsv: '', tsv_rows: 0, tsv_checksum: 0, review_rounds: 1, review_prior_sha: 'cafe1234abcd', review_prior_rebased: true },
+  { outcome: 'PUSHED', sha: 'a25f', branch: 'build/cifix-rebased' },
+  { outcome: 'CI_GREEN' },
+  { outcome: 'BODY_UPDATED', pr_number: 702 },
+);
+setWorker('cifix-rebased',
+  { status: 'done', summary: 'initial', acceptance_results: [{ criterion: 'c', passed: true, evidence: 'e' }], commits: [] },
+  { status: 'done', summary: 'ci fixed', acceptance_results: [], commits: [] },
+);
+setReview('cifix-rebased',
+  '## Summary\\nclean on the original push.\\n\\n## Findings\\n(none)\\n',
+  '## Summary\\nclean on the CI-fix commit too.\\n\\n## Findings\\n(none)\\n',
+);
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'cifix-rebased', branch: 'build/cifix-rebased', title: 'CI-fix re-review after a rebase', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+let reason = null;
+const reviewCalls = callLog.filter(c => isReviewCall(c.opts));
+if (reviewCalls.length !== 2)
+  reason = 'expected TWO review agent() calls (original push + CI-fix commit), got ' + reviewCalls.length;
+else {
+  const first = reviewCalls[0].promptFull;
+  const second = reviewCalls[1].promptFull;
+  if (first.indexOf('UPSTREAM REBASE BETWEEN ROUNDS') !== -1)
+    reason = 'round 1 has no prior round and can never carry a between-rounds rebase notice: ' + first.slice(0,400);
+  else if (second.indexOf('## Continuation') === -1)
+    reason = 'the CI-fix re-review is round 2 and must carry the delta-aware continuation section: ' + second.slice(0,600);
+  // HALF 1 — the range, and its base is the RE-STAMPED post-rebase commit.
+  else if (second.indexOf('cafe1234abcd..HEAD') === -1)
+    reason = 'ACCEPTANCE 1: the re-review must carry the <prior-sha>..HEAD range whose base is the POST-REBASE commit the freshness step re-stamped: ' + second.slice(0,900);
+  // HALF 2 — and it must SAY the base moved. Both ship together or neither.
+  else if (second.indexOf('UPSTREAM REBASE BETWEEN ROUNDS') === -1)
+    reason = 'ACCEPTANCE 2: the re-stamp fired, so the prompt must state that an upstream rebase landed between rounds — the range without the notice is the dishonest version: ' + second.slice(0,1200);
+  else if (second.indexOf('NOT the upstream delta') === -1)
+    reason = 'ACCEPTANCE 2: the notice must say WHAT the range covers — the work since the rebase, not the upstream delta the rebase brought in: ' + second.slice(0,1200);
+  else if (second.indexOf('PRE-REBASE tree') === -1)
+    reason = 'ACCEPTANCE 2: the notice must tell the reviewer its prior conclusions were made against a pre-rebase tree: ' + second.slice(0,1200);
+  // The notice must sit INSIDE the continuation section, before the numbered
+  // steps — a reviewer that reads the range instruction first and the caveat
+  // afterwards has already been misled by the time it reaches it.
+  else if (second.indexOf('UPSTREAM REBASE BETWEEN ROUNDS') > second.indexOf('cafe1234abcd..HEAD'))
+    reason = 'the rebase notice must precede the range instruction it qualifies: ' + second.slice(0,1200);
+  // #2127's truthful-premise fix is untouched by this arm.
+  else if (second.indexOf('found blocking finding(s)') !== -1)
+    reason = 'the rebase notice must not resurrect the FALSE blocking-findings premise #2127 removed: ' + second.slice(0,1200);
 }
 if (!reason && (result.escalations ?? []).length !== 0)
   reason = 'expected 0 escalations: ' + JSON.stringify(result.escalations);
@@ -12277,6 +12385,170 @@ if [ -f "$K2127_UNBORN_GD/build-review-rounds-sha" ]; then
   fail "#2127-corrupt: on an UNBORN HEAD nothing may be written to the prior-sha marker — a bare 'git rev-parse HEAD' prints the literal string HEAD there (exit 128), which a later round's tr -cd filters to 'EAD'; marker holds '$(cat "$K2127_UNBORN_GD/build-review-rounds-sha")'"
 fi
 echo "PASS: #2127-corrupt prior-sha marker — a corrupted marker, a real-but-orphaned (pre-rebase) commit, and an unborn HEAD each degrade to an EMPTY prior sha, while a genuine ancestor still passes through verbatim"
+
+# ============================================================================
+# TEST (K2149-e2e): the RE-STAMP itself, both GENERATED SHELLS executed for
+#   real, against ONE real linked worktree that really gets rebased.
+#
+#   Every mock case above hands the driver a review_prior_rebased fixture and
+#   never runs the shell gateFreshnessCmd() actually generates — so the write
+#   half (does the freshness step MOVE the marker at all? does the review-diff
+#   step then SEE it?) would be entirely untested by them. This case closes
+#   that end to end, reusing the #1937-e2e emit helper for the freshness
+#   command and the #1970-e2e emit body for the review-diff command so the two
+#   halves are the SAME text the driver would run.
+#
+#   The fixture is deliberately a NON-CONFLICTING divergence (origin/main
+#   touches a different file), because the pre-existing #1937-e2e scenarios all
+#   cover the FAILING rebase arms and none of them reaches a clean
+#   FRESHNESS_REBASED at all.
+# ============================================================================
+K2149_E2E="$WF_TEST_TMPDIR/restamp-e2e"
+mkdir -p "$K2149_E2E"
+git init --quiet --bare "$K2149_E2E/origin.git"
+mkdir -p "$K2149_E2E/main-checkout"
+(
+  set -e
+  cd "$K2149_E2E/main-checkout"
+  git init --quiet .
+  git symbolic-ref HEAD refs/heads/main
+  git config user.email t@example.com
+  git config user.name t
+  mkdir -p scripts
+  printf '#!/bin/sh\nexit 0\n' > scripts/quality-gates.sh
+  chmod +x scripts/quality-gates.sh
+  printf 'base\n' > f.txt
+  git add -A && git commit --quiet -m base
+  git remote add origin "$K2149_E2E/origin.git"
+  git push --quiet -u origin main
+) || fail "#2149-e2e: could not build the base fixture"
+git -C "$K2149_E2E/main-checkout" worktree add --quiet "$K2149_E2E/repo.wt/restamp" -b build/restamp main \
+  || fail "#2149-e2e: could not create the restamp-scenario linked worktree"
+# Same fixture self-check the #1937/#1970 e2e cases make: a LINKED worktree's
+# .git is a pointer FILE, so `git rev-parse --git-dir` is the only correct way
+# to reach the private git dir the markers live in.
+[ -f "$K2149_E2E/repo.wt/restamp/.git" ] \
+  || fail "#2149-e2e: fixture worktree's .git is not a pointer FILE — this fixture does not exercise the linked-worktree shape"
+(
+  set -e
+  cd "$K2149_E2E/repo.wt/restamp"
+  printf 'the worker change the CI fix will extend\n' > worker.txt
+  git add -A && git commit --quiet -m work-restamp
+) || fail "#2149-e2e: could not commit the worker-side change"
+# origin/main moves on, touching a DIFFERENT file so the rebase is clean.
+(
+  set -e
+  cd "$K2149_E2E/main-checkout"
+  printf 'upstream moved on\n' > upstream.txt
+  git add -A && git commit --quiet -m main-moved-on
+  git push --quiet origin main
+) || fail "#2149-e2e: could not advance origin/main past the fixture worktree"
+
+K2149_GD="$(git -C "$K2149_E2E/repo.wt/restamp" rev-parse --absolute-git-dir)"
+K2149_PRE="$(git -C "$K2149_E2E/repo.wt/restamp" rev-parse HEAD)"
+# Stand in for the §3e round that already ran and stamped the marker at the
+# then-current (pre-rebase) HEAD — exactly what reviewDiffCmd's bumping call
+# writes before the push.
+printf '%s\n' "1" > "$K2149_GD/build-review-rounds"
+printf '%s\n' "$K2149_PRE" > "$K2149_GD/build-review-rounds-sha"
+[ ! -e "$K2149_GD/build-review-rounds-rebased" ] \
+  || fail "#2149-e2e: fixture self-check failed — the rebase-notice marker already exists before any run"
+
+# --- half 1: the REAL generated gate-freshness shell rebases and re-stamps ---
+k1937_emit restamp restamp "$K2149_E2E/restamp" "$K2149_E2E"
+[ -s "$K2149_E2E/restamp.main.sh" ] || fail "#2149-e2e: no gate-freshness command was generated for the restamp scenario"
+K2149_FRESH_OUT="$(bash "$K2149_E2E/restamp.main.sh" 2>/dev/null || true)"
+printf '%s' "$K2149_FRESH_OUT" | grep '"outcome":"FRESHNESS_REBASED"' >/dev/null \
+  || fail "#2149-e2e: the fixture must reach a CLEAN rebase (FRESHNESS_REBASED); got: $K2149_FRESH_OUT"
+printf '%s' "$K2149_FRESH_OUT" | grep '"review_marker_restamped":true' >/dev/null \
+  || fail "#2149-e2e: a clean rebase with an existing prior-sha marker must report review_marker_restamped:true; got: $K2149_FRESH_OUT"
+K2149_POST="$(git -C "$K2149_E2E/repo.wt/restamp" rev-parse HEAD)"
+[ "$K2149_POST" != "$K2149_PRE" ] \
+  || fail "#2149-e2e: fixture self-check failed — HEAD did not move, so nothing was actually rebased"
+# THE DEFECT, ESTABLISHED POSITIVELY: the pre-rebase commit really is orphaned
+# off this branch now, which is why #2127's --is-ancestor check empties it and
+# why a re-stamp (rather than a wider ancestor rule) is the recoverable fix.
+git -C "$K2149_E2E/repo.wt/restamp" merge-base --is-ancestor "$K2149_PRE" HEAD 2>/dev/null \
+  && fail "#2149-e2e: fixture self-check failed — the pre-rebase commit is still an ancestor of HEAD, so this fixture does not reproduce the orphaned-marker defect at all"
+[ "$(cat "$K2149_GD/build-review-rounds-sha")" = "$K2149_POST" ] \
+  || fail "#2149-e2e: ACCEPTANCE 1 — the marker must now name the POST-REBASE base ($K2149_POST), not the orphaned pre-rebase commit; holds '$(cat "$K2149_GD/build-review-rounds-sha")'"
+[ -f "$K2149_GD/build-review-rounds-rebased" ] \
+  || fail "#2149-e2e: ACCEPTANCE 2 — the re-stamp must also write the paired rebase-notice marker; the range without the notice is the dishonest version"
+# Both markers live in the GIT DIR, never the working tree — a stray untracked
+# file there would surface in git status, in the 3e.5 --scoped gate's untracked
+# resolution, and in the tracked-path coverage manifests.
+git -C "$K2149_E2E/repo.wt/restamp" status --porcelain | grep . >/dev/null \
+  && fail "#2149-e2e: the re-stamp must write nothing into the WORKING TREE, but git status reports changes"
+
+# --- half 2: the REAL generated review-diff shell then SEES both markers -----
+K2149_RD_CASE="$WF_TEST_TMPDIR/e2e-restamp-rd.mjs"
+printf '%s\n' "$PREAMBLE" > "$K2149_RD_CASE"
+printf '%s\n' "$K1970_EMIT_BODY" >> "$K2149_RD_CASE"
+MJS_PATH="$MJS" AGENT_DEF_PATH="$AGENT_DEF" \
+K1970_ROOT="$K2149_E2E" K1970_WT="$K2149_E2E/repo.wt/restamp" K1970_OUT="$K2149_E2E/review-diff.sh" \
+  node "$K2149_RD_CASE" >/dev/null || fail "#2149-e2e: could not emit the generated review-diff command (node failed)"
+[ -s "$K2149_E2E/review-diff.sh" ] || fail "#2149-e2e: no review-diff command was generated"
+# ONE invocation, captured whole: this script BUMPS, so re-running it per field
+# would read two different rounds' output (the #2127-e2e capture rule).
+K2149_RD1="$(bash "$K2149_E2E/review-diff.sh" 2>/dev/null || true)"
+printf '%s' "$K2149_RD1" | grep "\"review_prior_sha\":\"$K2149_POST\"" >/dev/null \
+  || fail "#2149-e2e: ACCEPTANCE 1 — the CI-fix re-review's diff fetch must carry the re-stamped POST-REBASE base as its prior sha, so the range is exactly the CI fix; got: $K2149_RD1"
+printf '%s' "$K2149_RD1" | grep '"review_prior_rebased":true' >/dev/null \
+  || fail "#2149-e2e: ACCEPTANCE 2 — the same fetch must relay the rebase notice, so the prompt can state that the base moved; got: $K2149_RD1"
+# The notice is CONSUMED by the round that carries it: the marker is cleared on
+# the bumping call, so the NEXT round (whose prior sha is now post-rebase and
+# current) is not told about a rebase that predates it.
+[ -e "$K2149_GD/build-review-rounds-rebased" ] \
+  && fail "#2149-e2e: the bumping review-diff call must CONSUME the rebase-notice marker; leaving it would make every later round claim a rebase that already predates its own prior sha"
+K2149_RD2="$(bash "$K2149_E2E/review-diff.sh" 2>/dev/null || true)"
+printf '%s' "$K2149_RD2" | grep '"review_prior_rebased":false' >/dev/null \
+  || fail "#2149-e2e: the round AFTER the notice was consumed must report review_prior_rebased:false; got: $K2149_RD2"
+
+# --- half 3: the #2127 FAIL-SAFE is preserved, not replaced ------------------
+# A rewritten history with no valid base still degrades to the range-free
+# wording. Re-point the marker at a commit that is real but not an ancestor —
+# the residue a rewrite this re-stamp did NOT cover would leave — and assert
+# reviewDiffCmd still empties it rather than handing out a bogus range.
+K2149_ORPHAN="$(git -C "$K2149_E2E/repo.wt/restamp" commit-tree "$(git -C "$K2149_E2E/repo.wt/restamp" rev-parse 'HEAD^{tree}')" -m 'orphan, not on this branch' 2>/dev/null || true)"
+[ -n "$K2149_ORPHAN" ] || fail "#2149-e2e: could not mint the orphan commit for the fail-safe arm"
+printf '%s\n' "$K2149_ORPHAN" > "$K2149_GD/build-review-rounds-sha"
+K2149_RD3="$(bash "$K2149_E2E/review-diff.sh" 2>/dev/null || true)"
+printf '%s' "$K2149_RD3" | grep '"review_prior_sha":""' >/dev/null \
+  || fail "#2149-e2e: ACCEPTANCE 3 — the #2127 --is-ancestor fail-safe must STILL empty a non-ancestor base; the re-stamp is an improvement on top of it, never a substitute; got: $K2149_RD3"
+# …and the re-stamp itself refuses to MINT a marker where no round ever stamped
+# one: a freshness rebase on a worktree whose §3e has not run yet must not
+# invent a prior round.
+rm -f "$K2149_GD/build-review-rounds-sha" "$K2149_GD/build-review-rounds-rebased"
+(
+  set -e
+  cd "$K2149_E2E/main-checkout"
+  printf 'upstream moved on again\n' >> upstream.txt
+  git add -A && git commit --quiet -m main-moved-on-again
+  git push --quiet origin main
+) || fail "#2149-e2e: could not advance origin/main for the no-marker arm"
+K2149_FRESH_OUT2="$(bash "$K2149_E2E/restamp.main.sh" 2>/dev/null || true)"
+printf '%s' "$K2149_FRESH_OUT2" | grep '"outcome":"FRESHNESS_REBASED"' >/dev/null \
+  || fail "#2149-e2e: the no-marker arm must still reach a clean rebase; got: $K2149_FRESH_OUT2"
+printf '%s' "$K2149_FRESH_OUT2" | grep '"review_marker_restamped":false' >/dev/null \
+  || fail "#2149-e2e: with NO prior-sha marker there is nothing to re-stamp — the step must report false, never mint one; got: $K2149_FRESH_OUT2"
+[ -e "$K2149_GD/build-review-rounds-sha" ] \
+  && fail "#2149-e2e: the re-stamp must never CREATE a prior-sha marker; a §3e round that never ran has no reviewed commit to name"
+[ -e "$K2149_GD/build-review-rounds-rebased" ] \
+  && fail "#2149-e2e: with nothing re-stamped there is no tighter range to qualify, so no rebase notice may be written either"
+echo "PASS: #2149-e2e re-stamp — a REAL clean rebase in a linked worktree moves the §3e prior-sha marker onto the post-rebase base and writes its paired notice, the generated review-diff shell then relays BOTH (and consumes the notice once carried), #2127's --is-ancestor fail-safe still empties a non-ancestor base, and a worktree with no prior round gets no marker minted"
+
+# --- K2149 static lockstep guard ---------------------------------------------
+# Anchored at the two seams a well-meaning refactor would sever silently: the
+# re-stamp inside the REBASED arm, and the prompt half that qualifies it.
+grep -q 'build-review-rounds-rebased' "$MJS" \
+  || fail "#2149: the rebase-notice marker must exist in build-level.mjs — without it the re-stamped range ships unqualified, which is the dishonest half of this change"
+grep -q 'review_prior_rebased' "$MJS" \
+  || fail "#2149: reviewDiffCmd must relay the rebase notice as review_prior_rebased"
+grep -q 'UPSTREAM REBASE BETWEEN ROUNDS' "$MJS" \
+  || fail "#2149: reviewContinuationSection() must state that the base moved whenever the re-stamp fired"
+grep -q 'merge-base --is-ancestor "$review_prior_sha" HEAD' "$MJS" \
+  || fail "#2149: the #2127 --is-ancestor fail-safe must remain the last line of defense — the re-stamp is added on top of it, never in place of it"
+echo "PASS: #2149 static lockstep guards — the notice marker, its relay field, the prompt half that states the base moved, and the preserved #2127 fail-safe are all wired"
 
 # ============================================================================
 # temperloop#2014: the push -> ci-poll SHA hand-off
@@ -12733,6 +13005,18 @@ fi
   || fail "#2127: running this suite CHANGED the production §3e prior-reviewed-SHA marker at $REVIEW_ROUNDS_SHA_MARKER (before: $REVIEW_ROUNDS_SHA_BEFORE, after: $_k2127_after). Same production-state contract as #2046's round counter — a test run must never write it."
 unset _k2127_after
 echo "PASS: #2127 production-state guard — a full suite run leaves the §3e prior-reviewed-SHA marker byte-identical to how it found it (${REVIEW_ROUNDS_SHA_BEFORE})"
+
+# temperloop#2149 — the same after-snapshot for the rebase-notice marker. The
+# bumping code path CONSUMES this one, so the failure it guards is a DELETION
+# of production state rather than an inflation of it.
+_k2149_after="ABSENT"
+if [ -n "$REVIEW_ROUNDS_REBASED_MARKER" ] && [ -f "$REVIEW_ROUNDS_REBASED_MARKER" ]; then
+  _k2149_after="PRESENT"
+fi
+[ "$_k2149_after" = "$REVIEW_ROUNDS_REBASED_BEFORE" ] \
+  || fail "#2149: running this suite CHANGED the production §3e rebase-notice marker at $REVIEW_ROUNDS_REBASED_MARKER (before: $REVIEW_ROUNDS_REBASED_BEFORE, after: $_k2149_after). Same production-state contract as #2046/#2127 — and this marker is CONSUMED by the bumping path, so a test run that touches it silently robs a real CI-fix re-review of the notice that its base moved."
+unset _k2149_after
+echo "PASS: #2149 production-state guard — a full suite run leaves the §3e rebase-notice marker exactly as it found it (${REVIEW_ROUNDS_REBASED_BEFORE})"
 
 # ============================================================================
 # TEST (K2004-control-empty): a LEGITIMATELY empty level stays SILENT.
