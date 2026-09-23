@@ -57,6 +57,14 @@ claude/commands/build.md	3e — pre-push review (workflow-reviewer on a claude/c
 # reached in a degraded shape at all, and a fixture pins that refusal.
 claude/commands/build.md	3e.6 — class-A activation proof (plan-schema rule 13)	`proof:` is **required** on a `class: A` block	guard	workflows/scripts/build/tests/test_plan.sh	class-A activation without proof: not flagged (rule 13)	make test-build	plan.sh rule 13 rejects a class-A block carrying no proof: at Step 1, before any worker runs; deleting that check turns this fixture red under `make test-build`.
 
+# ── /build §3.6 — the activation PASS record (temperloop#1431) ──────────
+# The gate's OWN execution signal. temperloop#1219 shipped the gate; a PASS
+# left only a log line behind, which nothing can check once the run is over, so
+# "the gate ran against this item's worktree" was unprovable from the item's
+# own output. The signal is now park()'s per-item `activation` record, and the
+# guard below goes red the moment park() stops stamping it.
+claude/commands/build.md	3e.6 — the class-A PASS is recorded, not merely logged	the pass is **recorded, not merely logged** (temperloop#1431)	guard	workflows/scripts/build/tests/test_workflow.sh	park() must stamp the §3e.6 class-A PASS record on the parked record	make test-build-workflow	park() stamps `activation: { class, proof, absence_asserting, merge_base, exit_code }` on a class-A item's parked record; deleting that stamp turns the static guard AND the two runtime cases red under `make test-build-workflow`.
+
 # ── /check-in Part 2 — the trailing-newline restore (temperloop#853) ────────
 # A one-command step inside a larger part, exactly the shape that silently
 # stops being run. Its guard reproduces the corruption when the step is
