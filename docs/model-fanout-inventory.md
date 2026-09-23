@@ -101,12 +101,19 @@ Named-setting-convention violation.
 Declaring **`sonnet`** — findings are advisory inputs the orchestrator and a
 human filter, so a mechanical gate stands behind them:
 `congruence-lens`, `consultant-persona`, `docs-reviewer`, `hobbyist-persona`,
-`red-team-lens`, `requirements-auditor`, `team-member-persona`,
-`workflow-reviewer`, and the five adopter-catalog language reviewers
-(`go`, `java`, `rust`, `swift`, `typescript`).
+`red-team-lens`, `requirements-auditor`, `team-member-persona`, and the four
+adopter-catalog language reviewers for languages this repo does not itself
+ship (`go`, `java`, `rust`, `swift`).
+
+Declaring **`inherit`** — gate-bearing seats kept on the session model by
+`/build` 3c § Model tiering absent a paired measurement (temperloop#2132):
+`workflow-reviewer`, `typescript-reviewer`. (Both left the `sonnet` roster
+above at that item; the roster is corrected here rather than left to disagree
+with the charters.)
 
 Declaring **`opus`** — the seat's own output *is* the gate, so no cheaper tier
-is admissible under rule 3: `architecture-reviewer`.
+is admissible under rule 3: `architecture-reviewer`, and — since
+temperloop#2179 — `shell-reviewer` and `python-reviewer` (§ B3).
 
 This seat was a **justified inherit** until temperloop#1456, which found the
 justification and the mechanism disagreeing: the seat's own charter said it is
@@ -129,7 +136,7 @@ hypothesis that `/workshop` had "NO tier control of any kind" was wrong, and
 the corrected picture routes its cost question to fan-out width rather than to
 a tier lever.
 
-### B3. `python-reviewer` / `shell-reviewer` — was silent inherit, now justified
+### B3. `python-reviewer` / `shell-reviewer` — silent inherit, then justified, now pinned
 
 Both declared `model: inherit` while their five sibling language reviewers
 declared `sonnet`, with **no stated reason for the divergence** — the textbook
@@ -146,7 +153,8 @@ entries for languages this repo does not itself ship. A false negative in a
 kernel-native reviewer ships a defect into the pipeline itself, and no second
 reviewer stands behind it. The justification is now written at both seats.
 
-**Open, since temperloop#1456: is that justification enough on its own?** It
+**Was open, temperloop#1456 → #2179 (closed at the end of this section): is
+that justification enough on its own?** It
 is the same "no second reviewer stands behind it" argument
 `architecture-reviewer` ran on, and there it turned out to argue for a
 *declared* tier rather than an inherited one — a caller can be a cheap
@@ -182,10 +190,40 @@ reviewer-routing.tsv` routes `.sh`, `**/Makefile` and `**/build-level.mjs` to
 kernel's own machinery, not dormant files awaiting an adopter. The "somebody
 else's spend" framing that justified leaving them as-is was therefore resting
 on a factual error about where they run. The open question this section raises
-is unchanged and still open — whether a **pin** is owed where `inherit` only
-buys parity with the caller — but it should be re-argued on the correct
-premise, and it applies to `shell-reviewer`/`python-reviewer` for the same
+was unchanged and still open at that point — whether a **pin** is owed where
+`inherit` only buys parity with the caller — but it needed re-arguing on the
+correct premise, and it applies to `shell-reviewer`/`python-reviewer` for the same
 reason it now applies to `typescript-reviewer`.
+
+**CLOSED (temperloop#2179) — both seats are pinned to `opus`.** Re-argued on
+the corrected premise, the open question above resolves in one direction. The
+"somebody else's spend" objection was the only thing holding the pin back, and
+it rested on the factual error the update above corrects: these are live §3e
+seats in this repo, routed by `workflows/scripts/config/reviewer-routing.tsv`
+(`.sh`, `**/Makefile` and `**/build-level.mjs` → `shell-reviewer`; `.py` →
+`python-reviewer`), gating this repo's own machinery — `**/build-level.mjs` is
+the `/build` engine itself. A seat reviewing the pipeline's own engine is the
+least plausible candidate for spend that belongs to someone else.
+
+With that objection gone, what remains is the B2 argument unchanged: `inherit`
+buys **parity with the caller**, never a floor, so an autonomous or mechanical
+drive on a cheap tier down-tiers the seat silently — and the seat's own charter
+already claimed the stronger position ("no second reviewer stands behind it"),
+which only a declared tier can deliver. The live evidence is direct rather than
+hypothetical: in two consecutive §3e passes `shell-reviewer` ran as
+`claude-opus-5[1m]` while `docs-reviewer` ran as `claude-sonnet-5` — strong
+only because the driving session happened to be strong. Right by accident; the
+pin makes it right by construction.
+
+Note the direction of the fix, exactly as in § B2: the seats' *intent* was
+authoritative and the mechanism was corrected to match it — the tier moved from
+caller-dependent to declared, not from cheap to strong. `typescript-reviewer`
+is deliberately **not** swept along: its `inherit` rests on temperloop#2132's
+gate-bearing argument with a paired measurement parked to temperloop#2134, not
+on the "no second reviewer" argument these two and `architecture-reviewer`
+share. The pin is asserted mechanically by
+`workflows/scripts/tests/test_reviewer_seat_tiers.sh` (case 6), so it cannot
+drift back silently.
 
 ## C. Headless `claude -p` seats under `bin/` — the find
 

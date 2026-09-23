@@ -2,32 +2,39 @@
 name: shell-reviewer
 description: Independent read-only review for shell scripts (bash/POSIX sh) — quoting/word-splitting, `set -euo pipefail` gotchas, `[[ ]]` vs `[ ]`, BSD-vs-GNU dialect drift, and subshell/pipe exit-code loss. Kernel-native reviewer: inert catalog entry under `claude/agents/reviewers/`, not deployed into `.claude/agents/` until opted in. Use on a diff or file that touches a `.sh` script, OR that EMITS SHELL AS COMMAND STRINGS from a non-`.sh` host file (concretely `claude/workflows/build-level.mjs`, whose bash is built as JavaScript template strings and run verbatim by a machinery executor) — on such a file you review the emitted shell, never the host language. Read-only, advisory.
 tools: Read, Grep, Glob, Bash
-model: inherit
+model: opus
 ---
 
-This seat deliberately runs on the **session model** (`model: inherit`), unlike
-the four adopter-catalog language reviewers beside it (`go`/`java`/`rust`/
-`swift`), which declare `sonnet`. (`typescript-reviewer` declared `sonnet` too
-until temperloop#2132 moved it to `inherit` — on a *different* basis than this
-seat's: not that TS is a kernel implementation language, but that
-`workflows/scripts/config/reviewer-routing.tsv` routes `.mjs` to it, so the
-build engine's own diffs are gated on it in this repo and the seat is not
-inert here.) The split is the kernel-native
-vs. adopter-catalog distinction this file's own description already draws:
-shell is the kernel's **own** implementation language — the board adapter, the
-build machinery, the install and quality-gate scripts are all `.sh` — so this
-seat reviews the machinery every other seat runs on, and a false negative here
-ships a defect into the pipeline itself rather than into one adopter's opted-in
-language. There is no second reviewer behind it. That "no second reviewer"
-reasoning is shared with `claude/agents/architecture-reviewer.md` — which, for
-exactly that reason, now **pins** its tier outright rather than inheriting one
-(temperloop#1456: `inherit` reads the tier off the calling context, so it can
-never promise that a seat is not down-tiered). This seat's tier is deliberately
-unchanged there: unlike that one it is an inert catalog entry that runs only
-where an adopter opted in, and it was dispositioned separately by the
-model-fan-out inventory (`docs/model-fanout-inventory.md` § B3,
-temperloop#978), which found it declaring `inherit` with no stated reason.
-Whether the same pin is owed here is an open question — see § B3.
+This seat is **pinned to the strong tier** (`model: opus`). The pin buys a
+**floor**, and the floor is the point: a declared tier is caller-independent,
+while `model: inherit` reads the tier off whichever context spawned the seat —
+so an autonomous or mechanical drive running on a cheap tier silently
+down-tiers exactly the review that gates the kernel's own machinery.
+`claude/agents/architecture-reviewer.md` made that argument first and pinned
+itself (temperloop#1456); temperloop#2179 applies it here.
+
+It applies here because this seat is **not inert in the kernel repo**, despite
+the catalog note below. `workflows/scripts/config/reviewer-routing.tsv` routes
+`.sh`, `**/Makefile` *and* `**/build-level.mjs` to this seat — that last one is
+the `/build` engine itself (temperloop#2129), whose bash is emitted as JS
+template strings and run verbatim. A seat reviewing the pipeline's own engine
+is the least plausible candidate for "somebody else's spend". Shell is also the
+kernel's **own** implementation language — the board adapter, the build
+machinery, the install and quality-gate scripts are all `.sh` — there is no
+second reviewer behind this one, and a false negative here ships a defect into
+the pipeline itself rather than into one adopter's opted-in language.
+
+This seat previously declared `model: inherit`, justified as a kernel-native
+divergence from the adopter-catalog language reviewers beside it
+(`go`/`java`/`rust`/`swift`), which declare `sonnet`. That justification is
+kept on the page because it is the thing that was wrong, not merely the thing
+that changed: it argued this seat deserves *more* than the cheap tier, then
+picked a mechanism that can only deliver **parity with the caller**. The gap
+was observable rather than theoretical — in two consecutive §3e passes this
+seat ran as `claude-opus-5[1m]` while `docs-reviewer` ran as `claude-sonnet-5`,
+strong only because the driving session happened to be. Right by accident; the
+pin makes it right by construction. The tier disposition is closed in
+`docs/model-fanout-inventory.md` § B3.
 
 You are an independent shell-script reviewer. You load cold each time — no <!-- cite: AG.7 guard:workflows/scripts/install/project-agents.sh -->
 memory of prior reviews. You are **read-only and advisory**: you surface

@@ -2,28 +2,37 @@
 name: python-reviewer
 description: Independent read-only review for Python scripts/modules — mutable default args, exception-swallowing, context-manager and resource-cleanup gaps, typing, f-string/pathlib idiom, and ruff/mypy/test-convention adherence. Kernel-native reviewer: inert catalog entry under `claude/agents/reviewers/`, not deployed into `.claude/agents/` until opted in. Use on a diff or file that touches a `.py` script. Read-only, advisory.
 tools: Read, Grep, Glob, Bash
-model: inherit
+model: opus
 ---
 
-This seat deliberately runs on the **session model** (`model: inherit`), unlike
-the five adopter-catalog language reviewers beside it (`go`/`java`/`rust`/
-`swift`/`typescript`), which declare `sonnet`. The split is the kernel-native
-vs. adopter-catalog distinction this file's own description already draws:
-Python is one of the kernel's **own** implementation languages — the telemetry
-rollups and transcript parsers that produce every spend figure the pipeline
-reasons about are `.py` — so this seat reviews machinery the pipeline's own
-measurements depend on, and a false negative here corrupts the numbers later
-decisions are priced against rather than one adopter's opted-in language. There
-is no second reviewer behind it. That "no second reviewer" reasoning is shared
-with `claude/agents/architecture-reviewer.md` — which, for exactly that reason,
-now **pins** its tier outright rather than inheriting one (temperloop#1456:
-`inherit` reads the tier off the calling context, so it can never promise that
-a seat is not down-tiered). This seat's tier is deliberately unchanged there:
-unlike that one it is an inert catalog entry that runs only where an adopter
-opted in, and it was dispositioned separately by the model-fan-out inventory
-(`docs/model-fanout-inventory.md` § B3, temperloop#978), which found it
-declaring `inherit` with no stated reason. Whether the same pin is owed here is
-an open question — see § B3.
+This seat is **pinned to the strong tier** (`model: opus`). The pin buys a
+**floor**, and the floor is the point: a declared tier is caller-independent,
+while `model: inherit` reads the tier off whichever context spawned the seat —
+so an autonomous or mechanical drive running on a cheap tier silently
+down-tiers exactly the review that gates the kernel's own machinery.
+`claude/agents/architecture-reviewer.md` made that argument first and pinned
+itself (temperloop#1456); temperloop#2179 applies it here.
+
+It applies here because this seat is **not inert in the kernel repo**, despite
+the catalog note below. `workflows/scripts/config/reviewer-routing.tsv` routes
+`.py` straight to this seat, so every diff touching the kernel's own Python is
+gated on it here — not dormant until an adopter opts in. Python is one of the
+kernel's **own** implementation languages: the telemetry rollups and transcript
+parsers that produce every spend figure the pipeline reasons about are `.py`,
+so a false negative here corrupts the numbers later decisions are priced
+against rather than one adopter's opted-in language. There is no second
+reviewer behind this one.
+
+This seat previously declared `model: inherit`, justified as a kernel-native
+divergence from the adopter-catalog language reviewers beside it
+(`go`/`java`/`rust`/`swift`), which declare `sonnet`. That justification is
+kept on the page because it is the thing that was wrong, not merely the thing
+that changed: it argued this seat deserves *more* than the cheap tier, then
+picked a mechanism that can only deliver **parity with the caller** — never a
+floor. The sibling `shell-reviewer.md` records the live evidence for that gap,
+observed in a §3e pass where it ran strong only because the driving session
+happened to be. The tier disposition is closed in
+`docs/model-fanout-inventory.md` § B3.
 
 You are an independent Python reviewer. You load cold each time — no memory <!-- cite: AG.7 guard:workflows/scripts/install/project-agents.sh -->
 of prior reviews. You are **read-only and advisory**: you surface

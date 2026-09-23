@@ -36,6 +36,13 @@
 #      to declare. That is case 2's doc-vs-mechanism property applied to the
 #      seats this item moved: the same disagreement, in mirror image, is
 #      exactly what an edit to one half and not the other would recreate.
+#   6. The two KERNEL-NATIVE catalog seats temperloop#2179 pinned —
+#      `shell-reviewer` and `python-reviewer` — declare `model: opus`, AND each
+#      charter's prose states that pin rather than still arguing for the
+#      `inherit` it used to declare. Case 2's doc-vs-mechanism property again,
+#      on the seats this item moved. The `opus` half is asserted specifically,
+#      not merely not-inherit: a pin is only a FLOOR if it names a tier, and
+#      case 5's siblings show `inherit` is a live, deliberate alternative here.
 #
 # WHY CASE 4 ANCHORS ON THE FUNCTION, NOT ON ONE SPAWN SITE INSIDE IT. It
 # originally located the spawn by its `for (const route of routes)` loop header.
@@ -48,15 +55,18 @@
 # locator is the function's own declaration line and its closing brace, which no
 # internal restructure changes.
 #
-# Scope: the seats /build §3e routes, PLUS `claude/agents/reviewers/
-# typescript-reviewer.md` (temperloop#2132). The rest of the
-# `claude/agents/reviewers/**` language catalog stays deliberately NOT covered
-# — those seats are inert, opted-in per adopter repo, and their tiers were
-# dispositioned separately (docs/model-fanout-inventory.md § B3).
-# `typescript-reviewer` is the exception because it is NOT inert here:
-# `workflows/scripts/config/reviewer-routing.tsv` routes `.ts`/`.js`/`.mjs`
-# straight to it, so every diff touching the build engine itself is gated on
-# that seat in THIS repo, not only in an adopter's.
+# Scope: the seats /build §3e routes, PLUS the `claude/agents/reviewers/`
+# catalog entries that are NOT inert in this repo — `typescript-reviewer`
+# (temperloop#2132), `shell-reviewer` and `python-reviewer` (temperloop#2179).
+# The rest of the `claude/agents/reviewers/**` language catalog
+# (`go`/`java`/`rust`/`swift`) stays deliberately NOT covered: those seats are
+# genuinely inert, opted-in per adopter repo, and route no extension this repo
+# ships. The three exceptions are exceptions for one reason:
+# `workflows/scripts/config/reviewer-routing.tsv` routes `.ts`/`.js`/`.mjs` to
+# typescript-reviewer, `.sh`/`**/Makefile`/`**/build-level.mjs` to
+# shell-reviewer and `.py` to python-reviewer — so each gates the kernel's own
+# machinery in THIS repo, not only in an adopter's
+# (docs/model-fanout-inventory.md § B3).
 #
 # No network, no HOME mutation, no tmpdir: every assertion reads a tracked file.
 #
@@ -218,5 +228,42 @@ for charter in $INHERIT_SEATS; do
   fi
 done
 pass "5: workflow-reviewer and typescript-reviewer declare model: inherit, and their prose states that tier"
+
+# ---------------------------------------------------------------------------
+# Test 6: the two kernel-native catalog seats are PINNED to `opus`, and say so.
+#
+# temperloop#2179 moved `shell-reviewer` and `python-reviewer` off `model:
+# inherit` onto a declared `opus`. Both are live §3e seats in this repo —
+# reviewer-routing.tsv routes `.sh`, `**/Makefile` and `**/build-level.mjs`
+# (the /build engine itself) to the first, `.py` to the second — so the
+# "somebody else's spend" objection that once justified leaving them on
+# `inherit` does not hold: they gate this repo's own machinery, and no second
+# reviewer stands behind either.
+#
+# Why the specific tier and not just "not inherit": `inherit` buys parity with
+# the caller, a pin buys a FLOOR, and case 5 proves `inherit` is a live,
+# deliberate choice for other seats here. Asserting only not-inherit would let
+# these two land on `sonnet` and still pass — the opposite of the guarantee.
+#
+# The prose half is case 2's property once more. Each charter carried a
+# paragraph arguing FOR `inherit`; moving the frontmatter and leaving that
+# paragraph standing would recreate temperloop#1456's doc-vs-mechanism
+# disagreement at the very seats this item exists to fix.
+# ---------------------------------------------------------------------------
+PINNED_SEATS="${AGENTS_DIR}/reviewers/shell-reviewer.md ${AGENTS_DIR}/reviewers/python-reviewer.md"
+for charter in $PINNED_SEATS; do
+  seat="$(basename "$charter" .md)"
+  [ -f "$charter" ] || fail "6: charter not found at $charter"
+  got="$(frontmatter_model "$charter")"
+  if [ "$got" = "inherit" ]; then
+    fail "6: ${seat} declares 'model: inherit' — this seat gates the kernel's own machinery via reviewer-routing.tsv, so an autonomous drive on \$PIPELINE_DRIVE_MODEL would silently down-tier it. It is pinned; declare 'opus' (temperloop#2179)."
+  fi
+  [ "$got" = "opus" ] || fail "6: ${seat} declares 'model: ${got:-<none>}', expected 'opus' — a pin is only a FLOOR if it names a tier, and this seat's charter promises one (temperloop#2179)."
+  grep -qF '`model: opus`' "$charter" || fail "6: ${seat}.md declares 'model: opus' in frontmatter but its prose never states that tier — the charter must name the tier it actually runs on (temperloop#2179, the temperloop#1456 property again)"
+  if grep -q 'runs on the \*\*session model\*\*' "$charter"; then
+    fail "6: ${seat}.md's prose still claims the seat runs on the session model while its frontmatter declares '${got}' — the doc and the mechanism disagree (temperloop#2179)"
+  fi
+done
+pass "6: shell-reviewer and python-reviewer pin model: opus, and their prose states that pin"
 
 echo "All reviewer seat-tier tests passed."
