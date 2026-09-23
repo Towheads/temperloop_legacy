@@ -4587,6 +4587,22 @@ async function judgeArms(item, dual, arms) {
   };
 }
 
+// ledgerDirFlag — the ledger DATA dir, pinned ABSOLUTELY at every call site
+// (temperloop#2119). dual-build-ledger.sh resolves its default from the
+// INVOKING CWD's git toplevel, which is right for a human running it inside
+// the repo being built and wrong for this driver: nothing in the emitted
+// command text sets or asserts the executor's cwd, and a linked worktree is
+// its OWN `git rev-parse --show-toplevel`. An executor sitting in
+// `<repo>.wt/<slug>` would therefore land rows.jsonl, archives/*.patch and
+// calibration-pairs.jsonl inside a directory `git worktree remove` destroys —
+// including the archive archiveLosingArm exists to preserve — and
+// readCalibrationStatus would read an empty calibration and fail closed to the
+// modal-confirm arm. Every other path in these commands (`git -C ${wt}`,
+// ${repoRoot}) is already absolute for exactly this reason; the ledger is not
+// an exception. The script's cwd default stays correct for humans; the
+// machinery's target is explicit.
+const ledgerDirFlag = () => `--dir ${sq(`${input.repoRoot}/.temperloop/model-comparison/dual-build`)}`;
+
 // appendDualBuildRows — the ledger write (temperloop#2072). — see build-level.design-notes-4.md#appenddualbuildrows-the-ledger-write-temperloop-2072
 async function appendDualBuildRows(item, dual, rows, labelHint) {
   if (rows.length === 0) return { appended: 0, rejected: 0, unavailable: false };
@@ -4605,7 +4621,7 @@ async function appendDualBuildRows(item, dual, rows, labelHint) {
       `__row=$(printf %s ${sq(row)} | jq -c --argjson ca "$__ca" --arg hs "$__hs" --arg mv "$__mv" '.cross_read_attempted=$ca | .head_sha=$hs | .machinery_version=$mv')`,
       'if [ -z "$__row" ]; then',
       `printf '{"outcome":"ROW_REJECTED","arm":"%s","reason":"row could not be assembled"}\\n' ${sq(arm)}`,
-      'elif bash "$__led" append --row "$__row" >/dev/null 2>&1; then',
+      `elif bash "$__led" append ${ledgerDirFlag()} --row "$__row" >/dev/null 2>&1; then`,
       `printf '{"outcome":"ROW_APPENDED","arm":"%s"}\\n' ${sq(arm)}`,
       'else',
       `printf '{"outcome":"ROW_REJECTED","arm":"%s","reason":"dual-build-ledger.sh append refused the row"}\\n' ${sq(arm)}`,
@@ -4908,7 +4924,7 @@ async function readCalibrationStatus() {
     // reason: `$?` after a pipeline reports the LAST command's status, so a
     // piped read would structurally report 0 and a refusal would be recorded
     // as a verdict.
-    '__c=$(bash "$__led" calibrate-status 2>/dev/null); __cr=$?',
+    `__c=$(bash "$__led" calibrate-status ${ledgerDirFlag()} 2>/dev/null); __cr=$?`,
     'if [ "$__cr" -eq 0 ] && [ -n "$__c" ]; then',
     '__cj=$(printf %s "$__c" | jq -c . 2>/dev/null)',
     'if [ -n "$__cj" ]; then',
@@ -5003,7 +5019,7 @@ async function recordOverrideCalibrationPair(slug, arm, reason) {
     `__led=${ledgerBin}`,
     'if [ ! -f "$__led" ]; then',
     `printf '{"outcome":"CALIBRATION_PAIR_UNAVAILABLE","reason":"seam-absent"}\\n'`,
-    `elif bash "$__led" calibrate-record --slug ${sq(slug)} --preference ${sq(arm)} --reason ${sq(reason)} --source override >/dev/null 2>&1; then`,
+    `elif bash "$__led" calibrate-record ${ledgerDirFlag()} --slug ${sq(slug)} --preference ${sq(arm)} --reason ${sq(reason)} --source override >/dev/null 2>&1; then`,
     `printf '{"outcome":"CALIBRATION_PAIR_RECORDED"}\\n'`,
     'else',
     `printf '{"outcome":"CALIBRATION_PAIR_REFUSED","reason":"calibrate-record refused the pair"}\\n'`,
@@ -5111,9 +5127,9 @@ async function archiveLosingArm(slug, loser) {
       : `__p=""; __pr=1`,
     'if [ "$__pr" -ne 0 ] || [ -z "$__p" ]; then',
     `printf '{"outcome":"LOSER_KEPT","reason":"no-patch-to-archive"}\\n'`,
-    `elif ! printf '%s\\n' "$__p" | bash "$__led" archive ${sq(slug)} ${sq(loser.arm)} --from - >/dev/null 2>&1; then`,
+    `elif ! printf '%s\\n' "$__p" | bash "$__led" archive ${sq(slug)} ${sq(loser.arm)} ${ledgerDirFlag()} --from - >/dev/null 2>&1; then`,
     `printf '{"outcome":"LOSER_KEPT","reason":"archive-refused"}\\n'`,
-    `elif ! bash "$__led" archive-check ${sq(slug)} ${sq(loser.arm)} --repo ${repoRoot} >/dev/null 2>&1; then`,
+    `elif ! bash "$__led" archive-check ${sq(slug)} ${sq(loser.arm)} ${ledgerDirFlag()} --repo ${repoRoot} >/dev/null 2>&1; then`,
     `printf '{"outcome":"LOSER_KEPT","reason":"archive-check-failed"}\\n'`,
     'else',
     // archive-check PASSED — the patch applies, so the branch is now redundant.

@@ -554,6 +554,40 @@ machinery-version bump. A `git format-patch` archive per (item, arm) sits
 beside it, so a losing arm's full diff is preserved — unshipped, never lost —
 until `dual-build purge`/`prune` reclaims it.
 
+**Which repo's ledger — data follows cwd, settings follow `$0`
+(temperloop#2119).** `dual-build-ledger.sh` resolves two things two different
+ways, on purpose. Its **settings** (`build.config.sh`) climb from the
+script's own on-disk location, so they always come from the kernel checkout
+and an adopter cannot fork them (the temperloop#980 boundary). Its **data** —
+`rows.jsonl`, `archives/`, `calibration-pairs.jsonl`, `calibration.json`, and
+`archive-check`'s default `--repo` — resolves from `git rev-parse
+--show-toplevel` of the **cwd**, i.e. the repo actually being built, matching
+`report.contract.md`'s "invoked with cwd = the target repo" invariant that the
+read-side producer already followed. Until #2119 the data followed the
+settings climb, so an adopter's rows landed in the *kernel's* `.temperloop/`
+and two repos dual-building on one host silently shared a single ledger; an
+adopter now sees an honest **empty** ledger under its own heading instead of
+the kernel's numbers. A cwd outside any checkout is refused by name rather
+than falling back. Each row also carries an additive, optional **`repo`**
+field (the absolute toplevel it was appended from), so a ledger that a shared
+explicit `DUAL_BUILD_LEDGER_DIR` still mixes can be split by repo rather than
+discarded; pre-#2119 rows carry no `repo` and every reader treats it as
+optional.
+
+The cwd default is for a **human** running the script inside the repo being
+built. The **machinery never relies on it**: every `dual-build-ledger.sh`
+command `claude/workflows/build-level.mjs` emits carries an explicit absolute
+`--dir` rooted at the driven repo root, because nothing in an emitted command
+sets the executor's cwd and a linked worktree is its own `git rev-parse
+--show-toplevel` — an unpinned invocation from `<repo>.wt/<slug>` would write
+the rows and the losing arm's only archived patch into a directory
+`git worktree remove` then deletes. `test_workflow.sh`'s K2119 case (plus a
+static scan of every call site) holds that pin. One consequence for
+hand-invocation: `archive-check`'s `--repo` default is data too, so
+`archive-check <slug> <arm> --dir DIR` from **outside** any checkout now
+refuses by name instead of test-applying against the kernel checkout — pass
+`--repo PATH`, or run it from inside the repo being checked.
+
 **Level pick and the two operator levers.** Once every in-scope item is
 judged, the arm with more item wins ships the level: a gate failure counts
 as a loss for that arm on that item, a judged tie counts for neither arm, and

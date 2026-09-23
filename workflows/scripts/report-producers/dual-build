@@ -111,11 +111,14 @@
 # rate, cost totals and verdict under the adopter's own heading — exactly
 # the "wrong corpus" class report.contract.md warns against. The sibling
 # `tokens` producer solves the analogous problem with the same
-# `git rev-parse --show-toplevel` idiom. `dual-build-ledger.sh`'s own
-# LEDGER_DIR still climbs from $0 (filed separately as temperloop#2119) —
-# this file's fix is READ-side only; a caller wanting a specific repo's
-# ledger regardless of cwd still passes DUAL_BUILD_LEDGER_DIR explicitly,
-# exactly as `/build --dual-build` already does.
+# `git rev-parse --show-toplevel` idiom. Since temperloop#2119 the WRITE
+# side agrees: `dual-build-ledger.sh`'s own LEDGER_DIR resolves from the
+# cwd's git toplevel through the identical `git -C "$PWD" rev-parse
+# --show-toplevel` call, so writer and reader now name the same ledger for
+# the same repo (before #2119 the writer climbed from $0 to the kernel
+# checkout while this reader already looked in the adopter — the two halves
+# disagreed). A caller wanting a specific repo's ledger regardless of cwd
+# still passes DUAL_BUILD_LEDGER_DIR explicitly, which both halves honour.
 #
 # ── EGRESS: none. Local file reads (the ledger) plus subprocess calls to
 # sibling scripts in this same checkout (dual-build-ledger.sh, stats.sh).
