@@ -37,6 +37,9 @@
 #         network) — a throwaway repo with a known user.email and origin
 #         proves both fields
 #   22    stdin items-file (`--items-file -`)
+#   23-28 --judge-model (temperloop#2203): given -> rides .judge_model,
+#         .dualBuild.judgeModel and the consent line; absent -> null field,
+#         NO judgeModel key, byte-identical consent line; empty -> refused
 #
 # Usage: bash workflows/scripts/build/tests/test_dual_build_preflight.sh
 
@@ -306,6 +309,85 @@ echo "--- 22: --items-file - reads stdin ---"
 count
 v="$(printf '%s' "$ITEMS_MIXED" | env DUAL_BUILD_MIN_INSCOPE_ITEMS=2 bash "$DBP" --tier sonnet --items-file - --baseline x --candidate y --execution recorded)"
 [ "$(field "$v" .in_scope_n)" = "3" ] && ok "--items-file - reads the level's items from stdin" || fail "stdin: $(field "$v" .in_scope_n)"
+
+# ── 23-28: --judge-model (temperloop#2203) ───────────────────────────────────
+# The per-run pairwise-judge seam. Every input state is asserted: GIVEN (the id
+# rides `dualBuild.judgeModel`, the top-level `judge_model` field and the
+# consent line), ABSENT (no key at all — the object is byte-identical to the
+# pre-#2203 one, which is what keeps a caller that never passes the flag from
+# regressing), EMPTY and WHITESPACE-ONLY (both refused loudly, never read as
+# absent — the two must agree, because build-level.mjs's own `str()` trims and
+# a gate that did not would refuse them in different places), and PADDED-BUT-
+# REAL (accepted — the control that keeps the two refusals from being satisfied
+# by a gate that simply refuses every value it is given).
+echo "--- 23-28: --judge-model per-run pairwise judge ---"
+
+# run_judge <items-json> <judge-model-args…> — run() plus arbitrary extra SUT
+# flags (run() itself takes only env assignments).
+run_judge() {
+  local items="$1"; shift
+  local f="$WORK/items-judge-$$-$RANDOM.json"
+  write_items "$f" "$items"
+  env DUAL_BUILD_MIN_INSCOPE_ITEMS=2 \
+    bash "$DBP" --tier sonnet --items-file "$f" --baseline claude-opus-4-8 \
+      --candidate claude-sonnet-5 --execution recorded "$@"
+}
+
+# 23: GIVEN — the value reaches the emitted object AND the top-level field.
+count; v="$(run_judge "$ITEMS_MIXED" --judge-model claude-haiku-9)"
+[ "$(field "$v" .judge_model)" = "claude-haiku-9" ] \
+  && [ "$(field "$v" .dualBuild.judgeModel)" = "claude-haiku-9" ] \
+  && ok "--judge-model rides both .judge_model and .dualBuild.judgeModel" \
+  || fail "judge-model given: judge_model=$(field "$v" .judge_model) dualBuild=$(field "$v" .dualBuild)"
+
+# 24: GIVEN — the consent prompt discloses the instrument. Without this the
+# operator consents to a spend without being told which judge reads the arms.
+count; printf '%s' "$v" | jq -e '.cumulative_spend_line | test("Pairwise judge for this run: claude-haiku-9")' >/dev/null \
+  && ok "the judge identity is named on cumulative_spend_line (the consent prompt)" \
+  || fail "consent line omits the judge: $(field "$v" .cumulative_spend_line)"
+
+# 25: ABSENT — no key at all, null field, and a spend line byte-identical to
+# the flag-less one. THE regression guard for the no-override path.
+count; v_abs="$(run_judge "$ITEMS_MIXED")"
+v_plain="$(run "$ITEMS_MIXED")"
+[ "$(field "$v_abs" .judge_model)" = "null" ] \
+  && [ "$(field "$v_abs" '.dualBuild | has("judgeModel")')" = "false" ] \
+  && [ "$(field "$v_abs" '.dualBuild | keys | sort | join(",")')" = "baseline,candidate,inScope,tier" ] \
+  && [ "$(field "$v_abs" .cumulative_spend_line)" = "$(field "$v_plain" .cumulative_spend_line)" ] \
+  && ok "no --judge-model: judge_model null, NO judgeModel key, consent line unchanged" \
+  || fail "judge-model absent: judge_model=$(field "$v_abs" .judge_model) dualBuild=$(field "$v_abs" .dualBuild)"
+
+# 26: EMPTY — refused loudly (CANNOT_EVALUATE, non-zero), never silently read
+# as absent. A run that named a judge and got the host default instead is
+# indistinguishable afterwards from one that never named one.
+count; rc=0; v="$(run_judge "$ITEMS_MIXED" --judge-model "")" || rc=$?
+[ "$(field "$v" .outcome)" = "CANNOT_EVALUATE" ] && [ "$rc" -ne 0 ] \
+  && printf '%s' "$v" | jq -e '.error | test("--judge-model")' >/dev/null \
+  && ok "an EMPTY --judge-model is refused (CANNOT_EVALUATE, non-zero), not read as absent" \
+  || fail "empty judge-model: outcome=$(field "$v" .outcome) rc=$rc"
+
+# 27: WHITESPACE-ONLY — refused on exactly the same terms as case 26, because
+# the consumer refuses it too. build-level.mjs's `str()` TRIMS before testing,
+# so an untrimmed test here would let '   ' clear this pre-flight and the
+# ask-now consent gate — with the judge's name rendering as blank space on the
+# spend line the operator consents to — and only then be refused at drive time
+# with dual-build-input-invalid. That late refusal is precisely what moving the
+# check forward to the pre-flight exists to prevent, so the two validators must
+# agree on all three input states, not two of them.
+count; rc=0; v="$(run_judge "$ITEMS_MIXED" --judge-model "   ")" || rc=$?
+[ "$(field "$v" .outcome)" = "CANNOT_EVALUATE" ] && [ "$rc" -ne 0 ] \
+  && printf '%s' "$v" | jq -e '.error | test("--judge-model")' >/dev/null \
+  && ok "a WHITESPACE-ONLY --judge-model is refused too — the shell gate trims, matching build-level.mjs's str()" \
+  || fail "whitespace judge-model: outcome=$(field "$v" .outcome) rc=$rc"
+
+# 28: the CONTROL for 26-27 — a judge model that is merely SURROUNDED by
+# whitespace is a real value, not an empty one, and must still be ACCEPTED.
+# Without this, cases 26-27 are equally satisfied by a gate that refuses every
+# --judge-model it is given (temperloop#1706: an assertion that cannot fail).
+count; v="$(run_judge "$ITEMS_MIXED" --judge-model " claude-haiku-9 ")"
+[ "$(field "$v" .outcome)" = "PREFLIGHT" ] \
+  && ok "a padded but non-empty --judge-model is ACCEPTED (the control: the gate does not refuse everything)" \
+  || fail "padded judge-model should be accepted: outcome=$(field "$v" .outcome) judge_model=$(field "$v" .judge_model)"
 
 echo
 echo "test_dual_build_preflight: pass=$pass/$total"

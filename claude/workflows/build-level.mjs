@@ -4467,7 +4467,7 @@ function dualBuildInput() {
   const d = input.dualBuild;
   if (d == null) return null;
   if (typeof d !== 'object' || Array.isArray(d)) {
-    return { invalid: 'dualBuild must be an object { tier, baseline, candidate, inScope: [slug…] }' };
+    return { invalid: 'dualBuild must be an object { tier, baseline, candidate, inScope: [slug…] } (optional: judgeModel)' };
   }
   const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '');
   const tier = str(d.tier);
@@ -4483,6 +4483,20 @@ function dualBuildInput() {
   if (missing.length > 0) {
     return { invalid: `dualBuild is missing or empty: ${missing.join(', ')}` };
   }
+  // judgeModel (temperloop#2203) — the ONLY optional key: absent means judge.sh
+  // resolves its own MODEL_COMPARISON_JUDGE_MODEL default and the emitted
+  // command stays byte-identical to the pre-#2203 one. PRESENT-but-unusable is
+  // refused, not silently dropped, for the same reason the four required keys
+  // are: a run that asked to judge under a named instrument and quietly judged
+  // under the host's default is indistinguishable from one that got its wish.
+  const judgeModel = str(d.judgeModel);
+  if (d.judgeModel != null && !judgeModel) {
+    return {
+      invalid:
+        'dualBuild.judgeModel is present but not a non-empty string — pass a judge model id, ' +
+        "or omit the key entirely to judge under judge.sh's own default",
+    };
+  }
   if (baseline === candidate) {
     // Not refused — an A/A instrument check (both arms the same model, the — see build-level.design-notes-4.md#not-refused-an-a-a-instrument-check-both-arms-the-same-
     log(
@@ -4490,7 +4504,14 @@ function dualBuildInput() {
         'check, not a candidate-vs-baseline comparison. No arm difference it reports is a model difference.',
     );
   }
-  return { tier, baseline, candidate, inScope: new Set(inScope), inScopeList: inScope };
+  return {
+    tier,
+    baseline,
+    candidate,
+    judgeModel: judgeModel || null,
+    inScope: new Set(inScope),
+    inScopeList: inScope,
+  };
 }
 
 // dualBuildResidueGuard — wrap the worktree-create command in the flag-less
@@ -4736,6 +4757,10 @@ async function judgeArms(item, dual, arms) {
   });
   const diffCmd = (arm) =>
     `git -C ${sq(arm.wt)} diff ${sq(arm.wtBase || 'HEAD')}..HEAD 2>/dev/null | head -c 200000`;
+  // temperloop#2203 — the per-run judge model. EMPTY unless the run named one,
+  // so an unset judgeModel emits the exact byte sequence this call site emitted
+  // before the seam existed; judge.sh then resolves its own default.
+  const judgeModelArg = dual.judgeModel ? ` --model ${sq(dual.judgeModel)}` : '';
   const cmd = [
     `__mc=${sq(mcDir)}`,
     'if [ ! -f "$__mc/judge.sh" ]; then',
@@ -4748,7 +4773,7 @@ async function judgeArms(item, dual, arms) {
     `printf %s ${sq(recordFor(a))} | jq -c --arg d "$(${diffCmd(a)})" '.score.diff.text_excerpt=$d' > "$__jd/a.json"`,
     `printf %s ${sq(recordFor(b))} | jq -c --arg d "$(${diffCmd(b)})" '.score.diff.text_excerpt=$d' > "$__jd/b.json"`,
     // THE VERDICT IS READ UN-PIPED (temperloop#2080 round-2 review [HIGH]), — see build-level.design-notes-4.md#the-verdict-is-read-un-piped-temperloop-2080-round-2-review-
-    `__jo=$(bash "$__mc/judge.sh" pairwise --record-a "$__jd/a.json" --record-b "$__jd/b.json" --live --repo ${sq(input.ownerRepo ?? '')} 2>/dev/null); __jr=$?`,
+    `__jo=$(bash "$__mc/judge.sh" pairwise --record-a "$__jd/a.json" --record-b "$__jd/b.json" --live${judgeModelArg} --repo ${sq(input.ownerRepo ?? '')} 2>/dev/null); __jr=$?`,
     `__jo=$(printf '%s\\n' "$__jo" | tail -1)`,
     'rm -rf "$__jd"',
     // A non-JSON last line is a NAMED refusal, never interpolated: this prin — see build-level.design-notes-4.md#a-non-json-last-line-is-a-named-refusal-never-interpola
@@ -7414,7 +7439,7 @@ async function buildLevel() {
       escalate(item.slug, 'dual-build-input-invalid', {
         reason: dual.invalid,
         received: input.dualBuild,
-        remedy: 'pass dualBuild as { tier, baseline, candidate, inScope: [slug…] } (build.md Step 0/1 builds it from --dual-build via dual-build-preflight.sh), or drop the input entirely to build single-arm',
+        remedy: 'pass dualBuild as { tier, baseline, candidate, inScope: [slug…] } — plus the OPTIONAL judgeModel, omitted unless the run selects a pairwise judge — (build.md Step 0/1 builds it from --dual-build via dual-build-preflight.sh), or drop the input entirely to build single-arm',
       }),
     );
   } else if (dual) {
