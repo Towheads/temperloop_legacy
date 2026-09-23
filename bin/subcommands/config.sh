@@ -84,8 +84,11 @@
 # reach the output carrying a field or record separator of the format it is
 # being printed in. `\\` is escaped FIRST, so the encoding is unambiguous in
 # both directions: a value holding the two literal characters `\` + `n`
-# emits `\\n` and never round-trips back into a newline. A consumer that
-# wants the raw bytes reverses the three substitutions, innermost last.
+# emits `\\n`, distinct from the `\n` that encodes a real newline. A
+# consumer that wants the raw bytes DECODES WITH A SINGLE LEFT-TO-RIGHT
+# SCAN (see _config_list_unescape below) — no fixed order of three global
+# `${v//…}` substitutions inverts this encoding, because every order
+# rescans the second backslash of `\\n` and fabricates a newline.
 #
 # The same encoding is used INTERNALLY on the layer maps (see
 # _config_list_escape / _config_list_bulk_source / _config_list_index below),

@@ -35,9 +35,14 @@
 - **`config list` output now escapes backslash, TAB and newline in the
   `value` column** (#2218) — both `--format tsv` and `--format text`, for
   all five layers. This makes the documented "one row per line" contract
-  structural. A consumer that wants raw bytes reverses `\n` → newline,
-  `\t` → TAB, `\\` → backslash, in that order. No value in the current
-  registry contains any of the three, so today's output is byte-identical.
+  structural. A consumer that wants raw bytes decodes with a single
+  left-to-right scan, handling `\\`, `\t` and `\n` as each is encountered —
+  see `_config_list_unescape` in `bin/subcommands/config.sh`. A naive
+  sequence of three global substitutions is ambiguous in **every** order and
+  must not be used: each order turns the encoded `\\n` (a literal backslash
+  followed by the letter `n`) back into a newline the value never held. No
+  value in the current registry contains any of the three characters, so
+  today's output is byte-identical.
   Trailing newlines in a file-layer value are now preserved rather than
   eaten by the map's `$( )` capture, closing the "the parse is not
   lossless" caveat in the script's header.
