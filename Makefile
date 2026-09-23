@@ -131,20 +131,20 @@ test-board:
 # passed.
 test-build:
 	@echo "==> Running build toolkit tests..."
-	@bash $(BUILD_SRC)/bounded-suite.sh --label test-build -- \
+	@bash "$(BUILD_SRC)/bounded-suite.sh" --label test-build -- \
 		bash -c 'for t in "$$1"/tests/test_*.sh; do \
 			printf "%s\n" "$$(basename "$$t")" > "$${SUITE_PROGRESS_FILE:-/dev/null}"; \
 			if out="$$(bash "$$t" 2>&1)"; then echo "  [ok] $$(basename "$$t")"; else echo "  [FAIL] $$(basename "$$t")"; printf "%s\n" "$$out" | sed "s/^/      /"; exit 1; fi; \
-		done' _ $(BUILD_SRC)
+		done' _ "$(BUILD_SRC)"
 
 # Bounded exactly like test-build above (temperloop#2184). --case-source lets
 # the guard name the running case even for the suite's inline sections, which
 # announce nothing until they pass.
 test-build-workflow:
 	@echo "==> Running build-level.mjs offline harness..."
-	@bash $(BUILD_SRC)/bounded-suite.sh --label test-build-workflow \
-		--case-source $(BUILD_SRC)/tests/test_workflow.sh \
-		-- bash $(BUILD_SRC)/tests/test_workflow.sh
+	@bash "$(BUILD_SRC)/bounded-suite.sh" --label test-build-workflow \
+		--case-source "$(BUILD_SRC)/tests/test_workflow.sh" \
+		-- bash "$(BUILD_SRC)/tests/test_workflow.sh"
 
 # Glob-based, same rationale as test-board above (F#836): kernel coverage
 # can never trail whichever tests/test_*.sh files are actually vendored.

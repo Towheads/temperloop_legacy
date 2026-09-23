@@ -35,15 +35,26 @@
 #      the bound is a NAMED SETTING rather than a literal in the recipe, and
 #      test_workflow.sh still writes the progress breadcrumb. A node/shell
 #      behaviour case cannot see wiring that was deleted from the Makefile.
-#   9  SIGNAL PATH: interrupting the WRAPPER (SIGINT / SIGTERM) leaves NO
-#      surviving suite processes. `set -m` takes the suite out of make's
-#      foreground group, so a handler that merely exited would leave the tree
-#      running fully detached — this item's own defect class through a second
-#      door, and Ctrl-C would become WORSE than before the wrapper existed.
+#   9  SIGNAL PATH: interrupting the WRAPPER leaves NO surviving suite
+#      processes, for the FULL signal set the repo's own convention uses
+#      (sandbox.sh's EXIT/HUP/INT/TERM) plus QUIT: SIGHUP, SIGINT, SIGQUIT and
+#      SIGTERM, each with its own green arm AND its own RED arm. `set -m` takes
+#      the suite out of make's foreground group, so a handler that merely
+#      exited would leave the tree running fully detached — this item's own
+#      defect class through a second door, and the signal would become WORSE
+#      than before the wrapper existed. For an UNARMED signal it is worse
+#      again: bash's default disposition kills the wrapper, and the bound IS
+#      the wrapper's poll loop, so the unbounded forever-hang comes back.
 #  10  NO FLAKY EXIT: the exit-code handoff is atomic, so a green suite can
 #      never intermittently be reported non-zero. Shown, not asserted: a
 #      watcher races the file, and a mutant restoring the create-before-write
 #      ordering deterministically misreports a passing fixture as exit 1.
+#  11  REPORT HONESTY: the timeout report does not claim whole-group reaping on
+#      the SINGLE-PID fallback path (where $pgid was blanked and only the direct
+#      child was signalled). It says job control did not isolate the suite,
+#      names the one pid it killed, and sends the operator to `ps` — while the
+#      normal path still makes the strong claim, so the case cannot be passed by
+#      deleting the sentence.
 
 set -uo pipefail
 
@@ -397,9 +408,25 @@ sig_launch_and_signal() {
   return 0
 }
 
-for _sigspec in TERM:143 INT:130; do
+# THE SIGNAL SET IS THE REPO'S OWN CONVENTION, not a subset of it.
+# workflows/scripts/tests/lib/sandbox.sh installs EXIT/HUP/INT/TERM and says so
+# in its header; bounded-suite.sh arming only INT/TERM was a divergence with
+# teeth. SIGHUP is the live gap — closing a terminal or dropping an SSH session
+# hangs up the wrapper, and an UNARMED HUP kills it outright, which is strictly
+# WORSE than no wrapper at all on two counts: (a) `set -m` already moved the
+# suite out of make's foreground group, so it survives fully detached where a
+# pre-wrapper run would have died with the group, and (b) the bound IS this
+# wrapper's poll loop, so the 1800s guarantee dies with it and the run is back
+# to the unbounded forever-hang #2184 exists to fix. SIGQUIT (Ctrl-\) is the
+# same class at lower likelihood. Every signal gets its OWN green arm AND its
+# OWN red arm — kernel principle 1, every meaningful behaviour tested for every
+# state: a shared red arm would let a mis-spelled handler for one signal ride
+# in on another's proof.
+for _sigspec in HUP:129 INT:130 QUIT:131 TERM:143; do
   _signame="${_sigspec%%:*}"
   _sigcode="${_sigspec##*:}"
+
+  # GREEN arm — the shipped guard reaps the whole tree and exits 128+signal.
   sig_launch_and_signal "$GUARD" "$_signame"
   [ "$SIG_RC" -eq "$_sigcode" ] \
     || fail "9: the wrapper must exit $_sigcode on SIG$_signame (128+signal), got $SIG_RC"
@@ -409,23 +436,26 @@ for _sigspec in TERM:143 INT:130; do
   if kill -0 "$SIG_GC_PID" 2>/dev/null; then
     fail "9: SIG$_signame — the suite's GRANDCHILD (pid $SIG_GC_PID) survived the wrapper, i.e. an orphaned process tree — exactly what the ~50h incident left behind"
   fi
-done
 
-# RED arm: splice reap() back OUT of the TERM handler (the pre-fix shape) and
-# the very same probe must leave the tree alive. Without this, the GREEN arms
-# above would prove nothing — a fixture that happened to die on its own, or a
-# signal that propagated by some other route, would read identically.
-SIG_MUTANT="$TMPD/sig-mutant-guard.sh"
-sed "s/trap 'reap; cleanup; exit 143' TERM/trap 'cleanup; exit 143' TERM/" "$GUARD" > "$SIG_MUTANT"
-if diff -q "$GUARD" "$SIG_MUTANT" >/dev/null 2>&1; then
-  fail "9: RED-arm splice failed — the TERM handler was not found in its expected shape, so this discrimination proof is inert"
-fi
-sig_launch_and_signal "$SIG_MUTANT" TERM
-if ! kill -0 "$SIG_SELF_PID" 2>/dev/null && ! kill -0 "$SIG_GC_PID" 2>/dev/null; then
-  fail "9: RED arm — with reap() spliced out of the TERM handler the suite tree died ANYWAY, so something other than the handler is reaping it and the GREEN arms above prove nothing"
-fi
-kill -9 "$SIG_GC_PID" "$SIG_SELF_PID" 2>/dev/null
-pass "9 signal path: SIGINT and SIGTERM on the wrapper reap the suite's whole process group — the suite process AND its grandchild are both gone afterwards — and the wrapper exits 130/143; splice reap() out of the handler and the identical probe leaves both alive, so the green is produced by the handler and not by the fixture"
+  # RED arm — splice reap() back OUT of THIS signal's handler (the pre-fix
+  # shape) and the very same probe must leave the tree alive. Without it the
+  # green arm above would prove nothing: a fixture that happened to die on its
+  # own, or a signal that propagated by some other route, reads identically.
+  # Per-signal by construction — the handlers are four separate `trap` lines
+  # precisely so one can be neutralised without touching the other three.
+  SIG_MUTANT="$TMPD/sig-mutant-guard.$_signame.sh"
+  sed "s/trap 'reap; cleanup; exit $_sigcode' $_signame/trap 'cleanup; exit $_sigcode' $_signame/" \
+    "$GUARD" > "$SIG_MUTANT"
+  if diff -q "$GUARD" "$SIG_MUTANT" >/dev/null 2>&1; then
+    fail "9: RED-arm splice failed for SIG$_signame — no \`trap 'reap; cleanup; exit $_sigcode' $_signame\` line was found in the guard, so this signal is either unarmed or armed in an unexpected shape and its discrimination proof is inert"
+  fi
+  sig_launch_and_signal "$SIG_MUTANT" "$_signame"
+  if ! kill -0 "$SIG_SELF_PID" 2>/dev/null && ! kill -0 "$SIG_GC_PID" 2>/dev/null; then
+    fail "9: RED arm SIG$_signame — with reap() spliced out of the handler the suite tree died ANYWAY, so something other than the handler is reaping it and the green arm above proves nothing"
+  fi
+  kill -9 "$SIG_GC_PID" "$SIG_SELF_PID" 2>/dev/null
+done
+pass "9 signal path: SIGHUP, SIGINT, SIGQUIT and SIGTERM on the wrapper each reap the suite's whole process group — the suite process AND its grandchild are both gone afterwards — and the wrapper exits 129/130/131/143; for EACH signal, splicing reap() out of that one handler leaves both alive, so every green is produced by its own handler and not by the fixture"
 
 # ---------------------------------------------------------------------------
 # 10: NO FLAKY EXIT — the exit-code handoff has no create-before-write race
@@ -511,13 +541,72 @@ BUILD_SUITE_TIMEOUT_SECS=60 bash "$GUARD" --label racegreen -- bash "$TMPD/healt
 pass "10 no flaky exit: the exit-code handoff is an atomic rename, so \$RCF is never observable in a partial state ($rc_observations live observations, 0 partial) and 'wait' precedes the read as a second belt; restore the create-before-write ordering and the same passing fixture is misreported as exit 1"
 
 # ---------------------------------------------------------------------------
+# 11: the timeout report must not over-claim on the single-pid fallback
+# ---------------------------------------------------------------------------
+# reap() has TWO arms. With $pgid resolved it signals the whole process group
+# and nothing survives. When job control did NOT give the job its own group the
+# guard deliberately BLANKS $pgid (signalling the group would kill the wrapper,
+# and under a bare `make`, make itself), and reap() then signals only "$child" —
+# so every grandchild the suite forked IS STILL RUNNING. The report telling an
+# operator "nothing is left orphaned" on that path is worse than silence: the
+# fallback is precisely the case where they need to go look at `ps` themselves.
+#
+# Both arms are exercised. The fallback is reached by splicing the guard's own
+# safety condition to always-true — the honest way to reach a branch that a
+# working host's job control never takes.
+FB_MUTANT="$TMPD/fallback-guard.sh"
+sed 's/^if \[ -z "\$pgid" \] || \[ "\$pgid" = "\$self_pgid" \]; then/if true; then/' \
+  "$GUARD" > "$FB_MUTANT"
+if diff -q "$GUARD" "$FB_MUTANT" >/dev/null 2>&1; then
+  fail "11: splice failed — the guard's \$pgid safety fallback was not found in its expected shape, so the single-pid report arm is untested"
+fi
+
+FB_ERR="$TMPD/fallback.err"
+BUILD_SUITE_TIMEOUT_SECS=3 bash "$FB_MUTANT" --label fallbackdemo -- bash "$TMPD/hang.sh" \
+  >/dev/null 2>"$FB_ERR"
+# By construction this arm ORPHANS the fixture tree — that is the very thing the
+# report must confess to. Register the survivors so this test does not leak the
+# `sleep 300`s it deliberately provoked (the EXIT trap reaps STRAY_PIDS), and so
+# a `fail` below still cleans up.
+FB_GC_PID="$(cat "$GRANDCHILD_FILE" 2>/dev/null)"
+[ -n "$FB_GC_PID" ] && STRAY_PIDS+=("$FB_GC_PID")
+pkill -f "$TMPD/hang.sh" 2>/dev/null
+[ -n "$FB_GC_PID" ] && kill -9 "$FB_GC_PID" 2>/dev/null
+
+grep -q 'job control did NOT isolate' "$FB_ERR" \
+  || fail "11: on the single-pid fallback the report must SAY job control did not isolate the suite; stderr was: $(cat "$FB_ERR")"
+grep -q 'MAY STILL BE RUNNING' "$FB_ERR" \
+  || fail "11: on the single-pid fallback the report must warn that descendants may have survived and tell the operator to check — that path is exactly where they need to look at \`ps\` themselves"
+if grep -q 'nothing is left orphaned' "$FB_ERR"; then
+  fail "11: the report claimed 'nothing is left orphaned' on the SINGLE-PID fallback, where reap() signalled only the direct child — a false assurance that tells the operator not to go looking for the surviving tree"
+fi
+grep -q "Live processes under the suite's pid" "$FB_ERR" \
+  || fail "11: the process-snapshot heading must not say 'process group' on a path where no group was resolved"
+
+# GREEN counterpart — on the normal path the strong claim is not just allowed,
+# it is REQUIRED, or this case would pass against a guard that simply deleted
+# the sentence.
+FB_OK="$TMPD/pgid.err"
+BUILD_SUITE_TIMEOUT_SECS=3 bash "$GUARD" --label pgiddemo -- bash "$TMPD/hang.sh" \
+  >/dev/null 2>"$FB_OK"
+grep -q 'nothing is left orphaned' "$FB_OK" \
+  || fail "11: on the NORMAL path the whole group IS reaped, so the report must still say nothing is left orphaned; stderr was: $(cat "$FB_OK")"
+grep -q 'job control did NOT isolate' "$FB_OK" \
+  && fail "11: the normal path must NOT emit the fallback warning — job control DID isolate the suite there"
+pass "11 timeout report honesty: on the single-pid fallback the report names the one pid it signalled, says job control did not isolate the suite and tells the operator to check for survivors — and never claims whole-group reaping; on the normal path it still makes that claim, so the assertion is not satisfied by deleting the sentence"
+
+# ---------------------------------------------------------------------------
 # 8: static lockstep — the wiring a behaviour case cannot see
 # ---------------------------------------------------------------------------
-grep -q 'bounded-suite.sh --label test-build-workflow' "$MAKEFILE" \
+# `"?` throughout: these assert the WIRING (the target routes through the
+# guard), not the quoting style of the $(BUILD_SRC) expansion around it — the
+# recipes quote it so a checkout path containing a space still works, and that
+# quote must not be able to turn a wiring gate red.
+grep -qE 'bounded-suite\.sh"? --label test-build-workflow' "$MAKEFILE" \
   || fail "8: the Makefile's test-build-workflow target must run through bounded-suite.sh — an unwired guard bounds nothing"
-grep -q 'bounded-suite.sh --label test-build ' "$MAKEFILE" \
+grep -qE 'bounded-suite\.sh"? --label test-build ' "$MAKEFILE" \
   || fail "8: the Makefile's test-build target must run through bounded-suite.sh too — it has the identical gap"
-grep -q -- '--case-source \$(BUILD_SRC)/tests/test_workflow.sh' "$MAKEFILE" \
+grep -qE -- '--case-source "?\$\(BUILD_SRC\)/tests/test_workflow\.sh' "$MAKEFILE" \
   || fail "8: test-build-workflow must pass --case-source, or a stall in an inline section cannot be named"
 grep -q '^: "\${BUILD_SUITE_TIMEOUT_SECS:=' "$CONFIG" \
   || fail "8: BUILD_SUITE_TIMEOUT_SECS must be defined in build.config.sh — the bound is a NAMED SETTING, not a literal (CLAUDE.kernel.md § Named-setting convention)"

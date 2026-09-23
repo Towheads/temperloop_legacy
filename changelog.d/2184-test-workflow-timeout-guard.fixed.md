@@ -7,9 +7,12 @@
   `$BUILD_SUITE_TIMEOUT_SECS` (new, default 1800s, `build.config.sh`) with a
   report naming the case that was RUNNING — not the last one that passed —
   and kills the suite's whole process group so nothing is left orphaned. The
-  same process-group reap runs on SIGINT and SIGTERM, so Ctrl-C leaves no
-  detached suite behind either. The watchdog is dependency-free bash: it needs
-  neither GNU `timeout` nor `gtimeout`, so the bound holds on a stock macOS.
+  same process-group reap runs on SIGHUP, SIGINT, SIGQUIT and SIGTERM, so
+  neither a Ctrl-C nor a closed terminal (or a dropped SSH session) leaves a
+  detached suite behind — and since the bound *is* the wrapper's own poll
+  loop, an unhandled hangup would have taken the bound with it and restored
+  the unbounded hang. The watchdog is dependency-free bash: it needs neither
+  GNU `timeout` nor `gtimeout`, so the bound holds on a stock macOS.
 
   A healthy run keeps its exit code, its byte-identical stdout, and its
   stderr unmerged and untouched. One difference is worth knowing about rather

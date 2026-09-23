@@ -61,12 +61,21 @@
 # ── SIGNALS REAP THE GROUP TOO, NOT JUST THE BOUND ──────────────────────────
 # `set -m` puts the suite in its OWN process group, which is what lets the
 # bound reap the whole tree. It has a second, less obvious consequence: the
-# suite is no longer in `make`'s foreground group, so a terminal Ctrl-C no
-# longer reaches it. If this wrapper's INT/TERM handlers merely exited, the
-# suite would keep running FULLY DETACHED — reintroducing the orphaned process
-# trees this item exists to prevent, through a different door, and making
-# Ctrl-C strictly WORSE than before the wrapper existed. So INT and TERM run
-# the SAME reap() the bound does before exiting 130/143. Covered by
+# suite is no longer in `make`'s foreground group, so a terminal Ctrl-C — or a
+# terminal HANGUP — no longer reaches it. If this wrapper's handlers merely
+# exited, the suite would keep running FULLY DETACHED — reintroducing the
+# orphaned process trees this item exists to prevent, through a different door,
+# and making the signal strictly WORSE than before the wrapper existed. Worse
+# still for a hangup: the bound IS this wrapper's poll loop, so a wrapper that
+# died on SIGHUP would take the bound with it and restore the unbounded
+# forever-hang in full.
+#
+# So EVERY interactive/terminating signal a terminal or a CI job can deliver
+# runs the SAME reap() the bound does before exiting: HUP (129), INT (130),
+# QUIT (131) and TERM (143). That is the set workflows/scripts/tests/lib/
+# sandbox.sh already installs for its own cleanup traps — this guard follows
+# the established in-repo convention rather than arming a subset of it.
+# Covered per-signal, with a per-signal RED arm, by
 # tests/test_bounded_suite.sh case 9.
 #
 # ── WHAT IS *NOT* IDENTICAL IN A WRAPPED RUN ────────────────────────────────
@@ -168,9 +177,9 @@ TMPD="$(mktemp -d "${TMPDIR:-/tmp}/bounded-suite.XXXXXX")" || exit 2
 cleanup() { rm -rf "$TMPD"; }
 
 # reap() — terminate the suite's whole process group. THE ONLY killer in this
-# script: the bound calls it, and so do the INT/TERM handlers. Factored out
-# precisely so those three paths can never diverge, which is exactly how the
-# signal path came to orphan the tree in the first place.
+# script: the bound calls it, and so do the HUP/INT/QUIT/TERM handlers.
+# Factored out precisely so those paths can never diverge, which is exactly how
+# the signal path came to orphan the tree in the first place.
 #
 # $pgid / $child are resolved further down, AFTER the traps are installed, so
 # a signal can legitimately arrive before either exists — hence ${x:-} and the
@@ -200,20 +209,34 @@ reap() {
   return 0
 }
 
-# EXIT sweeps the scratch dir; INT/TERM must also REAP THE SUITE and then
-# TERMINATE.
+# EXIT sweeps the scratch dir; HUP/INT/QUIT/TERM must also REAP THE SUITE and
+# then TERMINATE.
 #   - reap, because `set -m` below moved the suite into its own process group,
-#     out of make's foreground group: a terminal Ctrl-C reaches this wrapper
-#     but NOT the suite, so a handler that skipped reap() would leave the whole
-#     suite tree running fully detached — this item's own defect class,
-#     reintroduced through the signal door (and Ctrl-C would be worse than
-#     before the wrapper existed, when make's group still caught it).
+#     out of make's foreground group: a terminal Ctrl-C (or a hangup from a
+#     closed terminal / dropped SSH session) reaches this wrapper but NOT the
+#     suite, so a handler that skipped reap() would leave the whole suite tree
+#     running fully detached — this item's own defect class, reintroduced
+#     through the signal door (and the signal would be worse than before the
+#     wrapper existed, when make's group still caught it).
 #   - exit, because a trap handler that returns without exiting leaves bash
 #     carrying on with the next command, which would make this guard itself
 #     unkillable by an ordinary SIGTERM (a Ctrl-C'd `make`, a CI job timeout).
-# 130/143 are the conventional 128+SIGINT / 128+SIGTERM codes.
+#
+# ALL FOUR, not a subset. An UNARMED signal takes bash's default disposition
+# and kills this wrapper outright — which is strictly worse than no wrapper:
+# the suite survives detached AND the bound dies with the poll loop that
+# enforces it, restoring the unbounded forever-hang #2184 exists to fix. SIGHUP
+# is the live case (closing a terminal, an SSH drop); SIGQUIT (Ctrl-\) is the
+# same class at lower likelihood. Each is one line, all four share reap(), and
+# each has its own RED arm in tests/test_bounded_suite.sh case 9.
+#
+# 129/130/131/143 are the conventional 128+SIGHUP / +SIGINT / +SIGQUIT /
+# +SIGTERM codes. Kept as FOUR separate `trap` lines, one per signal, so the
+# test's RED-arm splice can neutralise exactly one handler at a time.
 trap cleanup EXIT
+trap 'reap; cleanup; exit 129' HUP
 trap 'reap; cleanup; exit 130' INT
+trap 'reap; cleanup; exit 131' QUIT
 trap 'reap; cleanup; exit 143' TERM
 
 LOG="$TMPD/out.log"
@@ -366,6 +389,27 @@ else
 fi
 [ -n "$procs" ] || procs="(no live processes found at kill time)"
 
+# REAP FIRST, REPORT SECOND. The report speaks in the past tense about what was
+# killed, so it must run AFTER the kill or it is asserting something that has
+# not happened yet. The process snapshot above is deliberately taken BEFORE the
+# reap — it is the whole diagnostic value of this report — and is already held
+# in $procs, so moving the printing down costs nothing.
+reap
+
+# WHAT THE REPORT MAY CLAIM depends on which arm reap() took, and the two are
+# not interchangeable. With $pgid resolved, the whole process group got SIGTERM
+# then SIGKILL and nothing survives. With $pgid BLANKED (job control did not
+# give the job its own group — see the safety fallback above), reap() signalled
+# ONLY "$child": every grandchild the suite forked is still running. Telling an
+# operator "nothing is left orphaned" on that path is worse than saying nothing
+# at all — the fallback is precisely the case where they need to go look at
+# `ps` themselves.
+if [ -n "$pgid" ]; then
+  procs_heading="Live processes in the suite's process group, snapshotted just before the kill:"
+else
+  procs_heading="Live processes under the suite's pid ($child), snapshotted just before the kill:"
+fi
+
 {
   echo ""
   echo "================================================================================"
@@ -381,18 +425,25 @@ fi
   echo "  Last case that COMPLETED before it (this is NOT the stalled case):"
   echo "      $last_completed"
   echo ""
-  echo "  Live processes in the suite's process group at kill time:"
+  echo "  $procs_heading"
   printf '%s\n' "$procs" | sed 's/^/      /'
   echo ""
-  echo "  The whole process group was killed (SIGTERM, then SIGKILL), so nothing"
-  echo "  is left orphaned behind this failure."
+  if [ -n "$pgid" ]; then
+    echo "  The whole process group ($pgid) was killed (SIGTERM, then SIGKILL), so"
+    echo "  nothing is left orphaned behind this failure."
+  else
+    echo "  WARNING — job control did NOT isolate this suite in its own process"
+    echo "  group, so only the suite's single pid ($child) was signalled (SIGTERM,"
+    echo "  then SIGKILL). ANY DESCENDANTS IT SPAWNED MAY STILL BE RUNNING. Check"
+    echo "  for survivors and kill them yourself:"
+    echo "      ps -A -o pid=,ppid=,etime=,args= | grep -v grep"
+  fi
   echo ""
   echo "  To allow a legitimately longer run, raise the setting, never the recipe:"
   echo "      BUILD_SUITE_TIMEOUT_SECS=<seconds> make $label"
   echo "================================================================================"
 } >&2
 
-reap
 wait "$child" 2>/dev/null
 relay
 
