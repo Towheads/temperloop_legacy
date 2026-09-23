@@ -302,15 +302,44 @@ if [ -z "$pgid" ] || [ "$pgid" = "$self_pgid" ]; then
   pgid=""
 fi
 
+# ── POLL CADENCE: fine-grained first, then 1s (temperloop#2162) ─────────────
+# A flat `sleep 1` costs every wrapped command a fixed ~1s tail, because the
+# poller cannot observe $RCF until its first sleep has elapsed. That was free
+# when the only callers were two multi-minute umbrella suites. It is not free
+# now: temperloop#2162 splits those umbrellas into ~73 PER-SCRIPT gates, each
+# individually wrapped by this guard, and most of them finish in under two
+# seconds — a flat 1s tail would have added ~73s of pure poll latency to the
+# suite's serial cost for no bound-related reason.
+#
+# So the first $BS_FAST_POLLS iterations sleep $BS_FAST_SECS and the rest sleep
+# 1s. The BOUND ITSELF IS UNCHANGED: it is computed from `date +%s` against
+# $bound above, never from a poll count, so cadence cannot move when the guard
+# fires — only how quickly a FINISHED command is noticed.
+#
+# `sleep` with a FRACTIONAL argument is a BSD/GNU extension, not POSIX. Rather
+# than probe for it once at startup (which would itself cost a fractional
+# sleep on every wrapped invocation — the exact overhead this is removing), the
+# fractional form is attempted inline and falls back to a whole second when the
+# host's `sleep` rejects it. A host without fractional sleep therefore gets
+# exactly the pre-#2162 cadence, which is correct, just slower to notice.
+BS_FAST_POLLS=10
+BS_FAST_SECS=0.2
+
 start="$(date +%s)"
 timed_out=0
+polls=0
 while [ ! -f "$RCF" ]; do
   if [ $(( $(date +%s) - start )) -ge "$bound" ]; then
     timed_out=1
     break
   fi
   relay
-  sleep 1
+  if [ "$polls" -lt "$BS_FAST_POLLS" ]; then
+    sleep "$BS_FAST_SECS" 2>/dev/null || sleep 1
+  else
+    sleep 1
+  fi
+  polls=$((polls + 1))
 done
 relay
 

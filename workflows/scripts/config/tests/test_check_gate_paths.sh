@@ -356,4 +356,51 @@ $out"
 fi
 echo "PASS: 16b the same fixture passes once every gate begins make/bash"
 
+# --- 17. PATTERN ROW KEYS (temperloop#2162) ----------------------------------
+# quality-gates.sh glob-expands two test directories into one gate per script,
+# so the map's completeness check (check 2) had to stop demanding a literal row
+# per gate — otherwise adding a test_*.sh would turn THIS gate red until
+# someone also edited the map, which is the hand-enumeration trap the expansion
+# removes. A key carrying a wildcard therefore maps a whole FAMILY.
+#
+# Two properties, and the second is what keeps the widening honest:
+#  17a  a pattern row SATISFIES completeness for every gate it globs;
+#  17b  a pattern row that globs NO current gate is still a STALE row (check 3)
+#       — a family key is not a licence to leave dead rows in the map.
+cat >"$TMP/gates-family.txt" <<'EOF'
+[kernel]  make test-alpha
+[kernel]  bash suite.sh --run tests/test_one.sh
+[kernel]  bash suite.sh --run tests/test_two.sh
+[kernel]  bash tools/gamma.sh
+EOF
+
+# 17a — the family row covers both expanded gates; no completeness failure.
+cat >"$TMP/family.tsv" <<'EOF'
+ALL	Makefile
+make test-alpha	src/alpha.sh
+bash suite.sh --run tests/test_*.sh	src/beta/**
+bash tools/gamma.sh	ALWAYS
+EOF
+if ! out="$(run_check "$TMP/family.tsv" GATE_PATHS_GATE_LIST_FILE="$TMP/gates-family.txt")"; then
+  fail "17a: a pattern row must satisfy completeness for every gate it globs, got:
+$out"
+fi
+case "$out" in *'[ok]'*) : ;; *) fail "17a: expected an [ok] line, got: $out" ;; esac
+echo "PASS: 17a a pattern row satisfies completeness for the whole family it globs"
+
+# 17b — the DISCRIMINATION control: the same map against a gate list where the
+# family no longer exists. A pattern key that matches nothing is exactly the
+# rename/delete the staleness check exists to catch, and must still fail.
+cat >"$TMP/gates-family-gone.txt" <<'EOF'
+[kernel]  make test-alpha
+[kernel]  bash tools/gamma.sh
+EOF
+if out="$(run_check "$TMP/family.tsv" GATE_PATHS_GATE_LIST_FILE="$TMP/gates-family-gone.txt")"; then
+  fail "17b: a pattern row matching NO current gate must FAIL as stale, got:
+$out"
+fi
+case "$out" in *'stale row'*) : ;; *) fail "17b: the failure must name it a stale row, got: $out" ;; esac
+case "$out" in *'tests/test_*.sh'*) : ;; *) fail "17b: the failure must name the stale pattern key, got: $out" ;; esac
+echo "PASS: 17b a pattern row that globs no current gate still fails as stale"
+
 echo "OK — check-gate-paths.sh: all cases passed"

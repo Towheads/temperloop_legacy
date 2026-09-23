@@ -108,6 +108,21 @@
 #     GATES array, or one of two reserved pseudo-keys:
 #       ALL   — the globs listed escalate the run to the FULL set.
 #       none  — the globs listed are RECOGNISED but affect no gate.
+#   * <key> MAY ALSO BE A PATTERN (temperloop#2162) — a key carrying `*`, `?`
+#     or `[` is matched against each gate command line as a shell glob, so ONE
+#     row can map a whole FAMILY of gates. This exists because quality-gates.sh
+#     now GLOB-EXPANDS two test directories into one gate per script: the whole
+#     point of expanding at list time is that a newly added test_*.sh needs no
+#     registry edit, and a map that demanded a hand-typed row per script would
+#     have put that maintenance trap straight back (check-gate-paths.sh's
+#     completeness check fails an unmapped gate). MATCHING ROWS ARE UNIONED,
+#     never ranked: a gate is selected when ANY row that names it — its own
+#     literal row, a pattern row that globs it, or both — was selected. A
+#     single script inside an expanded family can therefore carry its own
+#     pinpoint row for EXTRA triggers (which is exactly what the four
+#     state-graph suites and test_dual_build_preflight.sh do) without that row
+#     ever REMOVING the family row's triggers. A precedence here would narrow
+#     — see the union rationale at the resolver's emit loop.
 #   * The single token `ALWAYS` in place of a glob list marks a gate that runs
 #     on every scoped run (a whole-tree scanner). An `ALWAYS` row contributes
 #     NOTHING to path recognition — otherwise a whole-tree gate's `**` would
@@ -511,6 +526,33 @@ _gs_in_list() {
   return 1
 }
 
+# --- key/gate matching (exact, or a PATTERN key — temperloop#2162) -----------
+# `_gs_key_is_pattern <key>` is the single place that decides what makes a key
+# a pattern, so the map loader, the resolver and check-gate-paths.sh cannot
+# drift on that question.
+_gs_key_is_pattern() {
+  case "$1" in
+    *'*'*|*'?'*|*'['*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# `_gs_key_matches_gate <key> <gate>` — true when the row keyed <key> governs
+# the gate command <gate>. A literal key matches only itself; a pattern key
+# matches as a shell glob. It is deliberately a MEMBERSHIP predicate with no
+# ranking: the resolver unions every row that answers true here, because a
+# precedence between a pinpoint row and the family row that globs it can only
+# resolve toward LESS coverage (see the emit loop's union rationale).
+_gs_key_matches_gate() {
+  local key="$1" gate="$2"
+  [[ "$key" == "$gate" ]] && return 0
+  if _gs_key_is_pattern "$key"; then
+    # shellcheck disable=SC2053  # RHS is a glob on purpose
+    [[ "$gate" == $key ]] && return 0
+  fi
+  return 1
+}
+
 # --- the selection itself ----------------------------------------------------
 # GATE_SELECTION_MODE / _REASON / _SELECTED / _MATCHED are OUT-PARAMS: written
 # here, read by the sourcing caller (this is a sourced lib, not a program), so
@@ -695,17 +737,41 @@ gate_selection_resolve() {
 
   # Emit in the caller's run order, and keep any gate the map does not mention
   # (defense 4 in the header: an unmapped gate over-runs, never under-runs).
-  local gate ordered="" left_out="" mapped always keep
+  local gate ordered="" left_out="" mapped always keep mapped_keys _gs_mkey
   while IFS= read -r gate; do
     [[ -n "$gate" ]] || continue
     mapped=0
     always=0
+    mapped_keys=""
+    # EVERY row that names this gate, UNIONED — never a precedence
+    # (temperloop#2162; the exact-wins precedence this replaces shipped in the
+    # first cut of that item and is the bug it fixes).
+    #
+    # A gate inside a glob-expanded family may ALSO carry its own pinpoint row,
+    # and the two rows carry DIFFERENT trigger sets: the pinpoint row names
+    # paths the family row does not glob (test_state_graph_soak.sh's row names
+    # workflows/scripts/config/ontology-registry.tsv), and the family row globs
+    # paths the pinpoint row does not name (all of workflows/scripts/build/**).
+    # Letting the exact row WIN — on the reasoning that the family row would
+    # otherwise "silently widen" a pinpoint gate — inverts the one invariant
+    # this selector states about itself: every unresolved case resolves TOWARD
+    # MORE coverage, never less (the header's five silent-green defenses, and
+    # quality-gates.sh's own "resolves TOWARD MORE coverage, never less").
+    # WIDENING is the safe direction here; NARROWING is the silent-green one,
+    # and exact-wins narrowed for real — a one-file
+    # `workflows/scripts/build/pr.sh` diff stopped selecting the four
+    # state-graph suites and test_dual_build_preflight.sh, which the umbrella
+    # row had always run, on CI too (`checks` is itself diff-scoped).
+    #
+    # So: collect EVERY matching key and keep the gate if ANY of them was
+    # selected. The union is a strict superset of either row alone, so the
+    # pinpoint row keeps its extra triggers and the family row keeps its reach.
     i=0
     while [[ $i -lt ${#_GS_KEYS[@]} ]]; do
-      if [[ "${_GS_KEYS[$i]}" == "$gate" ]]; then
+      if _gs_key_matches_gate "${_GS_KEYS[$i]}" "$gate"; then
         mapped=1
+        mapped_keys="${mapped_keys:+$mapped_keys$'\n'}${_GS_KEYS[$i]}"
         [[ "${_GS_GLOBS[$i]}" == "ALWAYS" ]] && always=1
-        break
       fi
       i=$((i + 1))
     done
@@ -715,7 +781,17 @@ gate_selection_resolve() {
     elif [[ $always -eq 1 ]]; then
       keep=1                       # whole-tree scanner — runs every scoped run
     elif _gs_in_list "$gate" "$selected"; then
-      keep=1                       # selected by a changed path
+      # The gate's own command line is in $selected. That happens on a
+      # registration-only diff, whose union names REAL gate command lines
+      # rather than row keys.
+      keep=1
+    else
+      # Selected through ANY row that names this gate — its own pinpoint row,
+      # the family pattern row that globs it, or both.
+      while IFS= read -r _gs_mkey; do
+        [[ -n "$_gs_mkey" ]] || continue
+        if _gs_in_list "$_gs_mkey" "$selected"; then keep=1; break; fi
+      done <<<"$mapped_keys"
     fi
     if [[ $keep -eq 1 ]]; then
       ordered="${ordered:+$ordered$'\n'}$gate"

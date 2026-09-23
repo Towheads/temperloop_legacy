@@ -356,8 +356,24 @@ echo "PASS: 14 the disable marker suppresses the producer entirely (contract ski
 # source edits -- those are present on BOTH sides of the diff (before tests
 # 12-14 ran and after), so they cancel out; only a delta introduced BY tests
 # 12-14 themselves fails this check.
+#
+# IT READS GLOBAL STATE, AND SINCE temperloop#2162 IT HAS CONCURRENT NEIGHBOURS.
+# The whole-repo delta is the only probe wide enough to catch BLOCKING 1 (see
+# above), but the working tree is SHARED: #2162 split `make test-build` and
+# `make test-cli-subcommands` into ~73 per-script gates the pool now runs
+# CONCURRENTLY, so a SIBLING gate writing a transient file anywhere in the
+# checkout lands in this delta too. Not hypothetical — it fired at 32-way
+# concurrency on `workflows/scripts/build/tests/.review-wait-early.<pid>`, and
+# the fix was to move THAT test's scratch out of the tree, because a test
+# writing into a git-tracked directory is the real defect. Keeping this probe
+# wide is right; what it owes the reader is honest ATTRIBUTION, so the message
+# below points at the other suspect instead of asserting the producer did it.
 post_repo_status="$(cd "$REPO_ROOT" && git status --porcelain 2>/dev/null)" || post_repo_status=""
 [ "$pre_repo_status" = "$post_repo_status" ] || fail "15: the repo tree changed after tests 12-14 (whole-repo status delta, not just .temperloop/) -- state must never leak into a repo-tracked path.
+  If the added entry is NOT one this producer could have written, check whether a
+  CONCURRENTLY-RUNNING gate wrote it: since temperloop#2162 the former test-build /
+  test-cli-subcommands umbrellas are ~73 pooled per-script gates sharing this one
+  working tree, and a sibling's scratch file belongs in a mktemp dir, not here.
   before:
 $pre_repo_status
   after:

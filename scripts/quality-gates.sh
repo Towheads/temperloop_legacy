@@ -82,6 +82,15 @@
 # `1` restores the exact pre-parallel serial loop, which is what a bisect or a
 # flake hunt should use).
 #
+# PER-SCRIPT GATES (temperloop#2162): the pool schedules per LIST ENTRY, so a
+# single entry that loops N scripts serially is one indivisible slot no number
+# of workers can spread. `make test-build` and `make test-cli-subcommands` were
+# exactly that — the two longest entries in the set, each a serial loop over a
+# directory glob. They are no longer gates; the `_qg_expand_case_gates` block
+# below GLOB-EXPANDS both directories at list time into one bounded gate per
+# script, which is what actually removes the long pole. See that block for the
+# bound, the dedupe and the independence audit.
+#
 # CHANGED-FILE SCOPING FOR A LOCAL RUN (temperloop#957, #1663): `--scoped` (and
 # its env twin $QUALITY_GATES_SCOPED) applies the same selector to the LOCAL
 # working tree — committed, staged, unstaged and untracked changes vs. the
@@ -115,41 +124,35 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # entries). Each entry is a full command line (a `make` target).
 KERNEL_GATES=(
   "make test-board"
-  # test-ci-poll-retry (temperloop#386): ci-poll.sh's gh_retry() transient-
-  # API-hiccup absorption — a bounded, backoff-retried gh api call rather
-  # than an immediate false-escalating ERROR on a transient non-JSON/HTTP-5xx
-  # response. Lives at workflows/scripts/build/tests/test_ci_poll_retry.sh,
-  # sibling of test_ci_poll.sh, and is auto-covered by the glob-based
-  # `make test-build` recipe below (same "kernel Makefile is generator-owned,
-  # no per-file target" convention every workflows/scripts/build/tests/
-  # test_*.sh file already follows) — this comment is the explicit
-  # by-name registration the activation proof greps for.
-  "make test-build"
-  # State graph core build (temperloop#1910, ADR 0033): test_state_graph.sh
-  # is already glob-covered by `make test-build` above (same convention as
-  # test_ci_poll_retry.sh just above), but is ALSO registered here as its
-  # own explicit gate line — not just a comment — because this item's
-  # activation proof runs `scripts/quality-gates.sh --list | grep -q
-  # test_state_graph`, and `--list` prints only the literal command strings
-  # in this array, never a comment (temperloop#1934).
-  "bash workflows/scripts/build/tests/test_state_graph.sh"
-  # Host-local state-graph sources (state-graph-build-local, temperloop#1918):
-  # plan_notes/journal/tmux, alongside the four core sources just above.
-  # test_state_graph_local.sh is already glob-covered by `make test-build`
-  # above, but registered here too as its own explicit gate line — same
-  # by-name-registration convention as test_state_graph.sh's own entry.
-  "bash workflows/scripts/build/tests/test_state_graph_local.sh"
-  # `state-graph.sh query <name>` (temperloop#1910 L6): status-drift/
-  # stale-claims/unlinked-prs/orphan-worktrees/resume, each a PURE function
-  # of a snapshot JSON — already glob-covered by `make test-build` above,
-  # registered here too by-name, same convention as the two entries above.
-  "bash workflows/scripts/build/tests/test_state_graph_queries.sh"
-  # `state-graph.sh soak` (temperloop#1910, this item): the mechanical
-  # cross-check (day count set by `STATE_GRAPH_SOAK_DAYS`) between `query status-drift` and
-  # the INDEPENDENT `reconcile.sh --status` read, plus `--count`/`--audit` and
-  # `bench`'s soak-log capture — already glob-covered by `make test-build`
-  # above, registered here too by-name, same convention as the entries above.
-  "bash workflows/scripts/build/tests/test_state_graph_soak.sh"
+  # `make test-build` USED TO SIT HERE and no longer does (temperloop#2162).
+  # The umbrella looped 58 test_*.sh scripts SERIALLY inside ONE gate-pool
+  # slot, so the pool could never spread them: it was the set's longest pole
+  # by a wide margin (measured serially on the item's host: 335s for the
+  # umbrella vs. 77s for its slowest single script) and it straggled long
+  # after every other worker went idle. It is now GLOB-EXPANDED into one gate
+  # PER SCRIPT by the `_qg_expand_case_gates` block further down, which also
+  # carries the whole rationale — including why each expanded gate keeps its
+  # own wall-clock bound. `make test-build` itself is UNCHANGED and still
+  # works for local use (and is still what the mandatory-step registry's
+  # signal rows name); it is simply no longer the gate.
+  #
+  # Two registrations that used to hang off this line, preserved verbatim
+  # because `--list`-grepping activation proofs depend on them, and both are
+  # now satisfied by the per-script expansion rather than by a glob inside a
+  # Makefile recipe:
+  #   * test-ci-poll-retry (temperloop#386): ci-poll.sh's gh_retry()
+  #     transient-API-hiccup absorption, at
+  #     workflows/scripts/build/tests/test_ci_poll_retry.sh — now its own
+  #     gate, by name, instead of a comment claiming glob coverage.
+  #   * the four state-graph suites (temperloop#1910/#1918, ADR 0033):
+  #     test_state_graph.sh, test_state_graph_local.sh,
+  #     test_state_graph_queries.sh and test_state_graph_soak.sh were each
+  #     listed here as an explicit literal line SOLELY so that
+  #     `scripts/quality-gates.sh --list | grep -q test_state_graph` would
+  #     match (temperloop#1934). The expansion emits every one of them as its
+  #     own literal `--list` line, so those greps keep matching — and the
+  #     duplicate hand-typed entries are gone, which is what stops each of
+  #     those four suites from running TWICE per suite run.
   # The `state-graph.sh query resume` call's presence-lint (temperloop#1910
   # L6) — build.md Step 0.5 declares this call mandatory on every resume
   # (mandatory-step-registry.tsv); this guard is that declaration's
@@ -1291,7 +1294,11 @@ KERNEL_GATES=(
   # tracked default. Hermetic: no network, no `gh`, no live model call, no
   # live git remote (a throwaway git repo per fixture). Same direct-`bash`
   # form, no Makefile target, as the four replay-preflight gates above.
-  "bash workflows/scripts/build/tests/test_dual_build_preflight.sh"
+  # temperloop#2162: the literal entry that used to sit here is GONE, not
+  # dropped — test_dual_build_preflight.sh lives under
+  # workflows/scripts/build/tests/, so `_qg_expand_case_gates` now emits it
+  # as its own (bounded) per-script gate. Keeping the hand-typed line as
+  # well would run the suite twice.
   # Live candidate tagging provenance (temperloop#1257, epic #1225 "model
   # comparison harness"): tagging.sh's three artifacts — the bounded window
   # record, the telemetry tag (a real emit-model-usage.sh raw-lake record,
@@ -1867,11 +1874,18 @@ KERNEL_GATES=(
   "make test-conventions-probe"
   # The bin/subcommands/ CLI suites — init, eject, config, configure, report,
   # feedback, uninstall, update, baseline-snapshot, dispatch-rename,
-  # prereq-scoping, report-offer, tokens-producer — run as one globbed gate
-  # (F#836: kernel coverage can never trail whichever tests/test_*.sh files are
-  # actually vendored). Renamed from `make test-try` when `try` was retired
-  # (temperloop#1117); the glob and therefore the covered set are unchanged.
-  "make test-cli-subcommands"
+  # prereq-scoping, report-offer, tokens-producer. `make test-cli-subcommands`
+  # USED TO BE THE GATE HERE and no longer is (temperloop#2162): like
+  # `make test-build` above it looped its whole glob SERIALLY inside ONE
+  # gate-pool slot (measured 125s on the item's host, 71s of it a single
+  # script), so the pool could not spread it. `_qg_expand_case_gates` further
+  # down now emits one gate per script, glob-expanded at list time from the
+  # SAME directory the recipe globs — so the F#836 property this comment has
+  # always claimed ("kernel coverage can never trail whichever tests/test_*.sh
+  # files are actually vendored") is now true of the GATE SET too, not just of
+  # the Makefile recipe. The target itself is unchanged and still works
+  # locally; it was renamed from `make test-try` when `try` was retired
+  # (temperloop#1117), and the covered set is still exactly its glob.
   # Docs-build gate (F#764, Epic A): runs the docs-site generator
   # (workflows/scripts/docs/generate.py) BUILD ONLY, no publish step — a
   # doc-source break (e.g. a malformed workflows/scripts/kernel/kernel-
@@ -2157,6 +2171,102 @@ KERNEL_GATES+=("bash scripts/tests/test_quality_gates_scoped.sh")
 # generator-owned).
 KERNEL_GATES+=("bash scripts/tests/test_quality_gates_parallel.sh")
 
+# ─── PER-SCRIPT EXPANSION OF THE TWO FORMER UMBRELLA GATES (temperloop#2162) ──
+# `make test-build` (58 scripts) and `make test-cli-subcommands` (15) were each
+# ONE entry in the list above, and each one looped its whole glob SERIALLY
+# inside a single gate-pool slot. The pool schedules per ENTRY, so it could
+# never spread either of them: measured serially on the item's host, the two
+# umbrellas cost 335s and 125s while their slowest INDIVIDUAL script cost 77s
+# and 71s. That is the classic straggler shape the pool's own header describes
+# — makespan is max(total/jobs, longest-gate-start + its length) — and no
+# amount of extra workers could touch it while the long pole was indivisible.
+#
+# So the two umbrellas are expanded here into one gate PER SCRIPT.
+#
+# GLOB-EXPANDED AT LIST TIME, NEVER HAND-ENUMERATED. The loop below globs the
+# same two directories the Makefile recipes glob, every time this script runs,
+# so a newly added `workflows/scripts/build/tests/test_*.sh` or
+# `bin/subcommands/tests/test_*.sh` becomes a gate with NO edit here and no
+# edit to any registry. A hand-typed list of 73 filenames would have gone stale
+# on the next test added — the exact maintenance trap F#836 already rejected
+# for the Makefile recipes themselves, reproduced one layer up. (The companion
+# half lives in workflows/scripts/config/gate-paths.tsv, whose two rows for
+# these families are PATTERN keys for the same reason.)
+#
+# EACH EXPANDED GATE KEEPS ITS OWN WALL-CLOCK BOUND — a deliberate choice, not
+# an inherited accident (temperloop#2184 landed the bound days before this
+# item). `make test-build` is bounded by
+# workflows/scripts/build/bounded-suite.sh because an unbounded suite hung for
+# ~50h with nothing going red. Once the GATE stops being `make test-build`,
+# leaving the bound "on the umbrella only" would mean the bound no longer
+# covers the path CI and /build §3e.5 actually take — reopening #2184's defect
+# at a finer granularity, on a set 73 gates wide, and this file's own
+# `lint-argloop-shift2` entry already states the house position on that class:
+# "A HUNG gate does not FAIL — it burns the runner to the job timeout". So
+# every expanded gate runs THROUGH the same wrapper, under the same named
+# setting ($BUILD_SUITE_TIMEOUT_SECS), and the umbrella targets keep theirs
+# unchanged for local use. The wrapper's per-invocation overhead was cut from
+# ~1.0s to ~0.25s in the same change (its poll cadence) so that paying it 73
+# times does not show up as a serial-time regression.
+#
+# DEDUPED AGAINST THE WHOLE LIST, KERNEL AND OVERLAY. Five of these scripts
+# used to ALSO carry a hand-typed literal entry (the four state-graph suites
+# and test_dual_build_preflight.sh). Those literals are removed above; the
+# guard below is the belt that keeps a future re-added literal from silently
+# running its suite twice. The expansion therefore runs AFTER the drop-in
+# sourcing below and scans BOTH arrays: a `scripts/quality-gates.d/*.sh`
+# drop-in that appends a literal for one of these scripts would otherwise slip
+# past a kernel-list-only, expand-first guard entirely.
+#
+# A FILENAME THAT CANNOT SURVIVE THE ROUND TRIP IS REJECTED LOUDLY. Each gate
+# is composed as ONE string that the runner later splits back into argv with
+# `read -ra` (workflows/scripts/lib/gate-retry.sh), so whitespace or a glob
+# metacharacter in a test filename would either mis-execute or, worse, match
+# the wrong dedupe branch and drop the gate from the set — the same
+# silent-green class the selector's own defenses exist to prevent. Name a test
+# script with such a character and this aborts with the filename, rather than
+# quietly running one fewer suite.
+#
+# INDEPENDENCE IS AUDITED, NOT ASSUMED. Pooling only became safe once the 73
+# scripts were checked for shared mutable state — see
+# docs/features/quality-gates.md § Parallel execution, which records the audit
+# (every script sandboxes under its own `mktemp -d`; nothing mutates a live
+# repo file in place, binds a fixed port, or writes a fixed shared path) and
+# the repeated concurrent runs that measured it.
+_qg_expand_case_gates() {
+  local dir="$1" f base rel gate existing dup
+  for f in "$REPO_ROOT/$dir"/test_*.sh; do
+    [[ -e "$f" ]] || continue
+    base="$(basename "$f")"
+    # Loud, not silent: a name carrying whitespace or a glob metacharacter
+    # cannot survive the string→argv round trip, and a silently dropped gate
+    # is a green run that tested less.
+    case "$base" in
+      *[[:space:]]*|*'*'*|*'?'*|*'['*|*']'*)
+        echo "quality-gates.sh: refusing to register '$dir/$base' — a test filename may not contain whitespace or a glob metacharacter (it is word-split back into argv by gate-retry.sh)" >&2
+        exit 2
+        ;;
+    esac
+    rel="$dir/$base"
+    gate="bash workflows/scripts/build/bounded-suite.sh --label $base -- bash $rel"
+    dup=0
+    for existing in "${KERNEL_GATES[@]}"; do
+      case "$existing" in
+        *" $rel"|*" $rel "*) dup=1; break ;;
+      esac
+    done
+    if [[ $dup -eq 0 && ${#OVERLAY_GATES[@]} -gt 0 ]]; then
+      for existing in "${OVERLAY_GATES[@]}"; do
+        case "$existing" in
+          *" $rel"|*" $rel "*) dup=1; break ;;
+        esac
+      done
+    fi
+    [[ $dup -eq 1 ]] && continue
+    KERNEL_GATES+=("$gate")
+  done
+}
+
 # The overlay gate set — empty by default; populated only by drop-ins.
 OVERLAY_GATES=()
 if [[ -d "$REPO_ROOT/scripts/quality-gates.d" ]]; then
@@ -2166,6 +2276,10 @@ if [[ -d "$REPO_ROOT/scripts/quality-gates.d" ]]; then
     source "$dropin"
   done
 fi
+
+# Expand AFTER the drop-ins, so the dedupe above sees whatever they added.
+_qg_expand_case_gates "workflows/scripts/build/tests"
+_qg_expand_case_gates "bin/subcommands/tests"
 
 GATES=("${KERNEL_GATES[@]}")
 # Bash 3.2 (macOS default) treats "${arr[@]}" on a zero-length array as an
@@ -2233,9 +2347,26 @@ SERIAL_LANE_PINS=(
 # These are the measured long poles (2026-08-02 baseline in the header above);
 # the pool dispatches them first. A stale entry here costs nothing but a little
 # scheduling efficiency — it can never change a verdict.
+# temperloop#2162 re-baselined the top of this list: `make test-build` and
+# `make test-cli-subcommands` are no longer gates (they are glob-expanded per
+# script above), and the NEW long poles are the individual scripts that used to
+# hide inside them. Measured serially on the item's host, 2026-09-22 — the
+# numbers are the reason each line is here, not decoration:
+#   test_bounded_suite.sh 77s · test_configure.sh 71s · test_workflow.sh 57s ·
+#   test_pipeline_drive.sh 52s · test_worktree.sh 31s · test_init.sh 28s ·
+#   test_pr.sh 16s · test_pipeline_cron.sh 15s · test_guard_arming_probe.sh 14s
+# Everything below those is single-digit seconds and needs no hint.
 SLOW_DISPATCH_HINTS=(
-  "make test-cli-subcommands"
-  "make test-build"
+  "bash workflows/scripts/build/bounded-suite.sh --label test_bounded_suite.sh -- bash workflows/scripts/build/tests/test_bounded_suite.sh"
+  "bash workflows/scripts/build/bounded-suite.sh --label test_configure.sh -- bash bin/subcommands/tests/test_configure.sh"
+  "bash workflows/scripts/build/bounded-suite.sh --label test_workflow.sh -- bash workflows/scripts/build/tests/test_workflow.sh"
+  "bash workflows/scripts/build/bounded-suite.sh --label test_pipeline_drive.sh -- bash workflows/scripts/build/tests/test_pipeline_drive.sh"
+  "bash workflows/scripts/build/bounded-suite.sh --label test_worktree.sh -- bash workflows/scripts/build/tests/test_worktree.sh"
+  "bash workflows/scripts/build/bounded-suite.sh --label test_init.sh -- bash bin/subcommands/tests/test_init.sh"
+  "bash workflows/scripts/build/bounded-suite.sh --label test_pr.sh -- bash workflows/scripts/build/tests/test_pr.sh"
+  "bash workflows/scripts/build/bounded-suite.sh --label test_pipeline_cron.sh -- bash workflows/scripts/build/tests/test_pipeline_cron.sh"
+  "bash workflows/scripts/build/bounded-suite.sh --label test_guard_arming_probe.sh -- bash workflows/scripts/build/tests/test_guard_arming_probe.sh"
+  "make test-build-workflow"
   "make test-board"
   "bash workflows/scripts/validate-prose-budget.sh"
   "bash workflows/scripts/tests/test_validate_prose_budget.sh"

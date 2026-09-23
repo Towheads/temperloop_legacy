@@ -129,6 +129,16 @@ test-board:
 # The loop writes the test script it is about to run to $$SUITE_PROGRESS_FILE
 # so a timeout report names the case that was RUNNING, not the last one that
 # passed.
+#
+# NOT THE QUALITY GATE ANY MORE (temperloop#2162) — still a first-class local
+# target, and still the execution signal four mandatory-step-registry.tsv rows
+# name. `scripts/quality-gates.sh` used to carry `make test-build` as ONE gate,
+# which meant 58 scripts running SERIALLY inside a single gate-pool slot the
+# pool could never spread. It now glob-expands this same directory into one
+# BOUNDED gate per script (`_qg_expand_case_gates`), so the split is in the
+# gate list rather than here. Keep this recipe globbing the directory: the
+# expansion reads the same glob, and the two must agree about what the suite
+# IS. See docs/features/quality-gates.md § Parallel execution.
 test-build:
 	@echo "==> Running build toolkit tests..."
 	@bash "$(BUILD_SRC)/bounded-suite.sh" --label test-build -- \
@@ -181,6 +191,13 @@ test-proposal-pr:
 # incidentally carried try's name. Retiring `try` therefore RENAMES this gate
 # rather than deleting it; deleting it would have silently dropped the sole
 # runner for 13 unrelated suites.
+#
+# NOT THE QUALITY GATE ANY MORE (temperloop#2162), same as test-build above and
+# for the same reason: as one gate it ran its whole glob serially inside a
+# single gate-pool slot. scripts/quality-gates.sh now glob-expands this same
+# directory into one BOUNDED gate per script. This recipe stays as the local
+# runner, and stays glob-based — the expansion reads the same glob, and the two
+# must agree about what the suite IS.
 test-cli-subcommands:
 	@echo "==> Running CLI subcommand tests..."
 	@for t in $(BIN_SRC)/subcommands/tests/test_*.sh; do \

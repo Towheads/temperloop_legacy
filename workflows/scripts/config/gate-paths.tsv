@@ -201,25 +201,39 @@ make test-board	workflows/scripts/board/**
 # Also depends on the pinned shellcheck resolver (same one `make shellcheck`
 # uses, temperloop#567) so both lints stay on the identical binary.
 bash workflows/scripts/board-consumer-shellcheck.sh	workflows/scripts/board/** scripts/ensure-shellcheck.sh
+# PER-SCRIPT FAMILY ROW (temperloop#2162). `make test-build` is no longer a
+# gate: scripts/quality-gates.sh glob-expands workflows/scripts/build/tests/
+# into one bounded gate per script, so the pool can spread what used to be one
+# indivisible 335s slot. This row is a PATTERN key — it globs every gate in
+# that family — for the reason the expansion exists at all: a hand-typed row
+# per script would go stale on the next test added, and check-gate-paths.sh's
+# completeness check would go red on the PR that added it. The GLOBS are the
+# umbrella's own, verbatim, so the selected set is unchanged: any of these
+# paths still runs every build-tests script, exactly as `make test-build` did.
+# A single script needing EXTRA triggers takes its own exact row as well (the
+# four state-graph rows below, and test_dual_build_preflight.sh's). Those rows
+# ADD to this one; they do not replace it — gate-selection.sh UNIONS every row
+# that names a gate, so a script with its own row still runs whenever this
+# family row's globs match. A precedence there would narrow a scoped run.
 # test_workflow_path.sh (temperloop#2027) rides this glob, and it also asserts
 # on the three driver specs' workflowPath wiring and on the doctor.sh drift
 # detector it reuses — so those four paths select this gate too, or a spec
 # that re-adds the uninvocable ~/.claude engine literal would pass a scoped run.
-make test-build	workflows/scripts/build/** workflows/scripts/board/** workflows/scripts/lib/** workflows/scripts/install/doctor.sh claude/commands/build.md claude/commands/sweep.md claude/commands/fix.md
+bash workflows/scripts/build/bounded-suite.sh --label * -- bash workflows/scripts/build/tests/test_*.sh	workflows/scripts/build/** workflows/scripts/board/** workflows/scripts/lib/** workflows/scripts/install/doctor.sh claude/commands/build.md claude/commands/sweep.md claude/commands/fix.md
 # State graph core build (temperloop#1910): explicit by-name gate line
 # (scripts/quality-gates.sh's own comment explains why it exists alongside
 # the make test-build glob coverage above) needs its own row too, since
 # check-gate-paths.sh requires exactly one row per gate command.
-bash workflows/scripts/build/tests/test_state_graph.sh	workflows/scripts/build/state-graph.sh workflows/scripts/build/tests/test_state_graph.sh workflows/scripts/board/lib/cache.sh workflows/scripts/board/lib/board.sh workflows/scripts/config/ontology-registry.tsv workflows/scripts/config/join-keys-lib.sh
-bash workflows/scripts/build/tests/test_state_graph_local.sh	workflows/scripts/build/state-graph.sh workflows/scripts/build/tests/test_state_graph_local.sh workflows/scripts/board/lib/cache.sh workflows/scripts/board/lib/board.sh workflows/scripts/config/ontology-registry.tsv workflows/scripts/config/join-keys-lib.sh workflows/scripts/lib/knowledge_store.sh
+bash workflows/scripts/build/bounded-suite.sh --label test_state_graph.sh -- bash workflows/scripts/build/tests/test_state_graph.sh	workflows/scripts/build/state-graph.sh workflows/scripts/build/tests/test_state_graph.sh workflows/scripts/board/lib/cache.sh workflows/scripts/board/lib/board.sh workflows/scripts/config/ontology-registry.tsv workflows/scripts/config/join-keys-lib.sh
+bash workflows/scripts/build/bounded-suite.sh --label test_state_graph_local.sh -- bash workflows/scripts/build/tests/test_state_graph_local.sh	workflows/scripts/build/state-graph.sh workflows/scripts/build/tests/test_state_graph_local.sh workflows/scripts/board/lib/cache.sh workflows/scripts/board/lib/board.sh workflows/scripts/config/ontology-registry.tsv workflows/scripts/config/join-keys-lib.sh workflows/scripts/lib/knowledge_store.sh
 # `state-graph.sh query <name>` (temperloop#1910 L6): pure functions of a
 # snapshot JSON, plus the shared route-alphabet fixture and the ontology
 # registry it is checked against.
-bash workflows/scripts/build/tests/test_state_graph_queries.sh	workflows/scripts/build/state-graph.sh workflows/scripts/build/tests/test_state_graph_queries.sh workflows/scripts/build/tests/fixtures/state-graph-routes.json workflows/scripts/config/ontology-registry.tsv
+bash workflows/scripts/build/bounded-suite.sh --label test_state_graph_queries.sh -- bash workflows/scripts/build/tests/test_state_graph_queries.sh	workflows/scripts/build/state-graph.sh workflows/scripts/build/tests/test_state_graph_queries.sh workflows/scripts/build/tests/fixtures/state-graph-routes.json workflows/scripts/config/ontology-registry.tsv
 # `state-graph.sh soak` (temperloop#1910, this item): the mechanical soak
 # runner, plus the reconcile.sh script it independently invokes through the
 # _sg_reconcile seam and the cache.sh accessors its log rides.
-bash workflows/scripts/build/tests/test_state_graph_soak.sh	workflows/scripts/build/state-graph.sh workflows/scripts/build/tests/test_state_graph_soak.sh workflows/scripts/board/lib/cache.sh workflows/scripts/board/lib/board.sh workflows/scripts/board/reconcile.sh workflows/scripts/config/ontology-registry.tsv
+bash workflows/scripts/build/bounded-suite.sh --label test_state_graph_soak.sh -- bash workflows/scripts/build/tests/test_state_graph_soak.sh	workflows/scripts/build/state-graph.sh workflows/scripts/build/tests/test_state_graph_soak.sh workflows/scripts/board/lib/cache.sh workflows/scripts/board/lib/board.sh workflows/scripts/board/reconcile.sh workflows/scripts/config/ontology-registry.tsv
 bash workflows/scripts/validate-state-graph-call.sh	workflows/scripts/validate-state-graph-call.sh workflows/scripts/build/state-graph.sh claude/commands/build.md
 bash workflows/scripts/tests/test_state_graph_call.sh	workflows/scripts/validate-state-graph-call.sh workflows/scripts/build/state-graph.sh workflows/scripts/tests/test_state_graph_call.sh claude/commands/build.md
 make test-build-workflow	workflows/scripts/build/** claude/workflows/** workflows/scripts/lib/portable-timeout.sh
@@ -335,7 +349,7 @@ bash workflows/scripts/model-comparison/tests/test_replay_preflight.sh	workflows
 bash workflows/scripts/model-comparison/tests/test_replay_preflight_two_arm.sh	workflows/scripts/model-comparison/tests/test_replay_preflight_two_arm.sh workflows/scripts/model-comparison/replay.sh workflows/scripts/model-comparison/stats.sh workflows/scripts/model-comparison/** workflows/scripts/report-producers/model-comparison workflows/scripts/build/quota-gate.sh workflows/scripts/build/build.config.sh workflows/scripts/config/setting-registry.tsv workflows/scripts/lib/cannot-evaluate.sh
 bash workflows/scripts/model-comparison/tests/test_replay_preflight_cost_unit.sh	workflows/scripts/model-comparison/tests/test_replay_preflight_cost_unit.sh workflows/scripts/model-comparison/replay.sh workflows/scripts/model-comparison/stats.sh workflows/scripts/model-comparison/** workflows/scripts/report-producers/model-comparison workflows/scripts/build/quota-gate.sh workflows/scripts/build/build.config.sh workflows/scripts/config/setting-registry.tsv workflows/scripts/lib/cannot-evaluate.sh
 bash workflows/scripts/model-comparison/tests/test_replay_preflight_derive.sh	workflows/scripts/model-comparison/tests/test_replay_preflight_derive.sh workflows/scripts/model-comparison/replay.sh workflows/scripts/model-comparison/stats.sh workflows/scripts/model-comparison/** workflows/scripts/emit-model-usage.sh workflows/scripts/build/quota-gate.sh workflows/scripts/build/build.config.sh workflows/scripts/config/setting-registry.tsv workflows/scripts/lib/cannot-evaluate.sh
-bash workflows/scripts/build/tests/test_dual_build_preflight.sh	workflows/scripts/build/tests/test_dual_build_preflight.sh workflows/scripts/build/dual-build-preflight.sh workflows/scripts/build/build.config.sh workflows/scripts/model-comparison/candidate-session.sh workflows/scripts/lib/land-on-protected-main.sh workflows/scripts/lib/cannot-evaluate.sh workflows/scripts/config/setting-registry.tsv scripts/quality-gates.sh
+bash workflows/scripts/build/bounded-suite.sh --label test_dual_build_preflight.sh -- bash workflows/scripts/build/tests/test_dual_build_preflight.sh	workflows/scripts/build/tests/test_dual_build_preflight.sh workflows/scripts/build/dual-build-preflight.sh workflows/scripts/build/build.config.sh workflows/scripts/model-comparison/candidate-session.sh workflows/scripts/lib/land-on-protected-main.sh workflows/scripts/lib/cannot-evaluate.sh workflows/scripts/config/setting-registry.tsv scripts/quality-gates.sh
 bash workflows/scripts/model-comparison/tests/test_live_tagging.sh	workflows/scripts/model-comparison/tests/test_live_tagging.sh workflows/scripts/model-comparison/tagging.sh workflows/scripts/model-comparison/** workflows/scripts/emit-model-usage.sh workflows/scripts/validate-model-usage-emit.sh workflows/scripts/build/build.config.sh workflows/scripts/config/setting-registry.tsv workflows/scripts/lib/portable-timeout.sh
 bash workflows/scripts/model-comparison/tests/test_tagging_arms_trailer.sh	workflows/scripts/model-comparison/tests/test_tagging_arms_trailer.sh workflows/scripts/model-comparison/tagging.sh workflows/scripts/model-comparison/** workflows/scripts/lib/portable-timeout.sh
 bash workflows/scripts/model-comparison/tests/test_replay_score.sh	workflows/scripts/model-comparison/tests/test_replay_score.sh workflows/scripts/model-comparison/replay.sh workflows/scripts/model-comparison/score.sh workflows/scripts/model-comparison/candidate-session.sh workflows/scripts/model-comparison/allowlist.sh workflows/scripts/model-comparison/** workflows/scripts/validate-provider-disclosure.sh workflows/scripts/emit-model-usage.sh workflows/scripts/build/worktree.sh workflows/scripts/build/build.config.sh workflows/scripts/config/setting-registry.tsv workflows/scripts/lib/portable-timeout.sh workflows/scripts/lib/cannot-evaluate.sh workflows/scripts/lib/spawn-diagnostic.sh scripts/quality-gates.sh
@@ -458,7 +472,15 @@ bash workflows/scripts/kernel/tests/test_kernel_lib_resolve.sh	workflows/scripts
 bash workflows/scripts/kernel/tests/test_kernel_lib_portability.sh	workflows/scripts/kernel/**
 make test-producer-egress	workflows/scripts/kernel/** workflows/scripts/report-producers/** .temperloop/report.d/** bin/**
 make test-conventions-probe	workflows/scripts/probe/** bin/**
-make test-cli-subcommands	bin/** workflows/scripts/probe/**
+# PER-SCRIPT FAMILY ROW (temperloop#2162), same shape and same reason as the
+# build-tests family row above: `make test-cli-subcommands` is no longer a
+# gate, bin/subcommands/tests/ is glob-expanded into one bounded gate per
+# script, and this PATTERN key maps the whole family so a newly added
+# test_*.sh needs no edit here. Globs are the umbrella's own, plus the guard
+# every expanded gate now runs through — a change to bounded-suite.sh reaches
+# these gates and lives outside bin/**, so without naming it a scoped run
+# would exercise the wrapper's build-side callers only.
+bash workflows/scripts/build/bounded-suite.sh --label * -- bash bin/subcommands/tests/test_*.sh	bin/** workflows/scripts/probe/** workflows/scripts/build/bounded-suite.sh
 make test-demo	workflows/scripts/demo/**
 make test-proposal-pr	workflows/scripts/proposal/**
 make test-testbed-source	workflows/scripts/testbed/**

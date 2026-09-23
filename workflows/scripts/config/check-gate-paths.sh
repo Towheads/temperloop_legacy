@@ -19,10 +19,13 @@
 #      `[kernel]` layer has a row. A gate with no row still RUNS at selection
 #      time (gate-selection.sh over-runs rather than under-runs), but leaving
 #      it unmapped is drift, so it fails here rather than quietly widening
-#      every PR's run forever.
+#      every PR's run forever. A row may be keyed EXACTLY or, since
+#      temperloop#2162, by a PATTERN that globs a whole family of gates — see
+#      the note at check 2 below.
 #   3. NO STALE ROWS  every row key is either a reserved pseudo-key (`ALL`,
-#      `none`) or a gate that currently exists. A row naming a deleted gate is
-#      dead weight that hides a rename.
+#      `none`) or a gate that currently exists — for a pattern key, at least
+#      one current gate it globs. A row naming a deleted gate is dead weight
+#      that hides a rename.
 #   4. REACHABLE     every glob-bearing row has at least one glob that matches
 #      at least one git-tracked path. THIS is the check the issue's second
 #      constraint asks for: a gate whose globs can never match is a gate that
@@ -205,20 +208,54 @@ if [[ ${#KEY_BY_INDEX[@]} -eq 0 ]]; then
 fi
 
 # --- 2. completeness ---------------------------------------------------------
+# A gate is mapped by an EXACT row, or (temperloop#2162) by a PATTERN row whose
+# key globs it. Pattern rows exist because quality-gates.sh glob-expands two
+# test directories into one gate per script: demanding a literal row per script
+# would reinstate the hand-enumeration trap the expansion removes — adding a
+# new test_*.sh would turn THIS check red until someone also edited the map.
+# `_gs_key_is_pattern` / `_gs_key_matches_gate` are the SHARED predicates from
+# gate-selection.sh (already sourced above), never a second copy — the same
+# reason `_gs_path_matches_glob` is shared: a validator that judges the map by
+# a different rule than the consumer applies is its own false-green.
+_gp_gate_is_mapped() {
+  local gate="$1" k
+  grep -Fxq -- "$gate" <<<"$KEYS" && return 0
+  for k in "${KEY_BY_INDEX[@]}"; do
+    case "$k" in ALL|none) continue ;; esac
+    _gs_key_is_pattern "$k" || continue
+    _gs_key_matches_gate "$k" "$gate" && return 0
+  done
+  return 1
+}
+
 while IFS= read -r gate; do
   [[ -n "$gate" ]] || continue
-  if ! grep -Fxq -- "$gate" <<<"$KEYS"; then
+  if ! _gp_gate_is_mapped "$gate"; then
     _gp_issue "gate has no row in the map (add one, or the gate widens every scoped run): $gate"
   fi
 done <<<"$KERNEL_GATE_LIST"
 
 # --- 3. no stale rows --------------------------------------------------------
+# A PATTERN row is live when it globs at least one CURRENT gate, so a family row
+# whose directory was deleted or renamed still fails here — which is exactly the
+# staleness this check exists to catch, just one level up from a literal key.
+_gp_key_names_a_gate() {
+  local key="$1" g
+  grep -Fxq -- "$key" <<<"$ALL_GATE_LIST" && return 0
+  _gs_key_is_pattern "$key" || return 1
+  while IFS= read -r g; do
+    [[ -n "$g" ]] || continue
+    _gs_key_matches_gate "$key" "$g" && return 0
+  done <<<"$ALL_GATE_LIST"
+  return 1
+}
+
 i=0
 while [[ $i -lt ${#KEY_BY_INDEX[@]} ]]; do
   key="${KEY_BY_INDEX[$i]}"
   i=$((i + 1))
   case "$key" in ALL|none) continue ;; esac
-  if ! grep -Fxq -- "$key" <<<"$ALL_GATE_LIST"; then
+  if ! _gp_key_names_a_gate "$key"; then
     if [[ $CONSUMER -eq 1 ]]; then
       printf '  [skip] row names a gate absent from this composed tree (vendoring consumer): %s\n' "$key"
     else
@@ -251,7 +288,7 @@ while [[ $i -lt ${#KEY_BY_INDEX[@]} ]]; do
   if [[ $CONSUMER -eq 1 ]]; then
     case "$key" in
       ALL|none) ;;
-      *) if ! grep -Fxq -- "$key" <<<"$ALL_GATE_LIST"; then continue; fi ;;
+      *) if ! _gp_key_names_a_gate "$key"; then continue; fi ;;
     esac
   fi
   # `read -r -a`, never a bare `for glob in $globs` — the latter pathname-expands

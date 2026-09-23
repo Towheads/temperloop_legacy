@@ -713,6 +713,122 @@ else
   fail "anti-burial: $buried real-bug gate(s) left the consumer's gate set"
 fi
 
+# ==========================================================================
+# PER-SCRIPT EXPANSION OF THE TWO FORMER UMBRELLA GATES (temperloop#2162)
+#
+# Third selector over "which gates a run contains", after the diff scoping
+# (1-18) and the class gating (19-21): how the list is COMPOSED in the first
+# place. `make test-build` and `make test-cli-subcommands` were each ONE entry
+# that looped a whole directory glob SERIALLY, and the pool schedules per LIST
+# ENTRY — so the two longest poles in the set were the two the pool could not
+# spread. They are now glob-expanded into one gate per script at list time.
+#
+# 22b is the load-bearing case. It is what makes "glob-expanded at list time"
+# a CHECKABLE property rather than a claim: an author who swaps the expansion
+# for a hand-typed list of 73 filenames passes 22a and 22c and fails HERE the
+# moment a test is added or renamed — which is the staleness the expansion
+# exists to prevent, and the reason the issue rejected enumeration outright.
+#
+# Run against the REAL script through `--list`, which composes the set and
+# exits before any gate runs (same hermetic trick cases 19-21 use).
+# ==========================================================================
+EXP_LIST="$(bash "$SRC" --list 2>/dev/null)"
+
+# --------------------------------------------------------------------------
+# 22a. Neither umbrella target is a gate any more.
+# --------------------------------------------------------------------------
+umbrella_left=0
+for _u in 'make test-build' 'make test-cli-subcommands'; do
+  # `grep -Fx … >/dev/null`, never `grep -Fxq`: scripts/lint-pipe-grep-q.sh
+  # rejects the `q` form here, and the redirect is the fix it names.
+  if grep -Fx "[kernel]  $_u" <<<"$EXP_LIST" >/dev/null 2>&1; then
+    umbrella_left=$((umbrella_left + 1))
+    echo "  still a gate: $_u" >&2
+  fi
+done
+if [ "$umbrella_left" -ne 0 ]; then
+  fail "22a an umbrella gate is still registered — the pool cannot spread it"
+else
+  pass "22a neither make test-build nor make test-cli-subcommands is a gate"
+fi
+
+# --------------------------------------------------------------------------
+# 22b. The expanded set EQUALS the on-disk glob, in both directions, with each
+#      script registered exactly ONCE. The once-each half is not decoration:
+#      five of these scripts used to carry a second, hand-typed literal entry
+#      and would otherwise run twice per suite run.
+# --------------------------------------------------------------------------
+exp_missing=0
+exp_dupe=0
+for _d in workflows/scripts/build/tests bin/subcommands/tests; do
+  for _f in "$REPO_ROOT/$_d"/test_*.sh; do
+    [ -e "$_f" ] || continue
+    _rel="$_d/$(basename "$_f")"
+    _n="$(grep -cF -- " -- bash $_rel" <<<"$EXP_LIST" | tr -d ' ')"
+    case "$_n" in
+      1) ;;
+      0) exp_missing=$((exp_missing + 1)); echo "  not a gate: $_rel" >&2 ;;
+      *) exp_dupe=$((exp_dupe + 1)); echo "  registered $_n times: $_rel" >&2 ;;
+    esac
+  done
+done
+exp_orphan=0
+while IFS= read -r _g; do
+  [ -n "$_g" ] || continue
+  _p="${_g##* -- bash }"
+  case "$_p" in
+    workflows/scripts/build/tests/*|bin/subcommands/tests/*)
+      [ -f "$REPO_ROOT/$_p" ] \
+        || { exp_orphan=$((exp_orphan + 1)); echo "  gate names a missing script: $_p" >&2; } ;;
+  esac
+done < <(sed -n 's/^\[kernel\]  //p' <<<"$EXP_LIST" | grep -F -- ' -- bash ')
+if [ "$exp_missing" -eq 0 ] && [ "$exp_dupe" -eq 0 ] && [ "$exp_orphan" -eq 0 ]; then
+  pass "22b the expanded gate set equals the two directories' test_*.sh glob, exactly once each"
+else
+  fail "22b expansion drifted from the glob: $exp_missing missing, $exp_dupe duplicated, $exp_orphan orphaned"
+fi
+
+# --------------------------------------------------------------------------
+# 22c. Every per-script gate keeps a WALL-CLOCK BOUND. temperloop#2184 wrapped
+#      the umbrella targets in bounded-suite.sh because an unbounded suite hung
+#      ~50h with nothing going red; once the GATE stops being the umbrella, an
+#      unwrapped per-script gate reopens that defect at a finer granularity —
+#      and this file's own gate list already states the house position on it
+#      ("a HUNG gate does not FAIL — it burns the runner to the job timeout").
+#      This is the case that stops a later "simplify" from dropping the wrapper.
+# --------------------------------------------------------------------------
+exp_unbounded=0
+while IFS= read -r _g; do
+  [ -n "$_g" ] || continue
+  case "$_g" in
+    "bash workflows/scripts/build/bounded-suite.sh --label "*" -- bash "*) ;;
+    *) exp_unbounded=$((exp_unbounded + 1)); echo "  unbounded: $_g" >&2 ;;
+  esac
+done < <(sed -n 's/^\[kernel\]  //p' <<<"$EXP_LIST" \
+  | grep -E -- ' bash (workflows/scripts/build|bin/subcommands)/tests/test_[^ ]*\.sh$')
+if [ "$exp_unbounded" -eq 0 ]; then
+  pass "22c every per-script gate runs through bounded-suite.sh (the #2184 bound survives the split)"
+else
+  fail "22c $exp_unbounded per-script gate(s) carry no wall-clock bound"
+fi
+
+# --------------------------------------------------------------------------
+# 22d. The umbrella MAKE TARGETS still resolve. They are no longer the gate,
+#      but four rows of workflows/scripts/config/mandatory-step-registry.tsv
+#      still name `make test-build` as their execution signal, and a kernel dev
+#      still runs both by hand.
+# --------------------------------------------------------------------------
+mk_missing=""
+for _t in test-build test-cli-subcommands; do
+  make -C "$REPO_ROOT" -n "$_t" >/dev/null 2>&1 \
+    || mk_missing="${mk_missing:+$mk_missing }$_t"
+done
+if [ -z "$mk_missing" ]; then
+  pass "22d make test-build and make test-cli-subcommands still resolve as targets"
+else
+  fail "22d umbrella target(s) no longer resolve: $mk_missing"
+fi
+
 echo
 if [ "$fail_count" -eq 0 ]; then
   echo "OK — quality-gates.sh --scoped + gate classing: all cases passed"
