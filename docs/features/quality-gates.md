@@ -261,8 +261,10 @@ Four properties are worth knowing:
   `test_*.sh` becomes a gate with no edit to `quality-gates.sh` and none to
   `gate-paths.tsv` — whose two rows for these families are **pattern keys**
   (`bash …/bounded-suite.sh --label * -- bash …/tests/test_*.sh`) for the same
-  reason. Exact keys still win, so a single script can keep its own pinpoint
-  row; the four state-graph suites and `test_dual_build_preflight.sh` do.
+  reason. Every row that names a script is unioned, never ranked — a single
+  script can keep its own pinpoint row for extra triggers without it
+  cancelling the family row's reach; the four state-graph suites and
+  `test_dual_build_preflight.sh` do.
   `scripts/tests/test_quality_gates_scoped.sh` case 22b asserts the expanded
   set **equals** the on-disk glob, which is what makes "glob-expanded" a
   checkable property rather than a claim.
