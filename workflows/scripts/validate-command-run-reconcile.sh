@@ -51,15 +51,27 @@
 # FAIL CLOSED. A validator that cannot evaluate its input reports that and
 # exits non-zero — it never prints OK over an input it never read (the
 # temperloop#1409 class). So: no jq, an explicitly-targeted stream that is
-# absent / unreadable / empty, an explicitly-targeted open-dir that is not a
-# readable directory, an unparseable stream, an unreadable marker, or a
-# non-numeric $CMD_RUN_OPEN_GRACE_SECS are all exit 1 — and so is the LAKE
-# DIRECTORY itself when it is not a directory, or is a directory this process
-# cannot list (unreadable/unsearchable), or was named EXPLICITLY (`--raw-dir`
-# or $CMD_RUN_RAW_DIR) and is absent or holds no `command-runs-*.jsonl`. The
-# explicit/default asymmetry is the same one `--stream` and `--open-dir`
-# already implement: a caller who NAMES a lake has asserted it exists, so an
-# empty result set from it is an unread input, not a clean run.
+# absent / unreadable / empty, an unparseable stream, an unreadable marker,
+# or a non-numeric $CMD_RUN_OPEN_GRACE_SECS are all exit 1.
+#
+# EVERY DIRECTORY SURFACE GOES THROUGH ONE SHARED CLASSIFIER, `classify_dir`.
+# This guard has two of them — the LAKE (`--raw-dir`, $CMD_RUN_RAW_DIR, or the
+# per-host default) and the OPEN LEDGER (`--open-dir`, or the default
+# `<lake>/command-run-open`) — and the SAME fail-open bug was written on each
+# of them in turn, because each was classified by its own bespoke block. It is
+# classified in exactly one place now, so a surface added later inherits the
+# guard rather than repeating the bug a fourth time. The verdict is closed:
+#   * a path that EXISTS but is NOT A DIRECTORY, and
+#   * a directory this process cannot LIST (it needs BOTH `-r` and `-x`)
+# fail closed on EVERY surface in EITHER mode; and
+#   * a path that is simply ABSENT fails closed when it was named EXPLICITLY,
+# and is handed back to the caller otherwise — that one state is the only one
+# whose meaning differs per surface (a host that has not emitted yet, versus a
+# ledger no run ever opened), so it is the only judgement a caller still makes.
+# A lake named explicitly that holds no `command-runs-*.jsonl` fails closed on
+# top of that. The explicit/default asymmetry is the same one `--stream`
+# already implements: a caller who NAMES a target has asserted it exists, so
+# an empty result set from it is an unread input, not a clean run.
 #
 # The ONE case that is legitimately exit 0 is DEFAULT mode — no `--raw-dir`,
 # no $CMD_RUN_RAW_DIR — finding a present, readable lake directory (or no
@@ -67,9 +79,11 @@
 # per-host and gitignored, so "this host has not emitted yet" is a real,
 # expected state and not a broken property.
 #
-# THREE WAYS THIS GUARD ONCE FAILED **OPEN** — all three closed, all three
+# FOUR WAYS THIS GUARD ONCE FAILED **OPEN** — all four closed, all four
 # regression-tested, because a reconciliation guard that cannot fail closed is
-# strictly worse than no guard at all: it manufactures confidence.
+# strictly worse than no guard at all: it manufactures confidence. Three of
+# the four are ONE CLASS on three different surfaces, which is why the fourth
+# fix was a shared classifier rather than a third bespoke patch.
 #   * A SPACED LAKE PATH. The file list was accumulated as a space-joined
 #     string and expanded unquoted into `cat $stream_files`. A path containing
 #     a space split into non-existent fragments, `cat`'s error went to
@@ -98,7 +112,23 @@
 #     now CLASSIFIED BEFORE the glob (not-a-directory and unlistable both fail
 #     closed in either mode), and an explicitly-named lake that is absent or
 #     holds no matching file fails closed too — the same asymmetry `--stream`
-#     and `--open-dir` already implement.
+#     already implements.
+#   * AN UN-LISTABLE OPEN LEDGER. Pre-existing since this file's first commit,
+#     and missed by all three of the reviews that closed the three above — the
+#     tell that the CLASS, not any one surface, was the thing left open. The
+#     `--open-dir` validation tested directory-ness ALONE (`[ ! -d ]`) while
+#     its own message said "is not a readable directory", and Check 1's loop
+#     was gated on a bare `[ -d ]`. A ledger that IS a directory but cannot be
+#     LISTED made `for m in "$open_dir"/*.json` fail to expand, the
+#     `[ -f "$m" ] || continue` swallowed the unexpanded pattern, the loop body
+#     never ran, and `fail` stayed 0 — so an aged `emitted=0` MISSING-RUN alarm
+#     sitting in that ledger became INVISIBLE and the guard printed its clean
+#     reduction verdict straight over it. `--open-dir` is EXPLICIT targeting,
+#     so by the asymmetry above it should have been the STRICTEST surface; it
+#     was the laxest. And this is the MISSING half — the half this guard's
+#     scope was widened to cover after one session produced seven runs and
+#     zero records. Both surfaces now share `classify_dir`, and Check 1 runs
+#     only over a ledger that classifier confirmed listable.
 #
 # SETTINGS (named, never valued here — the kernel's § Named-setting
 # convention; `workflows/scripts/config/setting-registry.tsv` records the
@@ -179,6 +209,52 @@ case "$CMD_RUN_OPEN_GRACE_SECS" in
     exit 1 ;;
 esac
 
+# ── The SHARED directory classifier ──────────────────────────────────────
+# ONE closed answer to "can this directory be LISTED?", used by EVERY
+# directory surface this guard has, and inherited by any added later.
+#
+# WHY IT IS SHARED (the header's fourth "failed OPEN"). The identical
+# fail-open was written three times on three surfaces and survived three
+# review rounds: a bare `[ -d "$d" ]` (or `[ ! -d "$d" ]`) followed by a glob
+# and a `[ -f "$x" ] || continue` folds four genuinely different states —
+# listable, present-but-unlistable, absent, and not-a-directory — into ONE
+# empty file list, and the caller's empty-list arm then prints something
+# reassuring over a read that FAILED. Patching each surface as it was found is
+# precisely how the class survived; it is closed here once, for all of them
+# (kernel principle 5, counter AI failure modes structurally; principle 6,
+# limit blast radius through boundaries).
+#
+# Usage:   classify_dir <path> <explicit 0|1> <what-it-is-for>
+# Returns: 0  listable — the caller may glob it
+#          1  a CLOSED failure; the message is already on stderr, the caller
+#             exits 1 without deciding anything
+#          2  absent AND not explicitly named — SILENT, and the only state
+#             handed back to the caller, because it is the only one whose
+#             meaning differs per surface. Every other state fails on every
+#             surface, so no caller can get it wrong.
+classify_dir() {
+  cd_path="$1"; cd_explicit="$2"; cd_what="$3"
+  if [ -e "$cd_path" ] && [ ! -d "$cd_path" ]; then
+    printf '%s: FAIL CANNOT EVALUATE — %s is not a directory, so the %s it names can never be listed. An unlistable directory is an unread input, never an empty one.\n' \
+      "$self" "$cd_path" "$cd_what" >&2
+    return 1
+  fi
+  if [ -d "$cd_path" ]; then
+    if [ ! -r "$cd_path" ] || [ ! -x "$cd_path" ]; then
+      printf '%s: FAIL CANNOT EVALUATE — %s is not a readable, searchable directory (listing one needs BOTH r and x), so this %s is indistinguishable from one that is genuinely empty. Fix its permissions; a reconciliation guard never reports a clean verdict over a directory it could not open.\n' \
+        "$self" "$cd_path" "$cd_what" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [ "$cd_explicit" -eq 1 ]; then
+    printf '%s: FAIL CANNOT EVALUATE — the %s %s was named EXPLICITLY but does not exist. A named target that is absent is a mistargeted probe, not a clean run.\n' \
+      "$self" "$cd_what" "$cd_path" >&2
+    return 1
+  fi
+  return 2
+}
+
 # ── Resolve the inputs ───────────────────────────────────────────────────
 explicit_streams=0
 [ -n "$streams" ] && explicit_streams=1
@@ -197,27 +273,18 @@ if [ "$explicit_streams" -eq 0 ]; then
     raw_dir="$repo_root/meta/data/raw"       # the default, per-host lake
   fi
 
-  # CLASSIFY THE DIRECTORY BEFORE GLOBBING IT (the header's third "failed
-  # OPEN"). The glob below plus `[ -f "$f" ] || continue` collapses four very
-  # different states into one empty file list — readable-but-empty, unreadable,
-  # absent, and not-a-directory — and the empty-list arm prints the sanctioned
-  # exit-0 sentence over ALL of them. A lake that holds a real record but is
-  # `chmod 000` then asserts this host emitted nothing: a conclusion fabricated
-  # from a read that failed, which is the exact class this guard exists to
-  # close. So each state is named and dispositioned here, before the glob runs.
-  if [ -e "$raw_dir" ] && [ ! -d "$raw_dir" ]; then
-    printf '%s: FAIL CANNOT EVALUATE — %s is not a directory, so the command-run lake it names can never be listed. An unlistable lake is an unread input, never an empty one.\n' "$self" "$raw_dir" >&2
-    exit 1
-  fi
-  if [ -d "$raw_dir" ]; then
-    if [ ! -r "$raw_dir" ] || [ ! -x "$raw_dir" ]; then
-      printf '%s: FAIL CANNOT EVALUATE — %s is not a readable, searchable directory, so a lake this process cannot LIST is indistinguishable from one that is genuinely empty. Fix its permissions; a reconciliation guard never reports "this host has emitted nothing" over a directory it could not open.\n' "$self" "$raw_dir" >&2
-      exit 1
-    fi
-  elif [ "$raw_dir_explicit" -eq 1 ]; then
-    printf '%s: FAIL CANNOT EVALUATE — the lake %s was named explicitly (--raw-dir, or the CMD_RUN_RAW_DIR setting) but does not exist. A named lake that is absent is a mistargeted probe, not a host that has emitted nothing.\n' "$self" "$raw_dir" >&2
-    exit 1
-  fi
+  # CLASSIFY THE DIRECTORY BEFORE GLOBBING IT — through the SHARED classifier
+  # above, never a block of its own. The glob below plus `[ -f "$f" ] ||
+  # continue` collapses four very different states into one empty file list —
+  # listable-but-empty, unlistable, absent, and not-a-directory — and the
+  # empty-list arm prints the sanctioned exit-0 sentence over ALL of them. A
+  # lake that holds a real record but is `chmod 000` then asserts this host
+  # emitted nothing: a conclusion fabricated from a read that failed. Only
+  # rc=2 (absent, and NOT explicitly named) comes back for this surface to
+  # judge, and its judgement is the documented exit-0 case below.
+  classify_dir "$raw_dir" "$raw_dir_explicit" \
+    "command-run lake (--raw-dir, the CMD_RUN_RAW_DIR setting, or this host's default)"
+  [ "$?" -ne 1 ] || exit 1
 
   for f in "$raw_dir"/command-runs-*.jsonl; do
     [ -f "$f" ] || continue
@@ -256,9 +323,21 @@ $streams
 EOF
 fi
 
-if [ -n "$open_dir" ] && [ "$open_dir_explicit" -eq 1 ] && [ ! -d "$open_dir" ]; then
-  printf '%s: FAIL CANNOT EVALUATE — --open-dir %s is not a readable directory, so a run that started and never emitted cannot be detected.\n' "$self" "$open_dir" >&2
-  exit 1
+# THE OPEN LEDGER, through the SAME classifier (the header's fourth "failed
+# OPEN"). This surface used to test directory-ness ALONE while claiming to
+# test readability, so a ledger that could not be LISTED hid every marker in
+# it — including the aged `emitted=0` markers that ARE the MISSING-RUN alarm.
+# The classifier's verdict is also what gates Check 1 below: the loop runs
+# ONLY over a ledger this process confirmed it can list, never over a bare
+# `[ -d ]` that a chmod-000 directory satisfies.
+open_dir_listable=0
+if [ -n "$open_dir" ]; then
+  classify_dir "$open_dir" "$open_dir_explicit" \
+    "open ledger (--open-dir, or the default <lake>/command-run-open)"
+  case "$?" in
+    0) open_dir_listable=1 ;;
+    1) exit 1 ;;
+  esac
 fi
 
 # ── Reduce ───────────────────────────────────────────────────────────────
@@ -346,7 +425,7 @@ legacy_count="$(printf '%s' "$report" | jq -r '[.runs[] | select(.legacy)] | len
 cutover="$(printf '%s' "$report" | jq -r '.cutover // "none"')"
 
 # ── Check 1: MISSING-RUN (a run that started and never emitted) ──────────
-if [ -n "$open_dir" ] && [ -d "$open_dir" ]; then
+if [ "$open_dir_listable" -eq 1 ]; then
   now_epoch="$(date -u +%s)"
   for m in "$open_dir"/*.json; do
     [ -f "$m" ] || continue

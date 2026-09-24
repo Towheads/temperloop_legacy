@@ -54,6 +54,19 @@
 #   17. `\b` in the caller-doc presence lint let `--open --command
 #       triage-feedback` satisfy the `triage` check by itself.
 #
+# Sections 18-19 cover the round-4 review finding — the SAME fail-open class as
+# 11 and 14, on its THIRD surface, pre-existing since the guard's first commit
+# and missed by all three earlier rounds:
+#   18. the OPEN LEDGER directory could not be LISTED, and the guard printed
+#       its clean reduction verdict straight over an aged emitted=0
+#       MISSING-RUN alarm sitting in it — on the surface that EXPLICIT
+#       targeting should make the strictest, and on the MISSING half of the
+#       property. Both directory surfaces now share ONE classifier, asserted
+#       here mechanically so a fourth surface inherits the guard.
+#   19. the header's own completeness claim ("N ways this guard once failed
+#       open") had contradicted the code four rounds running, so it is
+#       asserted from the file rather than maintained by hand.
+#
 # Synthetic lake under a throwaway tmpdir (CMD_RUN_RAW_DIR / --raw-dir).
 # Zero network; never writes outside the tmpdir.
 
@@ -707,6 +720,99 @@ if [ -f "$LINT" ]; then
     bad "and is green again on the real triage.md" "still red"
   fi
 fi
+
+echo "── 18. the OPEN LEDGER directory is classified too (round 4, HIGH) ──"
+# THE SAME fail-open class as sections 11 and 14, on its THIRD surface —
+# pre-existing since the guard's first commit and a miss of rounds 1, 2 AND 3.
+# The `--open-dir` validation tested directory-ness ONLY (`[ ! -d ]`) while its
+# own message said "is not a readable directory", and Check 1's loop gate was a
+# bare `[ -d ]`. A ledger that IS a directory but cannot be LISTED made
+# `for m in "$open_dir"/*.json` fail to expand, `[ -f "$m" ] || continue`
+# swallowed the literal pattern, the loop body never ran, and the guard printed
+# its clean verdict over an aged emitted=0 MISSING-RUN alarm sitting right
+# there. `--open-dir` is EXPLICIT targeting, so by this guard's own stated
+# asymmetry it should be the STRICTEST surface; it was the laxest.
+#
+# The fix is NOT a third bespoke patch: one shared `classify_dir` helper now
+# classifies EVERY directory surface, so a fourth surface inherits the guard.
+OL="$TMP/open-ledger"; mkdir -p "$OL/command-run-open"
+printf '%s\n' '{"ts":"2026-09-23T19:31:04Z","run_id":"run-present","session_id":"sess-ol","command":"fix","board":7,"items_processed":1,"merged":1,"resolved":0,"parked":0,"reported_no_op":0}' \
+  > "$OL/command-runs-2026-09.jsonl"
+printf '%s\n' '{"run_id":"run-ALARM","command":"fix","session_id":"sess-ol","board":7,"opened_at":"1970-01-01T00:00:01Z","opened_epoch":1,"emitted":0}' \
+  > "$OL/command-run-open/sess-ol__fix.json"
+
+recon --raw-dir "$OL"
+check_eq "control: a LISTABLE ledger's aged emitted=0 alarm is read and goes red" "1" "$RECON_RC"
+case "$RECON_OUT" in *"MISSING-RUN  run_id=run-ALARM"*) ok "control: and the alarm is named" ;;
+  *) bad "control: and the alarm is named" "got [$RECON_OUT]" ;; esac
+
+if [ "$(id -u)" -ne 0 ]; then
+  chmod 000 "$OL/command-run-open"
+
+  recon --stream "$OL/command-runs-2026-09.jsonl" --open-dir "$OL/command-run-open"
+  check_eq "an UNREADABLE explicitly-named --open-dir: exit 1 (CANNOT EVALUATE), not 0" "1" "$RECON_RC"
+  case "$RECON_OUT" in *"record(s) reduce to"*)
+      bad "an unlistable open ledger never prints the clean reduction verdict" \
+        "it printed exactly that over a hidden alarm: [$RECON_OUT]" ;;
+    *) ok "an unlistable open ledger never prints the clean reduction verdict" ;; esac
+  case "$RECON_OUT" in *"not a readable, searchable directory"*)
+      ok "and the failure says the LEDGER could not be LISTED, not merely that it is absent" ;;
+    *) bad "and the failure says the LEDGER could not be LISTED" "got [$RECON_OUT]" ;; esac
+
+  # The DEFAULT twin: the same ledger reached as <lake>/command-run-open. An
+  # unlistable directory is an unread input on EVERY surface in EITHER mode,
+  # so the shared classifier fails it closed here too.
+  recon --raw-dir "$OL"
+  check_eq "…and the DEFAULT <lake>/command-run-open twin fails closed identically" "1" "$RECON_RC"
+  case "$RECON_OUT" in *"record(s) reduce to"*)
+      bad "the default-mode unlistable ledger never prints the clean verdict either" "got [$RECON_OUT]" ;;
+    *) ok "the default-mode unlistable ledger never prints the clean verdict either" ;; esac
+
+  chmod 755 "$OL/command-run-open"
+  recon --raw-dir "$OL"
+  case "$RECON_OUT" in *"MISSING-RUN  run_id=run-ALARM"*)
+      ok "GREEN twin: readable again, the SAME ledger's SAME alarm is read once more" ;;
+    *) bad "GREEN twin: readable again, the SAME ledger's SAME alarm is read once more" "got [$RECON_OUT]" ;; esac
+else
+  ok "the unlistable-open-ledger cases [skipped: running as root, where chmod 000 is not a read barrier]"
+fi
+
+: > "$TMP/ledger-is-a-file"
+recon --stream "$OL/command-runs-2026-09.jsonl" --open-dir "$TMP/ledger-is-a-file"
+check_eq "an --open-dir that is NOT A DIRECTORY: exit 1 (CANNOT EVALUATE), not 0" "1" "$RECON_RC"
+
+# The one state that is NOT a failure on this surface: a present, readable
+# ledger holding no markers. Every run that opened has closed, which is the
+# healthy steady state — failing it would make the guard red on every host.
+mkdir -p "$TMP/empty-ledger"
+recon --stream "$OL/command-runs-2026-09.jsonl" --open-dir "$TMP/empty-ledger"
+check_eq "an EMPTY but readable --open-dir stays GREEN: no open marker is a real, expected state" "0" "$RECON_RC"
+
+# ONE classifier, not three. The lake surface and the ledger surface must
+# reach the SAME helper — that is what makes a fourth surface inherit the
+# guard instead of repeating the bug a fourth time.
+# `grep -c` exits 1 on zero matches, so the count is taken from the STATUS,
+# never from an `|| echo 0` that would concatenate two lines into "0\n0".
+CLASSIFY_CALLS="$(grep -c 'classify_dir "' "$RECON" 2>/dev/null)" || CLASSIFY_CALLS=0
+case "$CLASSIFY_CALLS" in ''|*[!0-9]*) CLASSIFY_CALLS=0 ;; esac
+if [ "$CLASSIFY_CALLS" -ge 2 ]; then
+  ok "one SHARED classify_dir is called by both directory surfaces ($CLASSIFY_CALLS call sites)"
+else
+  bad "one SHARED classify_dir is called by both directory surfaces" \
+    "found $CLASSIFY_CALLS call site(s) — a third bespoke block is how this class survived three rounds"
+fi
+
+echo "── 19. the header's completeness claims are TRUE at this HEAD (round 4) ──"
+# In a guard whose entire job is honest reporting, a completeness claim the
+# code contradicts IS a defect. Round 4 is the fourth time this item shipped
+# one, so it is asserted mechanically from here on.
+grep_ok "the header no longer claims only THREE ways it failed open" "FOUR WAYS" "$RECON"
+if grep -Fq 'THREE WAYS THIS GUARD ONCE FAILED' "$RECON"; then
+  bad "the superseded THREE-WAYS claim is gone" "the header still says THREE"
+else
+  ok "the superseded THREE-WAYS claim is gone"
+fi
+grep_ok "the header names the shared classifier by name" "classify_dir" "$RECON"
 
 printf '\n'
 if [ "$fail" -gt 0 ]; then

@@ -285,3 +285,20 @@ workflows/scripts/validate-command-run-reconcile.sh	empty	covered	workflows/scri
 workflows/scripts/validate-command-run-reconcile.sh:--raw-dir	absent	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an absent explicitly-named --raw-dir: exit 1 (CANNOT EVALUATE), not 0
 workflows/scripts/validate-command-run-reconcile.sh:--raw-dir	unreadable	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an UNREADABLE lake DIRECTORY: exit 1, never 'this host has emitted no telemetry yet'
 workflows/scripts/validate-command-run-reconcile.sh:--raw-dir	empty	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an explicitly-named lake holding no command-runs-*.jsonl: exit 1 (CANNOT EVALUATE), not 0
+
+# -- validate-command-run-reconcile.sh:--open-dir (temperloop#2220 round 4).
+#    The OPEN LEDGER is the THIRD directory surface of the same class, and it
+#    carried the same fail-open from this guard's first commit through three
+#    review rounds -- the tell that the CLASS, not any one surface, was what
+#    stayed open. `--open-dir` was validated for directory-ness ALONE while
+#    its own message claimed readability, and Check 1's loop was gated on a
+#    bare `[ -d ]`: a ledger that IS a directory but cannot be LISTED made
+#    the `*.json` glob fail to expand, `[ -f "$m" ] || continue` swallowed the
+#    unexpanded pattern, and an aged emitted=0 MISSING-RUN alarm sitting in
+#    that ledger became invisible while the guard printed its clean verdict.
+#    Both directory surfaces now share ONE classifier (classify_dir), so a
+#    fourth surface inherits the guard rather than repeating the bug.
+workflows/scripts/validate-command-run-reconcile.sh:--open-dir	absent	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an absent explicitly-named open-dir: exit 1 (CANNOT EVALUATE), not 0
+workflows/scripts/validate-command-run-reconcile.sh:--open-dir	unreadable	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an UNREADABLE explicitly-named --open-dir: exit 1 (CANNOT EVALUATE), not 0
+workflows/scripts/validate-command-run-reconcile.sh:--open-dir	empty	not-applicable	-	an EMPTY open ledger is the HEALTHY steady state, not a degenerate input: a marker exists only between a run's --open and its terminal emit, so a present, readable ledger holding no markers means every run that opened has closed. Failing it would turn this guard red on every correctly-behaving host -- the inverse of the unread-input class. The two shapes that ARE unread inputs on this surface (absent-when-named, and present-but-unlistable) are covered above, and the positive assertion that an empty readable ledger stays exit 0 is asserted in the same suite.
+

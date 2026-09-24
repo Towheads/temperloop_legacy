@@ -41,6 +41,23 @@
   case is unchanged but narrowed to what it always meant: **default** mode,
   no matching files. A record count that could not be read now also fails
   closed as MISSING-RUN rather than silently skipping that marker.
+- **…and on the OPEN LEDGER, through one shared directory classifier** (#2220).
+  The same fail-open had a third surface, present since the guard's first
+  commit: `--open-dir` was validated for directory-**ness** alone while its own
+  message claimed readability, and the MISSING-RUN loop was gated on a bare
+  `[ -d ]`. A ledger that is a directory but cannot be **listed** made the
+  `*.json` glob fail to expand, `[ -f "$m" ] || continue` swallowed the
+  unexpanded pattern, and an aged `emitted=0` MISSING-RUN alarm sitting in that
+  ledger became invisible while the guard printed its clean reduction verdict
+  — on the half of the property the guard was widened to cover, and on the
+  surface that explicit targeting should make the *strictest*. Rather than a
+  third bespoke patch, every directory surface now goes through one shared
+  `classify_dir`: not-a-directory and unlistable (needing both `r` and `x`)
+  fail closed on every surface in either mode, absent fails closed when the
+  target was named explicitly, and a surface added later inherits the guard
+  instead of repeating the bug. An empty but readable ledger stays green — no
+  open marker is the healthy steady state. The header's completeness claim is
+  now asserted mechanically by the suite rather than maintained by hand.
 - **A terminal emit now closes only the open-ledger marker it adopted** (#2220).
   `emit-command-run.sh`'s close path `rm`-ed whatever sat on the ledger key
   whenever nothing was parked — including a marker the run never adopted: an

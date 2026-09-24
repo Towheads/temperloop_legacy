@@ -192,6 +192,27 @@
 #   * `--open` also PRUNES spent markers — held past the adoption TTL with a
 #     record already emitted, so nothing can adopt them again. A marker with
 #     emitted=0 is never pruned at any age: that one IS the alarm below.
+#
+#     THE TRADE-OFF THAT BUYS, STATED RATHER THAN HIDDEN (temperloop#2220
+#     round 3, LOW). `--open` is the ONLY reaper. Because the close path now
+#     retires only the marker its own emit ADOPTED, a marker that was held
+#     (emitted > 0) and has since aged past $CMD_RUN_RUN_ID_TTL_SECS is SPENT
+#     but LINGERS on disk until the next `--open` on this host runs the prune.
+#     That is accepted deliberately, and the cost is bounded and inert:
+#       - a spent marker cannot be adopted (it is past the TTL), so it can
+#         never merge two runs onto one run id;
+#       - it cannot raise a false MISSING-RUN either, because that check fires
+#         on `emitted == 0` or a run id absent from the stream, and a spent
+#         marker has emitted > 0 with its record already in the lake;
+#       - the ledger stays bounded at one file per (session, command, target)
+#         key, and every instrumented run starts with an `--open`, so the
+#         lingering window is one run, not unbounded growth.
+#     The alternative — reaping on the close path too — was rejected: it would
+#     put a directory scan plus a jq read per marker on the terminal-emit hot
+#     path of every command run, to retire OTHER runs' inert files a few
+#     minutes earlier, and it would re-touch the exact close-path logic whose
+#     unconditional `rm` was the round-3 defect. Lingering is the cheaper,
+#     safer side of that trade.
 #   * A marker left behind with emitted=0 is a run that started and never
 #     emitted. workflows/scripts/validate-command-run-reconcile.sh is the
 #     guard that reads it and goes red — on that MISSING case and on the
