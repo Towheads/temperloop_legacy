@@ -383,13 +383,21 @@ KERNEL_GATES=(
   # exactly ONE record per run, a property that breaks in BOTH directions: a
   # /fix run that parks at the merge gate and merges later in the SAME run
   # emits twice, and a run whose terminal emit is never called emits nothing
-  # at all. The fixture suite proves the run_id + open-ledger fix and shows
-  # the guard red-then-green on each half. The guard itself reads THIS HOST's
-  # own lake: in CI there is none (the lake is gitignored and per-host),
-  # which is its one documented exit-0 path, so it never gates a PR on
-  # another machine's data -- on a developer box it is a real alarm.
+  # at all. This fixture suite proves the run_id + open-ledger fix and shows
+  # the guard red-then-green on each half, over synthetic lakes in a tmpdir.
+  #
+  # ONLY the fixture suite is gated here. Running the guard against THIS
+  # HOST's own live lake was tried and deliberately REVERSED (round-2 review):
+  # meta/data/raw is mutable per-host state that no diff produces, while every
+  # other KERNEL_GATES entry is hermetic. One abandoned emitted=0 marker --
+  # a killed session, a crashed run, precisely what the open ledger exists to
+  # RECORD -- would turn this gate red for every later merge and every /build
+  # item on that host, remediable only by a manual `rm` nobody is told about.
+  # That is project principle 3 (deterministic tests over host state) losing
+  # to a guard that is not even asserting the change under review. The live
+  # lake is swept by /tidy's environment-hygiene step instead, where a
+  # stale-marker report is the natural output (claude/commands/tidy.md).
   "bash workflows/scripts/tests/test_command_run_reconcile.sh"
-  "bash workflows/scripts/validate-command-run-reconcile.sh"
   # command-run emitter's epics_reviewed/epics_closed/epics_left_open
   # schema extension (temperloop item "epic-closing-gate", epic #1847) — the
   # /sweep end-of-run epic-closing gate's tally. Covers: the three fields are

@@ -70,7 +70,7 @@ Run in parallel:
 4. **Resolve board state once via the adapter.** `source "$BOARD_LIB"; board_resolve "$BOARD"` issues a SINGLE whole-board item read and caches it in the shell (`BOARD_ITEMS_JSON`) — so nothing re-lists per item, and the whole-board read cost lives in one place (GH #396). Status is carried on `fnd:status:*` labels and the adapter owns that encoding — no per-board special-casing here. `board_set_status` takes `BOARD_OPT_BACKLOG` / `BOARD_OPT_READY` / `BOARD_OPT_DONE` by name.
 5. For each analysis-doc path in `$1..$N`: `Read` on the path resolved against the knowledge store root (`workflows/scripts/lib/knowledge_store.contract.md`) to confirm it exists; note word count (≥10k → chunked reads in Step 1).
 6. **Source the tunable-setting config** — `source workflows/scripts/build/build.config.sh` (bare repo-relative, the same shape `/build` Step 0 item 6 uses). This is the ONE place this spec's tunables get their values, per the kernel's § Named-setting convention: every later reference names the setting symbolically (`$TRIAGE_INTAKE_EXCLUDE_LABELS`) and never restates its value inline. Best-effort (`|| true`) — a checkout that doesn't vendor the file simply skips it, and the Step-1 exclusion still applies because `triage-intake-exclusion.sh` carries its own documented fallback.
-7. **Open this run's telemetry ledger** (best-effort, `|| true`-safe, absent-checkout-safe — the opening half of Step 4.9's emit, temperloop#2220): `"$(git rev-parse --show-toplevel)/workflows/scripts/emit-command-run.sh" --open --command triage --board "$BOARD" || true` — and on a `--feedback-only` run, `--open --command triage-feedback` instead, matching the `--command` value Step 6.5 emits under (the ledger is keyed on that value, so opening under the wrong one leaves the run's real emit unmatched). ONE call, here, at the run's start. It mints this run's stable `run_id` and records it in the open ledger, so the stream stays **reducible to exactly one record per run** in both directions: several records describing one run collapse on the shared id, and a run that emits **nothing at all** leaves an un-emitted marker behind as its only trace. The terminal emit adopts the marker's id by itself; no id is carried between steps. A failure here is a no-op (the emit still writes a record, with a freshly minted id). `workflows/scripts/validate-command-run-reconcile.sh` is the guard that reads both halves.
+7. **Open this run's telemetry ledger** (best-effort, `|| true`-safe, absent-checkout-safe — the opening half of Step 4.9's emit, temperloop#2220): `"$(git rev-parse --show-toplevel)/workflows/scripts/emit-command-run.sh" --open --command triage --board "$BOARD" --target "$BOARD" || true` — and on a `--feedback-only` run, `--open --command triage-feedback` instead, matching the `--command` value Step 6.5 emits under (the ledger is keyed on that value, so opening under the wrong one leaves the run's real emit unmatched). `--target "$BOARD"` is keyed on too and must match the terminal emit's: the board is `/triage`'s run identity, so two boards triaged concurrently from one session no longer collapse onto one marker and one run id (temperloop#2220 round 2). ONE call, here, at the run's start. It mints this run's stable `run_id` and records it in the open ledger, so the stream stays **reducible to exactly one record per run** in both directions: several records describing one run collapse on the shared id, and a run that emits **nothing at all** leaves an un-emitted marker behind as its only trace. The terminal emit adopts the marker's id by itself; no id is carried between steps. A failure here is a no-op (the emit still writes a record, with a freshly minted id). `workflows/scripts/validate-command-run-reconcile.sh` is the guard that reads both halves.
 
 If any check fails, surface in one line and stop — except item 7, which never stops a run.
 
@@ -358,7 +358,7 @@ All board bash blocks below `source "$BOARD_LIB"` first (Step 0.3); let `repo="$
 
 ```bash
 "$(git rev-parse --show-toplevel)/workflows/scripts/emit-command-run.sh" \
-  --command triage --board "$BOARD" \
+  --command triage --board "$BOARD" --target "$BOARD" \
   --items-processed <K+M+Q — total candidates considered, Step 0.6/Step 1 (the full Backlog scan, INCLUDING the N the milestone filter deferred and the X the label exclusion skipped)> \
   --merged <S — survivors promoted to Ready (active phase), Step 4.7> \
   --resolved <C+D — culled (Step 4.8) + decisions routed off-board (Step 4.8)> \
@@ -537,7 +537,7 @@ So a `--feedback-only` run emits its own record under a **distinct `command` val
 
 ```bash
 "$(git rev-parse --show-toplevel)/workflows/scripts/emit-command-run.sh" \
-  --command triage-feedback --board "$BOARD" \
+  --command triage-feedback --board "$BOARD" --target "$BOARD" \
   --items-processed <Q — queue size, 6.4> \
   --merged <A+B+F — clarifications answered + decisions answered + escalations disposed> \
   --parked <G — deferred, left in the queue>

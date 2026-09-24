@@ -16,10 +16,17 @@
 # Usage:
 #   emit-command-run.sh --command sweep|triage|fix --board <N> \
 #     --items-processed <N> --merged <N> --resolved <N> --parked <N> \
-#     --reported-no-op <N> [--epic <N>] [--run-id <id>]
-#   emit-command-run.sh --open --command sweep|triage|fix [--board <N>]
+#     --reported-no-op <N> [--epic <N>] [--run-id <id>] [--target <id>]
+#   emit-command-run.sh --open --command sweep|triage|fix [--board <N>] \
+#     [--target <id>]
 #     → mints this run's stable run id, records it in the OPEN LEDGER, and
 #       prints it. Called ONCE, at the start of a run. See THE RUN LEDGER.
+#
+#   --target is the RUN's own identity within a session: the thing this run
+#   drives (a /fix target, a /sweep board). It never enters the record — it
+#   only keys the open ledger — and a run's `--open` call and its terminal
+#   emit MUST pass the SAME value, or the terminal emit cannot find the
+#   marker to adopt. See THE RUN LEDGER's "ONE MARKER PER RUN" note.
 #
 # Appends ONE JSONL line to:
 #   ${CMD_RUN_RAW_DIR:-<repo>/meta/data/raw}/command-runs-YYYY-MM.jsonl
@@ -143,8 +150,33 @@
 # not called). Detecting that needs a witness that the run STARTED, so this
 # script keeps a tiny open ledger beside the stream:
 #
-#   ${CMD_RUN_RAW_DIR:-<repo>/meta/data/raw}/command-run-open/<session>__<command>.json
-#     {run_id, command, session_id, board, opened_at, opened_epoch, emitted}
+#   ${CMD_RUN_RAW_DIR:-<repo>/meta/data/raw}/command-run-open/<session>__<command>[__<target>].json
+#     {run_id, command, session_id, board, target, opened_at, opened_epoch, emitted}
+#
+# ONE MARKER PER RUN — why the key carries `--target`. The key was once
+# (session, command) alone, on the stated premise that only one run of one
+# command runs per session at a time. That premise is FALSE, and was disproved
+# by ordinary operator usage in the very session that built this: `/fix 2220
+# and 2224` ran two /fix runs CONCURRENTLY in one session. Two live runs, one
+# key — one marker, one run id, and whichever `--open` came second silently
+# overwrote the first run's held id. A run id that two runs share is the same
+# double-count the field exists to prevent, one layer down. So the key carries
+# the run's target, `--open` NEVER clobbers a marker that is still live on its
+# key (it reuses it and says so on stderr), and a STALE un-emitted marker — the
+# MISSING-RUN alarm — is moved aside rather than overwritten, because deleting
+# the alarm before any guard reads it is the failure this ledger exists to
+# report. A caller that passes no `--target` keeps the old (session, command)
+# key verbatim, so nothing about an existing marker changes shape.
+#
+# `nosession` (the $CLAUDE_CODE_SESSION_ID-unset fallback) is a KNOWN, bounded
+# residue, disposed rather than fixed: outside Claude Code every run keys on
+# the same `nosession` stem, so two manual runs of one command CAN meet on one
+# key. Target-keying removes the common case (two manual runs on different
+# targets no longer collide), and the never-clobber rule removes the damaging
+# half of what is left — a collision now REUSES the held id and warns, instead
+# of destroying it. A PID would make the key unique but unusable: the marker's
+# whole job is to be found by a LATER, SEPARATE process (the terminal emit), so
+# a key no other process can reconstruct is not a ledger.
 #
 #   * `--open` (run start) mints a run id, writes the marker with emitted=0,
 #     and prints the id.
@@ -224,6 +256,7 @@ self="$(basename "$0")"
 command=""
 board=""
 run_id=""
+target=""
 open_mode=0
 items_processed=""
 merged=""
@@ -255,6 +288,7 @@ while [ $# -gt 0 ]; do
     --reported-no-op) reported_no_op="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     --epic) epic="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     --run-id) run_id="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    --target) target="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     --open) open_mode=1; shift ;;
     --epics-reviewed) epics_reviewed="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     --epics-closed) epics_closed="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
@@ -283,7 +317,12 @@ fi
 # any checkout that vendors this file, not just a hardcoded
 # $HOME/dev/foundation path. Resolved HERE rather than just before the
 # append, because `--open` writes the ledger and never reaches that point.
-here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# BOTH resolutions carry a fallback. `here` used to have none while the very
+# next line's did — and an empty `here` makes "$here/../.." resolve to `/`,
+# where `cd -P` SUCCEEDS, so that line's `||` fallback could never fire.
+here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || here=""
+[ -n "$here" ] || here="$(dirname "${BASH_SOURCE[0]}")"
+[ -n "$here" ] || here="."
 raw_root="$(cd -P "$here/../.." 2>/dev/null && pwd || echo "$HOME/dev/foundation")"
 raw_dir="${CMD_RUN_RAW_DIR:-$raw_root/meta/data/raw}"
 open_dir="$raw_dir/command-run-open"
@@ -294,32 +333,81 @@ open_dir="$raw_dir/command-run-open"
 # under-count this field exists to prevent, one layer over.
 : "${CMD_RUN_RUN_ID_TTL_SECS:=43200}"
 
-# The ledger is keyed on (session, command): one run of one command per
-# session at a time, which is what every caller spec actually does.
+# A malformed TTL silently disables the freshness bound it exists to be: the
+# bare `[ … -le "$CMD_RUN_RUN_ID_TTL_SECS" ]` below returns 2 on a plausible
+# typo like `12h`, the adoption arm reads that as "too old", and every emit
+# mints a fresh id — so a park and its later merge stop sharing a run id and
+# the run double-counts again, with nothing said. This emitter never FAILS a
+# caller (see WARN, DON'T DROP), so it warns loudly and falls back to the
+# documented default rather than running with a bound it cannot evaluate. The
+# fallback re-runs the SAME `${VAR:=…}` seam so the literal never diverges
+# from workflows/scripts/config/setting-registry.tsv.
+case "$CMD_RUN_RUN_ID_TTL_SECS" in
+  ''|*[!0-9]*)
+    printf '%s: WARN CMD_RUN_RUN_ID_TTL_SECS must be a whole number of SECONDS, got "%s" — falling back to the default. Left unchecked this disables the open-marker freshness bound entirely, so a parked run and its later merge would stop sharing a run id.\n' \
+      "$self" "$CMD_RUN_RUN_ID_TTL_SECS" >&2
+    unset CMD_RUN_RUN_ID_TTL_SECS
+    : "${CMD_RUN_RUN_ID_TTL_SECS:=43200}"
+    ;;
+esac
+
+# The ledger is keyed on (session, command, target) — see THE RUN LEDGER's
+# "ONE MARKER PER RUN" note for why the target is load-bearing and not
+# decoration. A caller that passes no --target keeps the old (session,
+# command) key byte-for-byte, so existing markers keep their names.
 # Only the KEY is sanitised — never the resolved sink path, which may
 # legitimately contain characters this filter would mangle.
-marker_key="$(printf '%s__%s' "${CLAUDE_CODE_SESSION_ID:-nosession}" "$command" | tr -c 'A-Za-z0-9._-' '_')"
+marker_key_raw="${CLAUDE_CODE_SESSION_ID:-nosession}__$command"
+if [ -n "$target" ]; then
+  marker_key_raw="${marker_key_raw}__$target"
+fi
+marker_key="$(printf '%s' "$marker_key_raw" | tr -c 'A-Za-z0-9._-' '_')"
 marker_path="$open_dir/$marker_key.json"
 
 mint_run_id() {  # → a fresh, sortable, collision-resistant run id
   printf 'run-%s-%04x%04x\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$RANDOM" "$RANDOM"
 }
 
+# ATOMIC. `jq … > "$marker_path"` truncates the file and then fills it, so a
+# concurrent reader — the reconcile guard, or another emit adopting the id —
+# can catch it empty or half-written, and the guard maps an unparseable marker
+# to a hard FAIL. Writing a sibling temp file and `mv -f`-ing it into place is
+# a rename within one directory, which is atomic, and costs nothing.
 write_marker() {  # $1=run_id $2=opened_at $3=opened_epoch $4=emitted → 0 ok
+  local tmp
   mkdir -p "$open_dir" 2>/dev/null || return 1
+  tmp="$marker_path.tmp.$$"
   jq -nc \
     --arg run_id "$1" \
     --arg command "$command" \
     --arg session_id "${CLAUDE_CODE_SESSION_ID:-}" \
     --arg board "$board" \
+    --arg target "$target" \
     --arg opened_at "$2" \
     --argjson opened_epoch "$3" \
     --argjson emitted "$4" \
     '{run_id: $run_id, command: $command,
       session_id: (if $session_id == "" then null else $session_id end),
       board: (if $board == "" then null else ($board | tonumber? // $board) end),
+      target: (if $target == "" then null else $target end),
       opened_at: $opened_at, opened_epoch: $opened_epoch, emitted: $emitted}' \
-    > "$marker_path" 2>/dev/null || return 1
+    > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$marker_path" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# read_marker <path> → sets MK_RID / MK_EPOCH / MK_EMITTED from that marker
+# (empty / 0 / 0 when it cannot be read or parsed). Shared by --open below and
+# the adoption arm further down, so the two can never read a marker
+# differently.
+read_marker() {
+  MK_RID=""; MK_EPOCH=0; MK_EMITTED=0
+  [ -r "$1" ] || return 1
+  MK_RID="$(jq -r '.run_id // empty' "$1" 2>/dev/null)" || MK_RID=""
+  MK_EPOCH="$(jq -r '.opened_epoch // 0' "$1" 2>/dev/null)" || MK_EPOCH=0
+  MK_EMITTED="$(jq -r '.emitted // 0' "$1" 2>/dev/null)" || MK_EMITTED=0
+  case "$MK_EPOCH" in ''|*[!0-9]*) MK_EPOCH=0 ;; esac
+  case "$MK_EMITTED" in ''|*[!0-9]*) MK_EMITTED=0 ;; esac
   return 0
 }
 
@@ -348,8 +436,37 @@ prune_spent_markers() {
 
 if [ "$open_mode" -eq 1 ]; then
   prune_spent_markers
+  open_now_epoch="$(date -u +%s)"
+  MK_RID=""; MK_EPOCH=0; MK_EMITTED=0
+  read_marker "$marker_path" || true
+
+  # NEVER CLOBBER A LIVE MARKER. The previous `> "$marker_path"` minted a
+  # fresh id and dropped the held one on the floor, so the run that opened
+  # first lost the very id its own terminal emit would have adopted. Within
+  # the TTL this key is still somebody's live run: hand that run's id back
+  # (a re-run of Step 0 in one run is idempotent this way) and say so.
+  if [ -z "$run_id" ] && [ -n "$MK_RID" ] \
+     && [ "$((open_now_epoch - MK_EPOCH))" -le "$CMD_RUN_RUN_ID_TTL_SECS" ]; then
+    printf '%s: WARN an open marker is already LIVE on this ledger key (%s, run_id=%s, emitted=%s) — reusing its run id rather than overwriting it. If these are two DIFFERENT runs, give each its own --target: a run id is per RUN, and two runs sharing one is exactly the double-count it exists to prevent.\n' \
+      "$self" "$marker_key" "$MK_RID" "$MK_EMITTED" >&2
+    printf '%s\n' "$MK_RID"
+    exit 0
+  fi
+
   [ -n "$run_id" ] || run_id="$(mint_run_id)"
-  if ! write_marker "$run_id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(date -u +%s)" 0; then
+
+  # A marker we are about to REPLACE is either a stale un-emitted MISSING-RUN
+  # alarm (never pruned, at any age — that one IS the alarm) or a live marker
+  # an explicit --run-id is displacing. Either way, overwriting it deletes a
+  # record the reconcile guard has not read yet, so move it aside instead. It
+  # stays a *.json in the same ledger dir, so the guard still finds it.
+  if [ -n "$MK_RID" ] && [ "$MK_RID" != "$run_id" ]; then
+    mv -f "$marker_path" \
+      "$open_dir/${marker_key}__$(printf '%s' "$MK_RID" | tr -c 'A-Za-z0-9._-' '_').json" \
+      2>/dev/null || true
+  fi
+
+  if ! write_marker "$run_id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$open_now_epoch" 0; then
     # Warn-don't-drop, same contract as every other failure here: the run id
     # is still printed, so the run stays reducible even with no ledger — only
     # the MISSING-run detection degrades.
@@ -452,12 +569,12 @@ marker_opened_epoch=0
 marker_emitted=0
 marker_run_id=""
 if [ -r "$marker_path" ]; then
-  marker_run_id="$(jq -r '.run_id // empty' "$marker_path" 2>/dev/null)" || marker_run_id=""
+  MK_RID=""; MK_EPOCH=0; MK_EMITTED=0
+  read_marker "$marker_path" || true
+  marker_run_id="$MK_RID"
+  marker_opened_epoch="$MK_EPOCH"
+  marker_emitted="$MK_EMITTED"
   marker_opened_at="$(jq -r '.opened_at // empty' "$marker_path" 2>/dev/null)" || marker_opened_at=""
-  marker_opened_epoch="$(jq -r '.opened_epoch // 0' "$marker_path" 2>/dev/null)" || marker_opened_epoch=0
-  marker_emitted="$(jq -r '.emitted // 0' "$marker_path" 2>/dev/null)" || marker_emitted=0
-  case "$marker_opened_epoch" in ''|*[!0-9]*) marker_opened_epoch=0 ;; esac
-  case "$marker_emitted" in ''|*[!0-9]*) marker_emitted=0 ;; esac
 fi
 
 if [ -n "$run_id" ]; then

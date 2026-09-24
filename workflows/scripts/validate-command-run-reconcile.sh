@@ -52,11 +52,36 @@
 # exits non-zero — it never prints OK over an input it never read (the
 # temperloop#1409 class). So: no jq, an explicitly-targeted stream that is
 # absent / unreadable / empty, an explicitly-targeted open-dir that is not a
-# readable directory, an unparseable stream, or an unreadable marker are all
-# exit 1. The ONE case that is legitimately exit 0 is the DEFAULT mode
-# finding no `command-runs-*.jsonl` at all: the lake is per-host and
-# gitignored, so "this host has not emitted yet" is a real, expected state and
-# not a broken property.
+# readable directory, an unparseable stream, an unreadable marker, or a
+# non-numeric $CMD_RUN_OPEN_GRACE_SECS are all exit 1. The ONE case that is
+# legitimately exit 0 is the DEFAULT mode finding no `command-runs-*.jsonl` at
+# all: the lake is per-host and gitignored, so "this host has not emitted yet"
+# is a real, expected state and not a broken property.
+#
+# TWO WAYS THIS GUARD ONCE FAILED **OPEN** — both closed, both regression-
+# tested, because a reconciliation guard that cannot fail closed is strictly
+# worse than no guard at all: it manufactures confidence.
+#   * A SPACED LAKE PATH. The file list was accumulated as a space-joined
+#     string and expanded unquoted into `cat $stream_files`. A path containing
+#     a space split into non-existent fragments, `cat`'s error went to
+#     /dev/null, `jq -s` over EMPTY input produced a perfectly valid empty
+#     report, and every check below passed vacuously — `ok — 0 record(s)`
+#     over a lake that was never read. The list is now an indexed ARRAY handed
+#     straight to `jq` (no `cat`), and jq's EXIT STATUS is kept and checked:
+#     a read that FAILED is distinguishable from a read that found nothing,
+#     which is this guard's entire job. Reachable from `--stream`,
+#     `--raw-dir` and `$CMD_RUN_RAW_DIR` alike.
+#   * A NON-NUMERIC GRACE WINDOW. `CMD_RUN_OPEN_GRACE_SECS=6h` made the
+#     `[ … -ge "$…" ]` age test return 2, which the surrounding `|| continue`
+#     read as an ordinary "no" — silently skipping the MISSING-RUN check for
+#     every marker while still exiting 0. A malformed setting now FAILS the
+#     guard loudly rather than disabling the half of it that the setting
+#     bounds.
+#
+# SETTINGS (named, never valued here — the kernel's § Named-setting
+# convention; `workflows/scripts/config/setting-registry.tsv` records the
+# defaults): $CMD_RUN_OPEN_GRACE_SECS bounds the MISSING-RUN check,
+# $CMD_RUN_RAW_DIR selects the lake.
 #
 # Usage:
 #   validate-command-run-reconcile.sh                  # this host's own lake
@@ -74,7 +99,12 @@
 set -uo pipefail
 
 self="$(basename "$0")"
-here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# BOTH resolutions carry a fallback. `here` used to have none while the very
+# next line's did: an empty `here` made "$here/../.." resolve to `/`, and the
+# `||` fallback on that line could then never fire because `cd -P /` succeeds.
+here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || here=""
+[ -n "$here" ] || here="$(dirname "${BASH_SOURCE[0]}")"
+[ -n "$here" ] || here="."
 repo_root="$(cd -P "$here/../.." 2>/dev/null && pwd || echo "$HOME/dev/foundation")"
 
 # How old an un-emitted open marker must be before it counts as a missing run
@@ -89,7 +119,9 @@ open_dir_explicit=0
 reduce_only=0
 
 usage() {
-  sed -n '2,70p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the header comment block, however long it is — a hard-coded line
+  # range silently truncates the usage text the next time the header grows.
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
 }
 
 while [ $# -gt 0 ]; do
@@ -110,6 +142,20 @@ if ! command -v jq >/dev/null 2>&1; then
   printf '%s: FAIL CANNOT EVALUATE — jq not found, so the stream cannot be parsed. Install jq; a reconciliation guard never reports OK over an input it could not read.\n' "$self" >&2
   exit 1
 fi
+
+# A malformed grace window is an EVALUATION failure, not a shrug. Left
+# unchecked, `CMD_RUN_OPEN_GRACE_SECS=6h` makes the age comparison in Check 1
+# return 2, which its `|| continue` reads as an ordinary "not yet old enough"
+# — so the MISSING-RUN arm is skipped for EVERY marker and the guard still
+# exits 0. That is the exact half of this property the item widened scope to
+# cover, disabled by a plausible typo, silently. Same `case` shape the marker
+# fields below and emit-command-run.sh's check_count() already use.
+case "$CMD_RUN_OPEN_GRACE_SECS" in
+  ''|*[!0-9]*)
+    printf '%s: FAIL CANNOT EVALUATE — CMD_RUN_OPEN_GRACE_SECS must be a whole number of SECONDS, got "%s". A non-numeric value makes the age test below return an error that reads as "still in flight", silently disabling the MISSING-RUN check for every marker while this guard still exits 0. Set it to an integer (see workflows/scripts/config/setting-registry.tsv) or unset it to take the default.\n' \
+      "$self" "$CMD_RUN_OPEN_GRACE_SECS" >&2
+    exit 1 ;;
+esac
 
 # ── Resolve the inputs ───────────────────────────────────────────────────
 explicit_streams=0
@@ -156,16 +202,33 @@ if [ -n "$open_dir" ] && [ "$open_dir_explicit" -eq 1 ] && [ ! -d "$open_dir" ];
 fi
 
 # ── Reduce ───────────────────────────────────────────────────────────────
-stream_files=""
+# An indexed ARRAY, never a space-joined string (see the header's "TWO WAYS
+# THIS GUARD ONCE FAILED OPEN"). bash-3.2 safe: `+=` on an indexed array is
+# 3.1+, and the array is proven non-empty before it is ever expanded, so no
+# empty-expansion abort under `set -u`.
+stream_files=()
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  stream_files="$stream_files $f"
+  stream_files+=("$f")
 done <<EOF
 $streams
 EOF
 
-# shellcheck disable=SC2086  # deliberate word-splitting of the collected list
-report="$(cat $stream_files 2>/dev/null | jq -s -c '
+if [ "${#stream_files[@]}" -eq 0 ]; then
+  printf '%s: FAIL CANNOT EVALUATE — the resolved stream list is empty, so nothing was read. A guard that reduces zero files reports "ok" over a lake it never opened.\n' "$self" >&2
+  exit 1
+fi
+
+stream_list="$(printf '%s ' "${stream_files[@]}")"
+stream_list="${stream_list% }"
+
+# jq OPENS THE FILES ITSELF — no `cat`, nothing word-split, and a parse error
+# names the offending file. Its stderr is captured rather than discarded and
+# its EXIT STATUS is kept: a read that FAILED must be distinguishable from a
+# read that found nothing.
+jq_err=""
+jq_err="$(mktemp "${TMPDIR:-/tmp}/command-run-reconcile.XXXXXX" 2>/dev/null)" || jq_err=""
+report="$(jq -s -c '
   map(select(type == "object"))
   | (map(select((.run_id // null) != null) | (.ts // "")) | sort | first) as $cutover
   | (to_entries | map(.value + {_i: .key}))
@@ -196,11 +259,18 @@ report="$(cat $stream_files 2>/dev/null | jq -s -c '
                      and $cutover != null
                      and (.ts // "") >= $cutover))
         | map({ts: (.ts // null), command: (.command // null), session_id: (.session_id // null)}))
-    }' 2>/dev/null)"
+    }' "${stream_files[@]}" 2>"${jq_err:-/dev/null}")"
+jq_rc=$?
 
-if [ -z "$report" ]; then
-  printf '%s: FAIL CANNOT EVALUATE — the command-run stream could not be parsed as JSONL (%s). A malformed stream is an unread input, never a clean one.\n' \
-    "$self" "$(printf '%s' "$stream_files" | sed 's/^ //')" >&2
+jq_msg=""
+if [ -n "$jq_err" ]; then
+  jq_msg="$(tr '\n' ' ' < "$jq_err" 2>/dev/null | sed 's/  */ /g; s/ *$//')"
+  rm -f "$jq_err" 2>/dev/null || true
+fi
+
+if [ "$jq_rc" -ne 0 ] || [ -z "$report" ]; then
+  printf '%s: FAIL CANNOT EVALUATE — the command-run stream could not be READ or parsed (jq exit %s over: %s)%s. An unread input is never a clean one — a lake path this guard cannot open must fail CLOSED here, not reduce to an empty report.\n' \
+    "$self" "$jq_rc" "$stream_list" "${jq_msg:+ — jq said: $jq_msg}" >&2
   exit 1
 fi
 
@@ -228,6 +298,7 @@ if [ -n "$open_dir" ] && [ -d "$open_dir" ]; then
     m_rid="$(jq -r '.run_id // empty' "$m" 2>/dev/null)" || m_rid=""
     m_cmd="$(jq -r '.command // "?"' "$m" 2>/dev/null)" || m_cmd="?"
     m_at="$(jq -r '.opened_at // "?"' "$m" 2>/dev/null)" || m_at="?"
+    m_tgt="$(jq -r '.target // "-"' "$m" 2>/dev/null)" || m_tgt="-"
     m_epoch="$(jq -r '.opened_epoch // 0' "$m" 2>/dev/null)" || m_epoch=0
     m_emitted="$(jq -r '.emitted // 0' "$m" 2>/dev/null)" || m_emitted=0
     case "$m_epoch" in ''|*[!0-9]*) m_epoch=0 ;; esac
@@ -241,8 +312,8 @@ if [ -n "$open_dir" ] && [ -d "$open_dir" ]; then
     [ "$((now_epoch - m_epoch))" -ge "$CMD_RUN_OPEN_GRACE_SECS" ] || continue
     seen="$(printf '%s' "$report" | jq -r --arg r "$m_rid" '[.runs[] | select(.run_id == $r)] | length')"
     if [ "$m_emitted" -eq 0 ] || [ "$seen" -eq 0 ]; then
-      printf 'FAIL  MISSING-RUN  run_id=%s command=%s opened_at=%s — this run opened and never produced a reducible record (emitted=%s, records in stream=%s). The run happened; the terminal emit did not. Call emit-command-run.sh at EVERY terminal route of /%s, then remove %s.\n' \
-        "$m_rid" "$m_cmd" "$m_at" "$m_emitted" "$seen" "$m_cmd" "$m"
+      printf 'FAIL  MISSING-RUN  run_id=%s command=%s target=%s opened_at=%s — this run opened and never produced a reducible record (emitted=%s, records in stream=%s). The run happened; the terminal emit did not. Call emit-command-run.sh at EVERY terminal route of /%s — passing the SAME --target the --open call used, or the terminal emit cannot find this marker to adopt — then remove %s.\n' \
+        "$m_rid" "$m_cmd" "$m_tgt" "$m_at" "$m_emitted" "$seen" "$m_cmd" "$m"
       fail=1
     fi
   done

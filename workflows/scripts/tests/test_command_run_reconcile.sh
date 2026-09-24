@@ -24,6 +24,19 @@
 # Every assertion is shown DISCRIMINATING: each red case has a green twin
 # differing only in the thing the fix changes.
 #
+# Sections 11-13 cover the round-2 review findings, all of which are ways the
+# machinery failed OPEN — it reported a clean property over an input it never
+# evaluated, which is worse than no guard because it manufactures confidence:
+#   11. a lake PATH CONTAINING A SPACE reduced to an empty report and passed
+#       (`ok - 0 record(s)`), and an unreadable lake read identically to an
+#       empty one.
+#   12. the open-ledger marker key carried no TARGET, so two concurrent /fix
+#       runs in one session shared one marker and one run id, and the second
+#       `--open` destroyed the first run's held id.
+#   13. a non-numeric *_SECS setting made the comparison it bounds return an
+#       error that the surrounding `|| continue` read as an ordinary "no",
+#       silently skipping the MISSING-RUN check while still exiting 0.
+#
 # Synthetic lake under a throwaway tmpdir (CMD_RUN_RAW_DIR / --raw-dir).
 # Zero network; never writes outside the tmpdir.
 
@@ -301,6 +314,9 @@ echo "── 9. the wiring is mechanically enforced in the caller docs ──"
 grep_ok "fix.md opens the run ledger" "--open --command fix" "$FIX_MD"
 grep_ok "sweep.md opens the run ledger" "--open --command sweep" "$SWEEP_MD"
 grep_ok "triage.md opens the run ledger" "--open --command triage" "$TRIAGE_MD"
+grep_ok "fix.md keys the ledger on its target (two concurrent /fix runs)" "--target" "$FIX_MD"
+grep_ok "sweep.md keys the ledger on its board" "--target" "$SWEEP_MD"
+grep_ok "triage.md keys the ledger on its board" "--target" "$TRIAGE_MD"
 if [ -f "$LINT" ]; then
   if bash "$LINT" >/dev/null 2>&1; then
     ok "validate-command-run-emit.sh is green on the real tree"
@@ -337,6 +353,178 @@ grep_ok "README dispositions the pre-#2220 backlog (no run_id ⇒ its own single
 grep_ok "README's record-shape line lists run_id" \
   '{ts, session_id, run_id, command' "$README"
 grep_ok "emit-command-run.sh documents the open ledger" "THE RUN LEDGER" "$EMIT"
+grep_ok "emit-command-run.sh documents one marker per RUN, not per (session, command)" \
+  "ONE MARKER PER RUN" "$EMIT"
+grep_ok "README documents the ledger's key shape" \
+  "<session>__<command>[__<target>].json" "$README"
+
+echo "── 11. the guard must FAIL CLOSED on a lake it cannot read (round 2, HIGH 1) ──"
+# The lake path is user-supplied from three surfaces (--stream, --raw-dir,
+# $CMD_RUN_RAW_DIR). A space in it once split the file list into non-existent
+# fragments; the read error was swallowed and `jq -s` over zero files produced
+# a valid EMPTY report, so every check passed vacuously.
+ONE_REC='{"ts":"2026-09-23T19:31:04Z","session_id":"sess-sp","run_id":"run-spaced","command":"fix","board":7,"items_processed":1,"merged":1,"resolved":0,"parked":0,"reported_no_op":0}'
+SP="$TMP/lake with a space"; mkdir -p "$SP"
+printf '%s\n' "$ONE_REC" > "$SP/command-runs-2026-09.jsonl"
+PLAIN="$TMP/lake-plain"; mkdir -p "$PLAIN"
+printf '%s\n' "$ONE_REC" > "$PLAIN/command-runs-2026-09.jsonl"
+
+recon --raw-dir "$PLAIN"
+plain_verdict="$RECON_OUT"
+recon --raw-dir "$SP"
+check_eq "a spaced lake path is READ, not silently reduced to nothing" \
+  "0 1" "$RECON_RC $(printf '%s\n' "$RECON_OUT" | sed -n 's/.*ok — \([0-9]*\) record(s).*/\1/p')"
+# The discriminating twin: byte-identical lakes, only the path differs.
+if [ "$(printf '%s' "$plain_verdict" | sed 's/.*ok —/ok —/')" = "$(printf '%s' "$RECON_OUT" | sed 's/.*ok —/ok —/')" ]; then
+  ok "and reads IDENTICALLY to the same bytes at a space-free path (the twin)"
+else
+  bad "and reads IDENTICALLY to the same bytes at a space-free path" \
+    "spaced=[$RECON_OUT] plain=[$plain_verdict]"
+fi
+recon --raw-dir "$SP" --reduce
+check_eq "the spaced lake's record actually reaches the reducer" \
+  "run-spaced" "$(printf '%s\n' "$RECON_OUT" | jq -r '.run_id')"
+recon --stream "$SP/command-runs-2026-09.jsonl"
+check_eq "--stream with a spaced path reads it too (the explicit surface)" "0" "$RECON_RC"
+
+# A read that FAILED must be distinguishable from a read that found nothing.
+if [ "$(id -u)" -ne 0 ]; then
+  UR="$TMP/lake-unreadable"; mkdir -p "$UR"
+  printf '%s\n' "$ONE_REC" > "$UR/command-runs-2026-09.jsonl"
+  chmod 000 "$UR/command-runs-2026-09.jsonl"
+  recon --raw-dir "$UR"
+  check_eq "an unreadable lake file: exit 1, never a clean 'ok — 0 record(s)'" "1" "$RECON_RC"
+  case "$RECON_OUT" in *"could not be READ or parsed"*)
+      ok "the failure says the input could not be READ (not that it was empty)" ;;
+    *) bad "the failure says the input could not be READ" "got [$RECON_OUT]" ;; esac
+  chmod 644 "$UR/command-runs-2026-09.jsonl"
+  recon --raw-dir "$UR"
+  check_eq "GREEN again once the same file is readable (the discriminating twin)" "0" "$RECON_RC"
+else
+  ok "the unreadable-lake case [skipped: running as root, where chmod 000 is not a read barrier]"
+fi
+
+echo "── 12. one marker per RUN, not per (session, command) (round 2, HIGH 2+3) ──"
+# `/fix 2220 and 2224` runs two /fix runs CONCURRENTLY in one session. Keyed on
+# (session, command) alone they collapsed onto one marker and one run id.
+CC="$TMP/concurrent"; mkdir -p "$CC"
+open_run() { # <target> → the run id
+  CMD_RUN_RAW_DIR="$CC" CLAUDE_CODE_SESSION_ID=sess-cc bash "$EMIT" \
+    --open --command fix --board 7 --target "$1" 2>/dev/null
+}
+emit_run() { # <target> <merged> <parked>
+  CMD_RUN_RAW_DIR="$CC" CLAUDE_CODE_SESSION_ID=sess-cc bash "$EMIT" \
+    --command fix --board 7 --target "$1" \
+    --items-processed 1 --merged "$2" --resolved 0 --parked "$3" --reported-no-op 0 >/dev/null 2>&1
+}
+RID_A="$(open_run 2220)"
+RID_B="$(open_run 2224)"
+if [ -n "$RID_A" ] && [ "$RID_A" != "$RID_B" ]; then
+  ok "two concurrent targets in ONE session get DISTINCT run ids"
+else
+  bad "two concurrent targets in ONE session get DISTINCT run ids" \
+    "both runs got [$RID_A] — one run id for two runs is the double-count this field prevents"
+fi
+check_eq "and each holds its OWN open marker" "2" "$(marker_count "$CC/command-run-open")"
+if [ -f "$CC/command-run-open/sess-cc__fix__2220.json" ] && [ -f "$CC/command-run-open/sess-cc__fix__2224.json" ]; then
+  ok "the marker key carries the target, so neither run can overwrite the other"
+else
+  bad "the marker key carries the target" \
+    "got: $(find "$CC/command-run-open" -type f -name '*.json' 2>/dev/null | tr '\n' ' ')"
+fi
+
+# Each run parks, then merges later in that SAME run — the real /fix shape.
+emit_run 2220 0 1
+emit_run 2224 0 1
+emit_run 2220 1 0
+emit_run 2224 1 0
+recon --raw-dir "$CC" --reduce
+check_eq "4 records from 2 concurrent runs reduce to exactly 2 runs" \
+  "2" "$(printf '%s\n' "$RECON_OUT" | jq -s 'length')"
+check_eq "each reduces to ONE merged item (neither double-counted)" \
+  "2 2" "$(printf '%s\n' "$RECON_OUT" | jq -s -r '"\([.[].merged] | add) \([.[].items_processed] | add)"')"
+recon --raw-dir "$CC"
+check_eq "and the guard is GREEN over both" "0" "$RECON_RC"
+
+# --open must never clobber a marker that is still LIVE on its key. This is
+# the residual (session, command) key — a caller that passes no --target.
+NC="$TMP/noclobber"; mkdir -p "$NC"
+NC_A="$(CMD_RUN_RAW_DIR="$NC" CLAUDE_CODE_SESSION_ID=sess-nc bash "$EMIT" --open --command fix 2>/dev/null)"
+NC_B="$(CMD_RUN_RAW_DIR="$NC" CLAUDE_CODE_SESSION_ID=sess-nc bash "$EMIT" --open --command fix 2>/dev/null)"
+NC_HELD="$(jq -r '.run_id' "$NC/command-run-open/sess-nc__fix.json" 2>/dev/null)"
+if [ -n "$NC_A" ] && [ "$NC_HELD" = "$NC_A" ] && [ "$NC_B" = "$NC_A" ]; then
+  ok "a second --open on a LIVE key reuses the held run id, never overwrites it"
+else
+  bad "a second --open on a LIVE key reuses the held run id" \
+    "first=[$NC_A] second=[$NC_B] marker now holds=[$NC_HELD] — the first run's id was lost"
+fi
+
+# A STALE un-emitted marker IS the missing-run alarm; --open must not erase it.
+AL="$TMP/alarm"; mkdir -p "$AL/command-run-open"
+cat > "$AL/command-run-open/sess-al__fix.json" <<'EOF'
+{"run_id":"run-ALARM","command":"fix","session_id":"sess-al","board":7,"target":null,"opened_at":"1970-01-01T00:00:01Z","opened_epoch":1,"emitted":0}
+EOF
+CMD_RUN_RAW_DIR="$AL" CLAUDE_CODE_SESSION_ID=sess-al bash "$EMIT" --open --command fix >/dev/null 2>&1
+if grep -lF 'run-ALARM' "$AL/command-run-open"/*.json >/dev/null 2>&1; then
+  ok "a stale un-emitted marker survives a later --open on the same key (the alarm is not erased)"
+else
+  bad "a stale un-emitted marker survives a later --open on the same key" \
+    "the MISSING-RUN alarm was deleted before any guard could read it"
+fi
+printf '%s\n' '{"ts":"2026-09-23T19:31:04Z","run_id":"run-other","command":"fix","items_processed":0,"merged":0,"resolved":0,"parked":0,"reported_no_op":0}' \
+  > "$AL/command-runs-2026-09.jsonl"
+recon --raw-dir "$AL"
+check_eq "and the guard still goes RED on it" "1" "$RECON_RC"
+case "$RECON_OUT" in *MISSING-RUN*run-ALARM*) ok "naming the preserved alarm's run id" ;;
+  *) bad "naming the preserved alarm's run id" "got [$RECON_OUT]" ;; esac
+
+# The marker write is ATOMIC: a temp sibling renamed into place, never a
+# truncate-then-fill a concurrent reader can catch half-written.
+if find "$CC/command-run-open" "$NC/command-run-open" -name '*.tmp.*' 2>/dev/null | grep . >/dev/null; then
+  bad "the marker write leaves no temp file behind" "a .tmp.<pid> sibling survived"
+else
+  ok "the marker write leaves no temp file behind (write-temp-then-rename)"
+fi
+
+echo "── 13. a non-numeric *_SECS setting is rejected LOUDLY, never skipped (round 2) ──"
+# `6h` / `12h` are plausible typos for something the registry calls `seconds`.
+# Bare `[ … -ge "$VAR" ]` returns 2 on one, which `|| continue` reads as an
+# ordinary "no" — disabling the MISSING-RUN check for every marker, silently.
+recon --raw-dir "$M1"
+check_eq "baseline: the missing-run lake is RED with a sane grace window" "1" "$RECON_RC"
+RECON_OUT="$(CMD_RUN_OPEN_GRACE_SECS=6h bash "$RECON" --raw-dir "$M1" 2>&1)"; RECON_RC=$?
+check_eq "a non-numeric CMD_RUN_OPEN_GRACE_SECS FAILS the guard (never a silent skip)" "1" "$RECON_RC"
+case "$RECON_OUT" in *CMD_RUN_OPEN_GRACE_SECS*)
+    ok "and the failure names the offending setting" ;;
+  *) bad "and the failure names the offending setting" "got [$RECON_OUT]" ;; esac
+case "$RECON_OUT" in *"ok — "*)
+    bad "a non-numeric grace window never prints an ok verdict" "it printed one: [$RECON_OUT]" ;;
+  *) ok "a non-numeric grace window never prints an ok verdict" ;; esac
+
+# Same class on the emitter side. It never FAILS a caller, so the contract is
+# warn-loudly-and-fall-back rather than exit non-zero.
+TT="$TMP/ttl"; mkdir -p "$TT"
+TTL_ERR="$(CMD_RUN_RUN_ID_TTL_SECS=12h CMD_RUN_RAW_DIR="$TT" CLAUDE_CODE_SESSION_ID=sess-ttl \
+  bash "$EMIT" --open --command fix 2>&1 >/dev/null)"
+TTL_RC=$?
+check_eq "a non-numeric CMD_RUN_RUN_ID_TTL_SECS never fails the emit (warn-don't-drop)" "0" "$TTL_RC"
+case "$TTL_ERR" in *CMD_RUN_RUN_ID_TTL_SECS*)
+    ok "but it WARNS loudly, naming the setting (never a silent skip)" ;;
+  *) bad "but it WARNS loudly, naming the setting" "stderr was [$TTL_ERR]" ;; esac
+# …and the bound it guards still works: a marker past the default TTL is not adopted.
+mkdir -p "$TT/command-run-open"
+cat > "$TT/command-run-open/sess-ttl2__fix.json" <<'EOF'
+{"run_id":"run-ancient","command":"fix","session_id":"sess-ttl2","board":7,"target":null,"opened_at":"1970-01-01T00:00:01Z","opened_epoch":1,"emitted":1}
+EOF
+TTL_REC="$(CMD_RUN_RUN_ID_TTL_SECS=12h CMD_RUN_RAW_DIR="$TT" CLAUDE_CODE_SESSION_ID=sess-ttl2 \
+  bash "$EMIT" --command fix --board 7 \
+  --items-processed 1 --merged 1 --resolved 0 --parked 0 --reported-no-op 0 2>/dev/null)"
+if [ "$(printf '%s' "$TTL_REC" | jq -r '.run_id')" = "run-ancient" ]; then
+  bad "the freshness bound still holds after the fallback" \
+    "a marker far past the default TTL was adopted, so the bad value disabled the bound"
+else
+  ok "the freshness bound still holds after the fallback (a fresh id is minted)"
+fi
 
 printf '\n'
 if [ "$fail" -gt 0 ]; then
