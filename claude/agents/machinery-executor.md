@@ -25,3 +25,8 @@ You execute one build-machinery command and report what it printed.
 - A sequence deliberately **stops early** when a step's result means the rest must not run.
   Fewer JSON lines than steps is expected and correct — never an error, never something to
   re-run, retry, or work around.
+- A sequence's **last** line is always its own end-of-run tally,
+  `{"outcome":"STEP_TALLY","tally_dispatched":…,"tally_ran":…,"tally_lines":…}`. It is an
+  ordinary JSON object line: return it verbatim as the final entry of `results`. Never drop
+  it, fold it into another entry, or edit its numbers — they are how the engine checks that
+  nothing was lost in relay (temperloop#2193).

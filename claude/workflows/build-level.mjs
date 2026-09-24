@@ -465,6 +465,13 @@ const SPINE_OUTCOME_SCHEMA = {
         'RECOVER_NONE', 'RECOVER_DIRTY', 'RECOVER_COMMITTED', 'RECOVER_PUSHED', 'RECOVER_PR_OPEN',
         // The WORKFLOW-LEVEL step liveness bound (temperloop#1071). Neither of — see build-level.design-notes.md#the-workflow-level-step-liveness-bound-temperloop-1071-neith
         'STEP_TIMEOUT', 'STEP_SLOW',
+        // temperloop#2193 — the batched script's own END-OF-RUN TALLY line: how
+        // many steps it dispatched, how many it actually ran, and how many JSON
+        // lines it put on stdout. Printed on EVERY exit path (an early stop
+        // included) as the LAST line, and read back by relayIntegrityFault() so
+        // a relay that drops, merges or reshapes a result line is DETECTED
+        // rather than read as a step that never ran.
+        'STEP_TALLY',
         // temperloop#2020 — the post-commit work-preservation push that runs — see build-level.design-notes.md#temperloop-2020-the-post-commit-work-preservation-push-that-
         'WORK_PRESERVED', 'WORK_PRESERVE_SKIP', 'WORK_PRESERVE_FAILED',
         // The §3e REVIEW-AGENT liveness bound's timer (temperloop#2003), whose
@@ -642,8 +649,49 @@ const STEP_OUTCOME_SCHEMA = {
     ...SPINE_OUTCOME_SCHEMA.properties,
     mergeable: { type: 'string' },
     mergeStateStatus: { type: 'string' },
+    // temperloop#2193 — STEP_TALLY's three counters. Declared (rather than left
+    // to `additionalProperties`) for the #2208 reason: an undeclared property
+    // has no type, so a constrained decode is free to hand a number back in
+    // whatever shape it likes — and these are the numbers the integrity check
+    // compares against. `['number','string']` because the relay has been
+    // observed to stringify scalars; numOrNull() reads either.
+    tally_dispatched: { type: ['number', 'string'] },
+    tally_ran: { type: ['number', 'string'] },
+    tally_lines: { type: ['number', 'string'] },
   },
 };
+
+// BATCH_RESULT_KNOWN_KEYS — temperloop#2193. The CLOSED set of field names a
+// batched machinery result may carry. A relayed object with a key outside it
+// was not produced by any machinery step: the live #2193 relay invented
+// `questions_surfaced` / `question_count` (which exist nowhere in the tree)
+// while merging two steps' fields into one object, and the engine read the
+// result as a valid-but-unrecognised shape rather than as corruption.
+//
+// The set is the schema's own declared properties PLUS the passthrough fields
+// the batch-step scripts print that the schema leaves to
+// `additionalProperties: true`. That second list is NOT curated by eye: the
+// K2193 lockstep guard in workflows/scripts/build/tests/test_workflow.sh
+// re-derives it from worktree.sh / pr.sh / ci-poll.sh on every run and fails if
+// a script emits a key this set omits — so a new machinery field can never
+// become a false relay-integrity refusal.
+const BATCH_RESULT_EXTRA_KEYS = [
+  'already', 'arm', 'arms', 'base_resolved', 'branch_deleted', 'gate', 'records',
+  'review_head_sha', 'rounds', 'selection', 'worktree_removed',
+  'conflicts', 'criterion', 'deferred_host_config', 'deterministic_failure',
+  'discrimination_evidence', 'evidence', 'forced', 'guard', 'guard_detail', 'issue',
+  'issue_state', 'landed', 'lease', 'lookup', 'passed', 'permissionDecision',
+  'pr_head_ref', 'pr_lookup', 'pr_url', 'preserved', 'preserved_detail',
+  'preserved_ref', 'reason', 'rebase_needed', 'ref', 'refused_reason',
+  'remote_only_commits', 'remote_tip', 'sibling_branch', 'sibling_worktree',
+  'sidelined', 'sidelined_branch', 'sidelined_path', 'slug', 'stale_head_cause',
+  'strategy', 'surface_closes_stripped', 'transient_retries_exhausted', 'unmerged',
+  'usage_error',
+];
+const BATCH_RESULT_KNOWN_KEYS = new Set([
+  ...Object.keys(STEP_OUTCOME_SCHEMA.properties),
+  ...BATCH_RESULT_EXTRA_KEYS,
+]);
 
 // SPINE_BATCH_SCHEMA — the batched executor's return: the ordered array  — see build-level.design-notes.md#spine-batch-schema-the-batched-executor-s-return-the-or
 const SPINE_BATCH_SCHEMA = {
@@ -1215,23 +1263,124 @@ function globPat(sub) {
 function batchCommand(steps) {
   // temperloop#1071: every step runs under the workflow's wall-clock ceili — see build-level.design-notes-2.md#temperloop-1071-every-step-runs-under-the-workflow-s-wa
   const lines = [stepBoundPreamble(STEP_SLOW_SECS)];
+  // temperloop#2193 — the RELAY-INTEGRITY tally. The script's stdout crosses a
+  // model (the machinery executor) on its way back, and an early stop is both
+  // expected and correct here — so FEWER results than steps carries no
+  // information on its own, and a dropped/merged/reshaped line was
+  // indistinguishable from a step that never ran. The script therefore counts
+  // what it dispatched, what it ran, and how many JSON lines it actually put on
+  // stdout, and prints that count as its LAST line on EVERY exit path. Same
+  // shape as the tsv_rows/tsv_checksum gap check temperloop#1976/#1982 put on
+  // the reviewer-routing relay: the producer states its own count, the consumer
+  // recomputes it, and a disagreement refuses instead of guessing.
+  lines.push('__lb_ran=0; __lb_lines=0');
+  lines.push(
+    [
+      '__lb_emit() {',
+      '  __lb_ran=$(( __lb_ran + 1 ))',
+      '  [ -n "$1" ] || return 0',
+      "  printf '%s\\n' \"$1\"",
+      // Count JSON-OBJECT lines, not raw lines: a step's capture can carry a
+      // STEP_SLOW advisory alongside its own result, and the executor is told to
+      // ignore non-JSON output — so this counts exactly what it is asked to relay.
+      "  __lb_lines=$(( __lb_lines + $(printf '%s\\n' \"$1\" | grep -c '^{') ))",
+      '}',
+      `__lb_tally() { printf '{"outcome":"STEP_TALLY","tally_dispatched":${steps.length},"tally_ran":%s,"tally_lines":%s}\\n' "$__lb_ran" "$__lb_lines"; }`,
+    ].join('\n'),
+  );
   steps.forEach((s, i) => {
     const v = `__o${i}`;
     const fn = `__s${i}`;
     lines.push(stepFnDef(fn, s.cmd));
     lines.push(`${v}=$( ${stepBoundInvoke(fn, s.kind)} )`);
-    lines.push(`printf '%s\\n' "$${v}"`);
+    lines.push(`__lb_emit "$${v}"`);
     if (i === steps.length - 1) return; // nothing follows — no gate needed
     if (s.stopGlobs && s.stopGlobs.length > 0) {
       // A timed-out step stops the sequence on BOTH gate forms. The — see build-level.design-notes.md#a-timed-out-step-stops-the-sequence-on-both-gate-forms-the
       const stops = [...s.stopGlobs.map(globPat), globPat('"outcome":"STEP_TIMEOUT"')];
-      lines.push(`case "$${v}" in ${stops.join('|')}) exit 0 ;; esac`);
+      lines.push(`case "$${v}" in ${stops.join('|')}) __lb_tally; exit 0 ;; esac`);
     } else if (s.continueOutcomes && s.continueOutcomes.length > 0) {
       const pats = s.continueOutcomes.map((o) => globPat(`"outcome":"${o}"`)).join('|');
-      lines.push(`case "$${v}" in ${pats}) ;; *) exit 0 ;; esac`);
+      lines.push(`case "$${v}" in ${pats}) ;; *) __lb_tally; exit 0 ;; esac`);
     }
   });
+  lines.push('__lb_tally');
   return lines.join('\n');
+}
+
+// relayIntegrityFault — temperloop#2193. Returns null when the relayed results
+// account for what the script printed, or a fault object naming WHAT was
+// dispatched vs WHAT came back when they do not. Three states are faults:
+// a duplicated tally, a tally whose count disagrees with the relayed object
+// count (a line dropped, merged or invented), and a relayed object carrying a
+// field no machinery step emits (a reshaped payload).
+//
+// A MISSING tally is deliberately NOT a fault — it is the only state that also
+// describes a stale executor or a harness-killed Bash call, and refusing there
+// would regress healthy runs for a signal we cannot attribute. It is logged
+// instead, and only when the relay is also short, which is the ambiguous case.
+function relayIntegrityFault(kinds, relayed, tallies) {
+  const base = { dispatched: kinds.length, steps: kinds, relayed: relayed.length };
+  if (tallies.length > 1) {
+    return {
+      ...base,
+      fault: 'tally-duplicated',
+      message:
+        `machinery batch RELAY INTEGRITY: ${tallies.length} end-of-run tally lines came back for ONE ` +
+        `${kinds.length}-step sequence (${kinds.join(', ')}) — the relay duplicated output, so no step ` +
+        'outcome in it can be trusted (temperloop#2193)',
+    };
+  }
+  if (tallies.length === 1) {
+    const t = tallies[0];
+    const printed = numOrNull(t.tally_lines);
+    const ran = numOrNull(t.tally_ran);
+    if (printed === null) {
+      return {
+        ...base,
+        fault: 'tally-unreadable',
+        tally: t,
+        message:
+          'machinery batch RELAY INTEGRITY: the end-of-run tally line came back without a readable ' +
+          `\`tally_lines\` count (${JSON.stringify(t.tally_lines)}) — the relay reshaped the one line ` +
+          'that says how much output there was to relay (temperloop#2193)',
+      };
+    }
+    if (printed !== relayed.length) {
+      return {
+        ...base,
+        fault: 'count-mismatch',
+        ran,
+        printed_lines: printed,
+        tally: t,
+        message:
+          `machinery batch RELAY INTEGRITY: the sequence dispatched ${kinds.length} step(s) ` +
+          `(${kinds.join(', ')}), RAN ${ran === null ? '?' : ran}, and printed ${printed} JSON line(s), ` +
+          `but ${relayed.length} object(s) came back — a result line was DROPPED, MERGED or INVENTED in ` +
+          'relay. This is a relay failure, NOT a step that produced no result (temperloop#2193)',
+      };
+    }
+  }
+  const unknown = [];
+  for (const r of relayed) {
+    if (r === null || typeof r !== 'object') continue;
+    for (const k of Object.keys(r)) {
+      if (!BATCH_RESULT_KNOWN_KEYS.has(k) && !unknown.includes(k)) unknown.push(k);
+    }
+  }
+  if (unknown.length > 0) {
+    return {
+      ...base,
+      fault: 'unknown-fields',
+      unknown_fields: unknown,
+      message:
+        `machinery batch RELAY INTEGRITY: relayed result(s) for ${kinds.length} step(s) ` +
+        `(${kinds.join(', ')}) carry ${unknown.length} field(s) no machinery step emits ` +
+        `(${unknown.join(', ')}) — the relay reshaped the payload rather than copying it verbatim, so ` +
+        'no step outcome in it can be trusted (temperloop#2193)',
+    };
+  }
+  return null;
 }
 
 // runMachineryBatch — returns { denied, results, steps, out }. `results[ — see build-level.design-notes.md#runmachinerybatch-returns-denied-results-steps-out-results
@@ -1257,6 +1406,11 @@ async function runMachineryBatch(steps, { label, slug, bashTimeoutMs, phase: pha
       lean ? null : "The script deliberately STOPS EARLY when a step's result means the remaining steps must not run. FEWER JSON lines than steps is expected and correct — never an error, never something to re-run, retry, or work around.",
       lean ? null : 'Return every JSON object it printed on stdout, in stdout order, as {"results": [ ... ]}. Copy each object VERBATIM — do not merge, summarise, reorder, add, drop, or invent entries — and ignore any non-JSON output.',
       lean ? null : 'If a step exits non-zero it STILL prints its JSON line; include it.',
+      // temperloop#2193 — deliberately NOT lean-guarded. The tally is the one
+      // line the integrity check depends on, and the lean path leans on the
+      // INSTALLED executor charter, which can be older than this file. Stating
+      // it in the prompt removes that version skew entirely.
+      'The LAST line the script prints is always its own end-of-run tally, {"outcome":"STEP_TALLY",...}. It is an ordinary JSON object line: return it verbatim as the final entry of "results" like any other. Do NOT drop it, do NOT fold it into another entry, and do NOT edit its numbers — they are how the engine checks that nothing was lost in relay.',
       '',
       'Command:',
       batchCommand(steps),
@@ -1284,8 +1438,37 @@ async function runMachineryBatch(steps, { label, slug, bashTimeoutMs, phase: pha
   }
   // temperloop#1071 — PARTITION the advisory notices out of the results ar — see build-level.design-notes.md#temperloop-1071-partition-the-advisory-notices-out-of-the-re
   out.results.forEach(canonicalizeOutcome);
-  const notices = out.results.filter((r) => r && r.outcome === 'STEP_SLOW');
-  const results = out.results.filter((r) => !(r && r.outcome === 'STEP_SLOW'));
+  // temperloop#2193 — RELAY INTEGRITY, checked BEFORE any caller reads a step
+  // index. The tally line is the script's own statement of how much it printed;
+  // partition it out exactly like a STEP_SLOW advisory so the step indices every
+  // caller branches on are unchanged on the faithful path.
+  const tallies = out.results.filter((r) => r && r.outcome === 'STEP_TALLY');
+  const relayed = out.results.filter((r) => !(r && r.outcome === 'STEP_TALLY'));
+  const relayFault = relayIntegrityFault(kinds, relayed, tallies);
+  if (relayFault) {
+    log(`[${slug ?? label ?? 'level'}] ${relayFault.message}`);
+    // REFUSED, not repaired: every call site already treats `denied` as "this
+    // batch decided nothing", so a corrupt relay stops the sequence instead of
+    // being read step-by-step. `relay_integrity` on the denied payload is what
+    // deniedOrQuota() reads to escalate its own kind rather than
+    // machinery-denied.
+    return {
+      denied: true,
+      relayFault,
+      results: [],
+      steps: kinds,
+      out: { ...out, relay_integrity: relayFault },
+    };
+  }
+  if (tallies.length === 0 && relayed.length < kinds.length) {
+    log(
+      `[${slug ?? label ?? 'level'}] machinery batch relayed ${relayed.length} of ${kinds.length} ` +
+      'dispatched step(s) with NO end-of-run tally line, so an early stop and a dropped relay line are ' +
+      'indistinguishable for this batch (temperloop#2193) — proceeding on the pre-#2193 reading.',
+    );
+  }
+  const notices = relayed.filter((r) => r && r.outcome === 'STEP_SLOW');
+  const results = relayed.filter((r) => !(r && r.outcome === 'STEP_SLOW'));
   // …and LOG them. This is the observable-progress half of the bound: a st — see build-level.design-notes-3.md#and-log-them-this-is-the-observable-progress-half-of-th
   for (const n of notices) {
     log(
@@ -2874,6 +3057,14 @@ function quotaEscalation(slug, where, { errorText = null, worktree = null, extra
 
 // deniedOrQuota — every site that mints a `machinery-denied` escalation  — see build-level.design-notes-3.md#deniedorquota-every-site-that-mints-a-machinery-denied-
 async function deniedOrQuota(slug, payload, worktree) {
+  // temperloop#2193 — a RELAY-INTEGRITY refusal is neither a classifier denial
+  // (the executor was never refused: it ran and answered) nor a quota death
+  // (spawning plainly worked), and the cures differ — rewriting the command or
+  // waiting for a reset both miss. Its own kind, ahead of the quota probe,
+  // which would otherwise spend a spawn on a question already answered.
+  if (payload && payload.out && payload.out.relay_integrity) {
+    return escalate(slug, 'machinery-relay-integrity', payload);
+  }
   if (!(await harnessCanSpawnAgents())) {
     const step = typeof payload.step === 'string' ? payload.step : 'batch';
     return quotaEscalation(slug, `machinery:${step}`, {

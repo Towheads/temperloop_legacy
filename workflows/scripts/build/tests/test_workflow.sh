@@ -541,6 +541,8 @@ globalThis.agent = async function agent(prompt, opts = {}) {
     // Batched executor (temperloop#942): consume one queued outcome per step and
     // stop exactly where the emitted bash `case` gate would.
     const results = [];
+    let ran = 0;
+    let lostTail = false;
     for (const kind of kinds) {
       // The merge-state probe is `gh pr view`, not a machinery script — it keeps
       // its own map (default non-conflicting) so pre-batching cases that call
@@ -549,6 +551,7 @@ globalThis.agent = async function agent(prompt, opts = {}) {
         ? nextFromMap(mergeCheckMap, slug, { mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' })
         : nextFromMap(machineryMap, slug, { outcome: 'ERROR', error: 'unexpected machinery step ' + kind + ' for ' + slug });
       machineryStepLog.push({ slug, kind });
+      ran += 1;
       // A queued null models the auto-mode classifier DENYING the command: the
       // whole executor call comes back null, not a partial results array.
       if (r === null) return null;
@@ -561,7 +564,13 @@ globalThis.agent = async function agent(prompt, opts = {}) {
       // drop this wiring probes for, distinct from every prior test's
       // short-circuit stop (which always includes an entry for the stopping
       // step itself).
-      if (r.__lostReturn) break;
+      // temperloop#2193: a lost TAIL takes the end-of-run tally with it — the
+      // tally IS the last line the script prints, so an executor that truncated
+      // its return dropped that line too. The mock therefore returns NO tally
+      // here, which is the one relay state the integrity check deliberately
+      // degrades on rather than refusing (see relayIntegrityFault) — so #1067's
+      // recover-probe path keeps running exactly as before.
+      if (r.__lostReturn) { lostTail = true; break; }
       results.push(r);
       if (kind === 'merge-state') {
         if (r.mergeable === 'CONFLICTING' || r.mergeStateStatus === 'DIRTY') break;
@@ -570,7 +579,18 @@ globalThis.agent = async function agent(prompt, opts = {}) {
         if (cont && !cont.includes(r.outcome)) break;
       }
     }
-    return { results };
+    // temperloop#2193: the mock models a FAITHFUL executor, so it appends the
+    // script's own end-of-run tally line — counted off what the mock itself just
+    // relayed, so it can never disagree with it. A case that wants a CORRUPT
+    // relay (a dropped/merged line, an invented field) hand-rolls
+    // globalThis.agent and writes its own STEP_TALLY.
+    if (lostTail) return { results };
+    return {
+      results: [
+        ...results,
+        { outcome: 'STEP_TALLY', tally_dispatched: kinds.length, tally_ran: ran, tally_lines: results.length },
+      ],
+    };
   }
   if (isWorkerCall(opts)) {
     // Worker call — implementation agent, routed by slug.
@@ -14449,7 +14469,10 @@ K2080_CREATE_CMD="$(k2080_emit_create)"
 [ -n "$K2080_CREATE_CMD" ] || fail "#2080-exec: the emitted create command is empty"
 
 # (a) CLEAN tree — no arm worktrees. The guard must be invisible: the create
-#     runs and its CREATED line is the ONLY output.
+#     runs and its CREATED line is the only STEP output. temperloop#2193 adds
+#     the batch's own end-of-run STEP_TALLY line after it — emitted by every
+#     batch on every exit path, so it is the constant, not the variable this
+#     assertion is about; the guard still contributes nothing.
 rm -rf "$K2080_EXEC_ROOT/repo.wt"
 k2080_clean_out="$(bash -c "$K2080_CREATE_CMD" 2>&1)" \
   || fail "#2080-exec: the generated create command exited non-zero on a clean tree: $k2080_clean_out"
@@ -14457,8 +14480,10 @@ printf '%s' "$k2080_clean_out" | grep -F '"outcome":"CREATED"' >/dev/null \
   || fail "#2080-exec: on a clean tree the residue guard swallowed the create (got: $k2080_clean_out)"
 printf '%s' "$k2080_clean_out" | grep -F 'DUAL_BUILD_RESIDUE' >/dev/null \
   && fail "#2080-exec: the residue guard fired on a tree with NO arm worktrees — every ordinary /build would refuse"
-[ "$(printf '%s\n' "$k2080_clean_out" | grep -c .)" = "1" ] \
-  || fail "#2080-exec: the clean path printed more than the create's own line, so a flag-less run's output is NOT byte-identical (got: $k2080_clean_out)"
+printf '%s' "$k2080_clean_out" | grep -F '"outcome":"STEP_TALLY"' >/dev/null \
+  || fail "#2080-exec: the generated batch printed no end-of-run tally line (temperloop#2193) (got: $k2080_clean_out)"
+[ "$(printf '%s\n' "$k2080_clean_out" | grep -c .)" = "2" ] \
+  || fail "#2080-exec: the clean path printed more than the create's own line plus the batch tally, so a flag-less run's output is NOT byte-identical (got: $k2080_clean_out)"
 
 # (b) PARTIALLY DUAL-BUILT — an arm worktree for this slug stands. The guard
 #     must refuse and the create must never run.
@@ -17463,6 +17488,277 @@ grep -q 'function reviewCarryForward(' "$MJS" \
 grep -qF "verdict: 'SKIPPED'" "$MJS" \
   || fail "#2138: a skipped gate must report its own SKIPPED verdict, never a fabricated GREEN — claiming a pass for a suite that did not run is exactly the fail-open outcome the skip must not produce"
 echo "PASS: #2138 the prose-only gate skip — a docs-reviewer-only blocking round never invokes quality-gates.sh yet still carries its findings to the PR, a mixed round runs the gate unchanged, every uncertain shape fails CLOSED (proven against a fail-open mutant), and the predicate is wired to the slice loop itself"
+
+# ============================================================================
+# K2193 — MACHINERY-RELAY INTEGRITY (temperloop#2193)
+# ============================================================================
+# THE DEFECT. A batched machinery sequence's stdout crosses a MODEL (the
+# machinery executor) on its way back into the engine, and an early stop is both
+# expected and correct — so "fewer results than steps" carried no information at
+# all. A relayed array that DROPPED a line, MERGED two steps' fields into one
+# object, or INVENTED fields read exactly like a step that never ran, and both
+# escalated identically as `machinery step '<name>' produced no result`. The
+# live #2193 run merged the prelude's claim and worktree lines and invented
+# `questions_surfaced` / `question_count` (which exist nowhere in the tracked
+# tree); the engine reported the worktree step as having produced nothing.
+#
+# THE FIX, checked here in every state: the generated script now prints its own
+# end-of-run STEP_TALLY line — dispatched / ran / JSON lines printed — on EVERY
+# exit path, and the engine compares that count against what came back and
+# tests every relayed field against the closed set the machinery actually
+# emits. A disagreement REFUSES the whole batch under its own
+# `machinery-relay-integrity` kind instead of being read step-by-step.
+#
+# NB the relay corruption is applied by WRAPPING the shared faithful mock rather
+# than hand-rolling a whole agent: the tally these cases disagree with is the one
+# the faithful mock produced, so a case cannot accidentally prove itself.
+
+run_node_case "K2193 control: a FAITHFUL relay (tally agrees, no invented fields) is byte-identical to the pre-#2193 path" "
+$PREAMBLE
+// The discriminating control. If the integrity check fired on a healthy batch,
+// every unattended run would refuse — so this case is the one that must stay
+// green while the three corruption cases below go red.
+happyMachinery('ok1', 91, 'a91');
+happyWorker('ok1');
+globalThis.args = { ...baseArgs, items: [{ slug: 'ok1', branch: 'b/ok1', title: 'T', kind: 'impl', acceptance: ['c'] }] };
+const mod = await loadLevel();
+const result = await mod.default();
+let reason = null;
+if ((result.escalations ?? []).length !== 0) reason = 'a faithful relay was refused: ' + JSON.stringify(result.escalations);
+else if ((result.parked ?? [])[0]?.pr !== 91) reason = 'expected a clean park on PR 91: ' + JSON.stringify(result);
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+run_node_case "K2193 DROPPED: a relayed array missing one line the tally counted is REFUSED as a relay failure, never as the step producing no result" "
+$PREAMBLE
+happyMachinery('rd1', 92, 'a92');
+happyWorker('rd1');
+const base = globalThis.agent;
+globalThis.agent = async (prompt, opts = {}) => {
+  const r = await base(prompt, opts);
+  if (String(opts.label || '').startsWith('pr-batch:') && r && Array.isArray(r.results)) {
+    // The script printed four step lines; the relay loses the scan one and
+    // keeps its own tally — the exact state an early stop cannot produce.
+    return { results: r.results.filter((x) => x.outcome !== 'SCAN_CLEAN') };
+  }
+  return r;
+};
+globalThis.args = { ...baseArgs, items: [{ slug: 'rd1', branch: 'b/rd1', title: 'T', kind: 'impl', acceptance: ['c'] }] };
+const mod = await loadLevel();
+const result = await mod.default();
+const esc = (result.escalations ?? [])[0];
+const blob = JSON.stringify(result);
+let reason = null;
+if (!esc) reason = 'a dropped relay line was accepted: ' + blob;
+else if (esc.kind !== 'machinery-relay-integrity') reason = 'wrong escalation kind: ' + esc.kind;
+else if (esc.payload?.out?.relay_integrity?.fault !== 'count-mismatch') reason = 'wrong fault: ' + JSON.stringify(esc.payload?.out?.relay_integrity);
+else if (esc.payload.out.relay_integrity.dispatched !== 4 || esc.payload.out.relay_integrity.relayed !== 3) reason = 'the payload must name dispatched vs came back: ' + JSON.stringify(esc.payload.out.relay_integrity);
+else if (/machinery step '[^']*' produced no result/.test(blob)) reason = 'a relay failure was still reported as the step producing no result: ' + blob;
+else if ((result.parked ?? []).length !== 0) reason = 'a corrupt relay must never park as though it succeeded';
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+run_node_case "K2193 MERGED: two steps' fields folded into ONE relayed object is REFUSED — the count, not the shape, is what catches it" "
+$PREAMBLE
+happyMachinery('rm1', 93, 'a93');
+happyWorker('rm1');
+const base = globalThis.agent;
+globalThis.agent = async (prompt, opts = {}) => {
+  const r = await base(prompt, opts);
+  if (String(opts.label || '').startsWith('pr-batch:') && r && Array.isArray(r.results)) {
+    // The live #2193 shape: two steps' fields in one object. Every field here
+    // is legitimate — only the COUNT betrays it.
+    return { results: [{ ...r.results[0], ...r.results[1] }, ...r.results.slice(2)] };
+  }
+  return r;
+};
+globalThis.args = { ...baseArgs, items: [{ slug: 'rm1', branch: 'b/rm1', title: 'T', kind: 'impl', acceptance: ['c'] }] };
+const mod = await loadLevel();
+const result = await mod.default();
+const esc = (result.escalations ?? [])[0];
+let reason = null;
+if (!esc) reason = 'a merged pair of relay lines was accepted: ' + JSON.stringify(result);
+else if (esc.kind !== 'machinery-relay-integrity') reason = 'wrong escalation kind: ' + esc.kind;
+else if (esc.payload?.out?.relay_integrity?.fault !== 'count-mismatch') reason = 'wrong fault: ' + JSON.stringify(esc.payload?.out?.relay_integrity);
+else if (!/DROPPED, MERGED or INVENTED/.test(String(esc.payload.out.relay_integrity.message))) reason = 'the message must name what went wrong: ' + esc.payload.out.relay_integrity.message;
+else if ((result.parked ?? []).length !== 0) reason = 'a corrupt relay must never park as though it succeeded';
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+run_node_case "K2193 INVENTED FIELDS: a relayed object carrying keys no machinery step emits is REFUSED even when the COUNT is right" "
+$PREAMBLE
+// The state a count check alone cannot see: the relay returns exactly as many
+// objects as the script printed, but reshapes one of them. These two field
+// names are the live #2193 run's own inventions.
+happyMachinery('ri1', 94, 'a94');
+happyWorker('ri1');
+const base = globalThis.agent;
+globalThis.agent = async (prompt, opts = {}) => {
+  const r = await base(prompt, opts);
+  if (String(opts.label || '').startsWith('prelude:') && r && Array.isArray(r.results)) {
+    return { results: r.results.map((x) => (x.outcome === 'CREATED' ? { ...x, questions_surfaced: true, question_count: 2 } : x)) };
+  }
+  return r;
+};
+globalThis.args = { ...baseArgs, items: [{ slug: 'ri1', branch: 'b/ri1', title: 'T', kind: 'impl', acceptance: ['c'] }] };
+const mod = await loadLevel();
+const result = await mod.default();
+const esc = (result.escalations ?? [])[0];
+const fault = esc?.payload?.out?.relay_integrity;
+let reason = null;
+if (!esc) reason = 'an invented-field relay was accepted: ' + JSON.stringify(result);
+else if (esc.kind !== 'machinery-relay-integrity') reason = 'wrong escalation kind: ' + esc.kind;
+else if (fault?.fault !== 'unknown-fields') reason = 'wrong fault: ' + JSON.stringify(fault);
+else if (!(fault.unknown_fields || []).includes('questions_surfaced') || !(fault.unknown_fields || []).includes('question_count')) reason = 'the payload must NAME the invented fields: ' + JSON.stringify(fault.unknown_fields);
+else if ((result.parked ?? []).length !== 0) reason = 'a corrupt relay must never park as though it succeeded';
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+run_node_case "K2193 legitimate short relay: an EARLY STOP whose tally agrees is NOT a relay failure" "
+$PREAMBLE
+// The other discriminating control, and the reason the tally exists at all: a
+// sequence that stops early relays FEWER objects than steps and must stay a
+// normal, unchanged outcome. Here the scan blocks, so push and pr-open never
+// run — the pre-#2193 closing-keyword escalation, not a relay refusal.
+setMachinery('rs1',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/rs1' },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', sha: 'abc' },
+  { outcome: 'SCAN_BLOCKED', matches: ['Closes #1'] },
+);
+happyWorker('rs1');
+globalThis.args = { ...baseArgs, items: [{ slug: 'rs1', branch: 'b/rs1', title: 'T', kind: 'impl', acceptance: ['c'] }] };
+const mod = await loadLevel();
+const result = await mod.default();
+const esc = (result.escalations ?? [])[0];
+let reason = null;
+if (!esc) reason = 'expected the unchanged closing-keyword escalation: ' + JSON.stringify(result);
+else if (esc.kind === 'machinery-relay-integrity') reason = 'a LEGITIMATE early stop was refused as a relay failure — the check cannot tell the two apart: ' + JSON.stringify(esc.payload);
+else if (esc.kind !== 'closing-keyword') reason = 'wrong escalation kind: ' + esc.kind;
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+# --- K2193 EMITTED-SHELL probe: the tally is produced by shell this file
+# GENERATES, so asserting on the .mjs alone would prove nothing about whether a
+# tally is ever printed. Generate the real batch script and RUN it.
+_k2193_gen="$WF_TEST_TMPDIR/k2193-gen.mjs"
+cat > "$_k2193_gen" <<'K2193GEN'
+import { readFileSync, writeFileSync } from 'fs';
+globalThis.args = JSON.stringify({ repoRoot: '/tmp/repo', ownerRepo: 'o/r', items: [] });
+globalThis.agent = async () => null;
+globalThis.log = () => {};
+globalThis.phase = () => {};
+globalThis.parallel = async (fns) => Promise.all(fns.map((f) => f()));
+const src = readFileSync(process.env.MJS_PATH, 'utf8')
+  .replace(/^export const meta/m, 'const meta')
+  .replace('const GATE_MAX_SLICES = 8;',
+    'const GATE_MAX_SLICES = 8;\nglobalThis.__p = { batch: batchCommand };');
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+await new AsyncFunction(src)();
+const out = process.env.K2193_OUT;
+const steps = (first) => ([
+  { kind: 'scan', cmd: "printf '{\"outcome\":\"" + first + "\"}\\n'", continueOutcomes: ['SCAN_CLEAN'] },
+  { kind: 'push', cmd: "printf '{\"outcome\":\"PUSHED\",\"sha\":\"abc\"}\\n'", continueOutcomes: ['PUSHED'] },
+  { kind: 'pr-open', cmd: "printf '{\"outcome\":\"PR_OPENED\",\"pr_number\":7}\\n'" },
+]);
+writeFileSync(out + '/full.sh', globalThis.__p.batch(steps('SCAN_CLEAN')));
+writeFileSync(out + '/stop.sh', globalThis.__p.batch(steps('SCAN_BLOCKED')));
+K2193GEN
+_k2193_out="$WF_TEST_TMPDIR/k2193"; mkdir -p "$_k2193_out"
+MJS_PATH="$MJS" K2193_OUT="$_k2193_out" node "$_k2193_gen" \
+  || fail "#2193: could not generate the emitted batch shell from build-level.mjs"
+for _f in full.sh stop.sh; do
+  bash -n "$_k2193_out/$_f" || fail "#2193: the emitted batch shell is not valid bash ($_f)"
+done
+
+k2193_full="$(bash "$_k2193_out/full.sh")"
+k2193_full_last="$(printf '%s\n' "$k2193_full" | tail -1)"
+printf '%s' "$k2193_full_last" | grep -F '"outcome":"STEP_TALLY"' >/dev/null \
+  || fail "#2193: a complete 3-step batch printed no end-of-run tally as its LAST line (got: $k2193_full)"
+printf '%s' "$k2193_full_last" | grep -F '"tally_dispatched":3' >/dev/null \
+  || fail "#2193: the tally must name how many steps were DISPATCHED (got: $k2193_full_last)"
+printf '%s' "$k2193_full_last" | grep -F '"tally_ran":3' >/dev/null \
+  || fail "#2193: the tally must name how many steps actually RAN (got: $k2193_full_last)"
+printf '%s' "$k2193_full_last" | grep -F '"tally_lines":3' >/dev/null \
+  || fail "#2193: the tally must count the JSON lines the script put on stdout (got: $k2193_full_last)"
+[ "$(printf '%s\n' "$k2193_full" | grep -c '^{')" = "4" ] \
+  || fail "#2193: expected 3 step lines plus the tally (got: $k2193_full)"
+
+# The load-bearing case: an EARLY STOP prints a tally too, and its numbers say
+# so. This is the whole separation — a stopped sequence is self-describing, so a
+# short relay is no longer ambiguous.
+k2193_stop="$(bash "$_k2193_out/stop.sh")"
+k2193_stop_last="$(printf '%s\n' "$k2193_stop" | tail -1)"
+printf '%s' "$k2193_stop_last" | grep -F '"outcome":"STEP_TALLY"' >/dev/null \
+  || fail "#2193: an EARLY-STOPPED batch printed no tally, so a stop and a dropped line stay indistinguishable (got: $k2193_stop)"
+printf '%s' "$k2193_stop_last" | grep -F '"tally_dispatched":3' >/dev/null \
+  || fail "#2193: the stopped batch's tally must still name all 3 dispatched steps (got: $k2193_stop_last)"
+printf '%s' "$k2193_stop_last" | grep -F '"tally_ran":1' >/dev/null \
+  || fail "#2193: the stopped batch's tally must name the 1 step that actually ran (got: $k2193_stop_last)"
+printf '%s' "$k2193_stop_last" | grep -F '"tally_lines":1' >/dev/null \
+  || fail "#2193: the stopped batch's tally must count only the 1 line it printed (got: $k2193_stop_last)"
+[ "$(printf '%s\n' "$k2193_stop" | grep -c '^{')" = "2" ] \
+  || fail "#2193: an early stop must print exactly its own step line plus the tally (got: $k2193_stop)"
+echo "PASS: #2193 emitted-shell tally — a complete batch and an EARLY-STOPPED batch each print a self-describing end-of-run tally as their last line"
+
+# --- K2193 EMITTER ↔ KNOWN-KEY lockstep guard --------------------------------
+#
+# The unknown-field half of the check tests every relayed field against a CLOSED
+# set. A closed set that falls behind its emitters turns a healthy machinery
+# field into a false relay-integrity refusal — the worst possible failure for a
+# guard whose whole job is to stop an unattended run. So the set is re-derived
+# from the shipping emitters on every run: the three batch-step helper scripts
+# plus build-level.mjs's own generated shell. Like K2205/K2208 it refuses to
+# pass vacuously — the extraction asserts a non-zero floor of harvested keys.
+K2193_OUT="$(EMITTED_KEY_FLOOR=40 MJS_PATH="$MJS" BUILD_DIR="$REPO_ROOT/workflows/scripts/build" node -e '
+const fs = require("fs");
+const path = require("path");
+const src = fs.readFileSync(process.env.MJS_PATH, "utf8");
+const die = (m) => { console.log(JSON.stringify({ ok: false, reason: m })); process.exit(0); };
+
+// --- side A: the CLOSED set the engine tests against -----------------------
+const known = new Set();
+const spine = src.match(/const SPINE_OUTCOME_SCHEMA = \{[\s\S]*?\n\};/);
+const step = src.match(/const STEP_OUTCOME_SCHEMA = \{[\s\S]*?\n\};/);
+const extra = src.match(/const BATCH_RESULT_EXTRA_KEYS = \[([\s\S]*?)\];/);
+if (!spine || !step || !extra) die("could not locate SPINE_OUTCOME_SCHEMA / STEP_OUTCOME_SCHEMA / BATCH_RESULT_EXTRA_KEYS in build-level.mjs — this guard`s extraction anchor moved and it is now inert");
+for (const m of (spine[0] + step[0]).matchAll(/^\s{4}([A-Za-z_][A-Za-z0-9_]*)\s*:\s*\{/gm)) known.add(m[1]);
+for (const m of extra[1].matchAll(/\x27([A-Za-z_][A-Za-z0-9_]*)\x27/g)) known.add(m[1]);
+if (known.size < 40) die("extracted only " + known.size + " known keys — the extraction is inert, not the set empty");
+
+// --- side B: every field name the batch-step emitters actually PRINT -------
+// Quoted `"key":` anywhere in a helper script, plus jq`s unquoted `key:` form
+// restricted to lines that also carry `outcome` (jq object literals), plus
+// build-level.mjs`s own inline `{"outcome":"X","key":...}` emissions.
+const emitted = new Set();
+const harvest = (txt) => {
+  for (const m of txt.matchAll(/\\*"([A-Za-z_][A-Za-z0-9_]*)\\*"\s*:/g)) emitted.add(m[1]);
+  for (const line of txt.split("\n")) {
+    if (!/outcome/.test(line)) continue;
+    for (const m of line.matchAll(/[{,]\s*([a-z_][a-z0-9_]*)\s*:/g)) emitted.add(m[1]);
+  }
+};
+for (const f of ["worktree.sh", "pr.sh", "ci-poll.sh"]) {
+  harvest(fs.readFileSync(path.join(process.env.BUILD_DIR, f), "utf8"));
+}
+for (const line of src.split("\n")) {
+  if (!/\{\\*"outcome\\*"\s*:/.test(line)) continue;
+  for (const m of line.matchAll(/\\*"([A-Za-z_][A-Za-z0-9_]*)\\*"\s*:/g)) emitted.add(m[1]);
+}
+const floor = Number(process.env.EMITTED_KEY_FLOOR);
+if (emitted.size < floor) die("harvested only " + emitted.size + " distinct emitted field names (floor " + floor + ") — the harvest regex has gone stale and this guard would pass vacuously");
+
+const missing = [...emitted].filter((k) => !known.has(k)).sort();
+if (missing.length) die("the batch-step emitters print " + missing.length + " field(s) BATCH_RESULT_KNOWN_KEYS omits: " + missing.join(", ") + ". A healthy machinery field outside the closed set is a FALSE relay-integrity refusal — add them to BATCH_RESULT_EXTRA_KEYS (or declare them in the schema), never widen the check itself.");
+console.log(JSON.stringify({ ok: true, known: known.size, emitted: emitted.size }));
+')" || fail "#2193: the emitter/known-key lockstep extractor failed to run"
+case "$K2193_OUT" in
+  *'"ok":true'*) : ;;
+  *) fail "#2193 emitter↔known-key lockstep: $K2193_OUT" ;;
+esac
+echo "PASS: #2193 emitter↔known-key lockstep — $K2193_OUT"
+unset K2193_OUT
 
 # --- K2205 EMITTED-LITERAL ↔ ENUM lockstep guard ----------------------------
 #
