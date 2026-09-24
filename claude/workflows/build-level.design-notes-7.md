@@ -1135,8 +1135,20 @@ side breached on its own.
  orphaned process trees bounded-suite.sh was written for. The group signal is
  emitted BEFORE the single-pid kill and both are kept: a host where job
  control could not give the child its own group degrades to the direct-child
- kill rather than to nothing. Omitting `opts` emits the pre-#2210 line
- byte-for-byte, so the #1071 call site below is unchanged.
+ kill rather than to nothing. Omitting `opts` leaves the single-pid kill
+ alone, which is what the #1071 machinery-step bound wants.
+
+ THE WATCHDOG ITSELF GETS A GROUP TOO, and that is what `retireWatchdog`
+ exists for. `set -m` around the `( … ) &` makes the SUBSHELL a process-group
+ leader. Without it, retiring a watchdog that is no longer needed — the FAST
+ path, i.e. almost every call — with a bare `kill "$wd"` signals only the
+ subshell: its `sleep` is a separate child OF that subshell, so it is
+ reparented to init and idles for the FULL ceiling. One stray `sleep` per
+ bounded step, per poll, accumulating across a level. The header's claim that
+ the bound "leaves nothing detached behind" is only true once the retire is a
+ GROUP kill, so `retireWatchdog` emits `kill -- -"$wd" || kill "$wd"` — group
+ first, bare pid as the same degrade-not-disappear fallback the bound itself
+ uses.
 ```
 
 ## The worker scoped-gate liveness bound (temperloop#2210)

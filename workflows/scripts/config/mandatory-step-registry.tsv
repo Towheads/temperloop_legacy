@@ -153,3 +153,19 @@ claude/commands/build.md	Step 0.5 item 5 — resume-recovery capture-at-source e
 # same red/green transition (remove the call, the guard names it; restore it,
 # green again — see workflows/scripts/build/tests/test_state_graph_call.sh).
 claude/commands/build.md	Step 0.5 — state-graph cross-check (build + query resume)	mandatory on every resume	guard	workflows/scripts/validate-state-graph-call.sh	state-graph.sh query resume	validate-state-graph-call	validate-state-graph-call.sh FAILS when build.md's Step 0.5 no longer invokes `state-graph.sh build` or `state-graph.sh query resume` — proven by removing each call in turn (the guard names the removed wiring) and restoring it (green again); test_state_graph_call.sh exercises this red/green transition against a disposable fixture copy so the live tree is never tampered with directly.
+
+# ── /build §4b step 2 — the TURN-END WAKE ASSERTION (temperloop#2210) ───────
+# The refusal is the last line of defense against the defect the whole item
+# exists to close: a turn that ends with an open PR and nothing scheduled
+# never learns anything again, because the merge queue and CI are pull-only.
+# Declaring it mandatory without an execution signal would be that same
+# failure one level up — prose that does not run. The signal is a STATIC
+# guard over the spec text, the same shape as the resume-recovery and
+# state-graph rows above: test_wake_guard.sh's § STATIC GUARDS asserts 4b
+# still INVOKES `wake-guard.sh assert`, and goes red the moment that
+# invocation is deleted or moved out of the spec. Proven by the same red/green
+# transition the sibling rows use (delete the invocation from build.md, the
+# guard names it; restore it, green again). The suite is auto-expanded into
+# the gate set by scripts/quality-gates.sh's _qg_expand_case_gates over
+# workflows/scripts/build/tests, the same path `make test-build` covers.
+claude/commands/build.md	Step 4b step 2 — turn-end wake assertion (wake-guard.sh assert)	mandatory before ending ANY turn at this step	guard	workflows/scripts/build/tests/test_wake_guard.sh	wake-guard.sh assert	make test-build	test_wake_guard.sh's § STATIC GUARDS greps build.md for the `wake-guard.sh assert` invocation and FAILS when 4b no longer carries it, so deleting the refusal from the spec turns the suite red instead of silently removing the last defense against a turn ending with open work and no armed wake source; the same suite also EXECUTES `assert` against all four of its outcomes (no open work, armed, unarmed-refusal, unknown-kind error), so the guard covers both that the step is wired and that the thing it wires still behaves.

@@ -1120,12 +1120,25 @@ function sq(value) {
 // -----------------------------------------------------------------------------
 // WHY IT IS ONE FUNCTION AND NOT TWO COPIES, why the guard cannot depend on
 // what it watches, and what `opts.group` is for — see build-level.design-notes-7.md#why-it-is-one-function-and-not-two-copies-bash-timeout-detach
-function killNotDetachWatchdog(ceilVar, pidVar, kidVar, opts) {
+function killNotDetachWatchdog(ceilVar, pidVar, kidVar, wdVar, opts) {
   const groupKill = opts && opts.group ? `kill -9 -"${pidVar}" 2>/dev/null; ` : '';
-  return `( sleep "${ceilVar}" 2>/dev/null; ${kidVar}=$(pgrep -P "${pidVar}" 2>/dev/null); ` +
+  // `set -m` gives the WATCHDOG SUBSHELL its own process group, so retireWatchdog
+  // can group-kill it and take its `sleep` with it — see the design note.
+  return `set -m; ( sleep "${ceilVar}" 2>/dev/null; ${kidVar}=$(pgrep -P "${pidVar}" 2>/dev/null); ` +
     groupKill +
     `kill -9 "${pidVar}" 2>/dev/null; [ -n "$${kidVar}" ] && kill -9 $${kidVar} 2>/dev/null ) ` +
-    `</dev/null >/dev/null 2>&1 &`;
+    `</dev/null >/dev/null 2>&1 & ${wdVar}=$!; set +m;`;
+}
+
+// retireWatchdog — the companion to killNotDetachWatchdog: retire a watchdog
+// that is no longer needed WITHOUT orphaning its `sleep` (temperloop#2210).
+// A bare `kill "$wd"` signals only the subshell; its `sleep` is a separate
+// child of that subshell, so it is reparented to init and idles for the FULL
+// ceiling on every FAST call — one stray process per bounded step. The group
+// kill takes the sleep with it; the bare-pid form is the fallback for a host
+// where job control could not give the subshell its own group.
+function retireWatchdog(wdVar) {
+  return `kill -- -"$${wdVar}" 2>/dev/null || kill "$${wdVar}" 2>/dev/null; wait "$${wdVar}" 2>/dev/null;`;
 }
 
 // -----------------------------------------------------------------------------
@@ -1141,10 +1154,9 @@ function stepBoundPreamble(slowSecs) {
     '  "$@" &',
     '  __lbp=$!',
     // Kill ORDER is load-bearing, and the obvious order is wrong. Killing th — see build-level.design-notes.md#kill-order-is-load-bearing-and-the-obvious-order-is-wrong-ki
-    '  ' + killNotDetachWatchdog('$__lb_ceil', '$__lbp', '__lbc'),
-    '  __lbw=$!',
+    '  ' + killNotDetachWatchdog('$__lb_ceil', '$__lbp', '__lbc', '__lbw'),
     '  wait "$__lbp" 2>/dev/null; __lbr=$?',
-    '  kill "$__lbw" 2>/dev/null; wait "$__lbw" 2>/dev/null',
+    '  ' + retireWatchdog('__lbw'),
     '  __lbe=$(( $(date +%s) - __lbt ))',
     // Timed out iff BOTH the step died by SIGNAL and the wall clock actually — see build-level.design-notes-2.md#timed-out-iff-both-the-step-died-by-signal-and-the-wall
     '  if [ "$__lbr" -ge 128 ] && [ "$__lbe" -ge "$__lb_ceil" ]; then',
@@ -1794,9 +1806,9 @@ function workerGateCmd(slug, worktreePath) {
     // before, and `pipefail` (set above, inherited by the subshell) still makes
     // $__rc the SUITE's status rather than tee's.
     `set -m; { ./scripts/quality-gates.sh --scoped 2>&1 | tee ${glog}; } & __wgp=$!; set +m; ` +
-    `${killNotDetachWatchdog('$__wgb', '$__wgp', '__wgc', { group: true })} __wgw=$!; ` +
+    `${killNotDetachWatchdog('$__wgb', '$__wgp', '__wgc', '__wgw', { group: true })} ` +
     `wait "$__wgp" 2>/dev/null; __rc=$?; ` +
-    `kill "$__wgw" 2>/dev/null; wait "$__wgw" 2>/dev/null; ` +
+    `${retireWatchdog('__wgw')} ` +
     `__we=$(( $(date +%s) - __t0 )); ` +
     // Timed out iff BOTH the suite died by SIGNAL and the wall clock actually
     // reached the bound — the same two-part test the #1071 step bound uses, so
