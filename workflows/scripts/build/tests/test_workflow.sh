@@ -15967,6 +15967,167 @@ if ((db2.pick ?? {}).held !== true)
 console.log(JSON.stringify({ ok: true }));
 "
 
+# ============================================================================
+# TEMPERLOOP#2229 — a gate pass that records NO acceptance evidence.
+#
+# Observed in A/A run wf_8b4f38e0-299 (item vault-hygiene-replace-all-open):
+# the baseline arm recorded 5 acceptance_results with evidence, the candidate
+# arm recorded [] — and the candidate PASSED its gate. A pass naming zero
+# criteria is indistinguishable from a vacuous pass, and in a COMPARISON that
+# asymmetry is read as a model difference. The three cases below are the
+# discrimination set: the asymmetric pair must refuse, the healthy pair must
+# NOT (so an unconditionally-firing check goes red), and the level cost block
+# must stop asserting known:true over a null token count.
+# ============================================================================
+
+run_node_case "K2229 unevidenced pass: an arm whose done verdict records ZERO acceptance results is REFUSED as a pass — an incomplete loss that cannot win its item and whose branch never reaches a PR" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+// THE ASYMMETRIC PAIR, as observed: same item, same criteria, both arms gate
+// GREEN — the baseline arm records its acceptance_results, the candidate arm
+// records []. The evidence is the ONLY difference between them.
+winningArm('ev1', 'baseline', 601, 'abc601');
+greenArm('ev1', 'candidate');
+happyWorker('ev1@candidate', { acceptance_results: [] });
+// No judge outcome queued on purpose: with one arm refused the pair is
+// one-arm-only, so judgeArms never spawns and this queue is the two barrier
+// row appends alone.
+setMachinery('ev1', { outcome: 'ROW_APPENDED', arm: 'baseline' }, { outcome: 'ROW_APPENDED', arm: 'candidate' });
+pickPhase('ev1');
+
+globalThis.args = { ...dualArgs(['ev1']), items: [
+  { slug: 'ev1', branch: 'build/ev1', title: 'EV1', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const rec = dualRecordOf(result, 'ev1');
+const cand = rec.arms.find(a => a.arm === 'candidate');
+const basel = rec.arms.find(a => a.arm === 'baseline');
+// THE REGRESSION THIS CASE EXISTS FOR: pre-fix this arm came back gate 'pass'
+// with acceptance_results [] — byte-identical, at every consumer, to an arm
+// that had verified every criterion.
+if (cand.gate !== 'fail' || cand.loss_reason !== 'incomplete')
+  { console.log(JSON.stringify({ ok: false, reason: 'an arm recording NO acceptance evidence must not be reportable as a pass: ' + JSON.stringify(cand) })); process.exit(0); }
+if ((cand.failure || {}).kind !== 'unevidenced-acceptance')
+  { console.log(JSON.stringify({ ok: false, reason: 'the refusal must name itself, or it reads as a gate or infra loss: ' + JSON.stringify(cand.failure) })); process.exit(0); }
+if ((cand.acceptance_results || []).length !== 0)
+  { console.log(JSON.stringify({ ok: false, reason: 'the refusal must not invent evidence the arm never recorded: ' + JSON.stringify(cand.acceptance_results) })); process.exit(0); }
+// The EVIDENCED arm is untouched — the refusal is about the empty record, not
+// about dual-build arms in general.
+if (basel.gate !== 'pass' || (basel.acceptance_results || []).length !== 1 || basel.failure)
+  { console.log(JSON.stringify({ ok: false, reason: 'the evidenced arm must still be an ordinary pass: ' + JSON.stringify(basel) })); process.exit(0); }
+// It cannot WIN: the item goes to the evidenced arm by gate, with no judge.
+const picked = ((result.dualBuild.pick || {}).items || []).find(i => i.slug === 'ev1') || {};
+if (picked.winner !== 'baseline' || picked.reason !== 'gate')
+  { console.log(JSON.stringify({ ok: false, reason: 'the item must be won by the evidenced arm on the gate, not compared: ' + JSON.stringify(picked) })); process.exit(0); }
+if (callLog.some(c => String(c.opts.label) === 'judge:ev1'))
+  { console.log(JSON.stringify({ ok: false, reason: 'a pair with a refused arm has nothing to compare — the judge must not be spent on it' })); process.exit(0); }
+// The refusal reaches the DURABLE row, not only the escalation payload the
+// operator disposes of and loses.
+const crow = rowFor('ev1', 'candidate') || {};
+if (crow.gate !== 'fail' || crow.loss_reason !== 'incomplete')
+  { console.log(JSON.stringify({ ok: false, reason: 'the refusal never reached the ledger row: ' + JSON.stringify(crow) })); process.exit(0); }
+// …and not one PR from the unevidenced arm.
+const prArms = callLog.filter(c => /^pr-batch:/.test(String(c.opts.label))).map(c => String(c.opts.label).split(':')[1]).sort();
+if (prArms.join(',') !== 'ev1@baseline')
+  { console.log(JSON.stringify({ ok: false, reason: 'the unevidenced arm must never reach the PR phase: ' + JSON.stringify(prArms) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2229 control: a pair where BOTH arms record acceptance results is UNCHANGED — two passes, a judge, and no refusal anywhere (an unconditional check goes red here)" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+calibrated();
+// The healthy path, identical to the case above except that the candidate arm
+// records its acceptance_results too. Every assertion below is the mirror of
+// one made there, so a check that fired unconditionally — the assertion that
+// cannot fail (temperloop#1706) — turns THIS case red.
+winningArm('hc1', 'baseline', 611, 'abc611');
+greenArm('hc1', 'candidate');
+itemBarrier('hc1');
+pickPhase('hc1');
+
+globalThis.args = { ...dualArgs(['hc1']), items: [
+  { slug: 'hc1', branch: 'build/hc1', title: 'HC1', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const rec = dualRecordOf(result, 'hc1');
+for (const a of rec.arms) {
+  if (a.gate !== 'pass' || a.loss_reason !== null)
+    { console.log(JSON.stringify({ ok: false, reason: 'an evidenced arm must still pass: ' + JSON.stringify(a) })); process.exit(0); }
+  if (a.failure)
+    { console.log(JSON.stringify({ ok: false, reason: 'the unevidenced-acceptance refusal fired on a healthy arm: ' + JSON.stringify(a.failure) })); process.exit(0); }
+  if ((a.acceptance_results || []).length !== 1)
+    { console.log(JSON.stringify({ ok: false, reason: 'the arm record must still carry the criteria it evaluated: ' + JSON.stringify(a) })); process.exit(0); }
+}
+if (!callLog.some(c => String(c.opts.label) === 'judge:hc1'))
+  { console.log(JSON.stringify({ ok: false, reason: 'two passing arms must still be compared by the judge' })); process.exit(0); }
+const picked = ((result.dualBuild.pick || {}).items || []).find(i => i.slug === 'hc1') || {};
+if (picked.reason !== 'judge')
+  { console.log(JSON.stringify({ ok: false, reason: 'a healthy pair must be decided by the judge, not by a gate loss: ' + JSON.stringify(picked) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+run_node_case "K2229 cost: the level cost block never reports known:true over a null token count — known answers for tokens, wall_clock_known for the fallback unit" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+uncalibrated();
+greenArm('kc1', 'baseline'); greenArm('kc1', 'candidate');
+itemBarrier('kc1');
+// The baseline arm captures a real token envelope; the candidate arm is left
+// on the fixture default (usage_source 'unavailable' → null tokens) with a
+// real wall-clock reading. That second shape is the observed one, and it used
+// to publish { tokens: null, known: true } — a block asserting it knew a
+// figure it was simultaneously reporting as absent.
+setWorkerUsage('kc1@baseline', { outcome: 'WORKER_USAGE', epoch_s: 1000, usage_source: 'envelope', input_tokens: 100, output_tokens: 50 });
+
+globalThis.args = { ...dualArgs(['kc1']), items: [
+  { slug: 'kc1', branch: 'build/kc1', title: 'KC1', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const cost = (result.dualBuild.pick || {}).cost || {};
+if (!cost.baseline || !cost.candidate)
+  { console.log(JSON.stringify({ ok: false, reason: 'the level summary carries no per-arm cost block: ' + JSON.stringify(result.dualBuild.pick) })); process.exit(0); }
+// POSITIVE CONTROL: a real token count still reports known:true.
+if (cost.baseline.tokens !== 150 || cost.baseline.known !== true)
+  { console.log(JSON.stringify({ ok: false, reason: 'an arm with a real token envelope must report its tokens as known: ' + JSON.stringify(cost.baseline) })); process.exit(0); }
+// THE REGRESSION: null tokens, and known must follow the tokens field.
+if (cost.candidate.tokens !== null)
+  { console.log(JSON.stringify({ ok: false, reason: 'expected a null token count on the un-instrumented arm: ' + JSON.stringify(cost.candidate) })); process.exit(0); }
+if (cost.candidate.known !== false)
+  { console.log(JSON.stringify({ ok: false, reason: 'known:true over a null token count — the flag outran the data: ' + JSON.stringify(cost.candidate) })); process.exit(0); }
+// The fallback unit still names ITSELF, so nothing is lost by the split.
+if (cost.candidate.wall_clock_known !== true || typeof cost.candidate.wall_clock_ms !== 'number')
+  { console.log(JSON.stringify({ ok: false, reason: 'the wall-clock fallback must carry its own answer: ' + JSON.stringify(cost.candidate) })); process.exit(0); }
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# --- temperloop#2229 static guards ------------------------------------------
+K2229_ARM="$(awk '/^async function driveArm/,/^}$/' "$MJS")"
+printf '%s' "$K2229_ARM" | grep -F 'unevidencedAcceptance(' >/dev/null \
+  || fail "#2229: driveArm never calls unevidencedAcceptance — an arm could report a gate pass with no acceptance evidence again"
+grep -q 'function unevidencedAcceptance' "$MJS" \
+  || fail "#2229: build-level.mjs has no unevidencedAcceptance predicate — the refusal has no single named place"
+K2229_ROUTE="$(awk '/^async function routePickedItem/,/^}$/' "$MJS")"
+printf '%s' "$K2229_ROUTE" | grep -F "winner.spike && winner.gate === 'pass'" >/dev/null \
+  || fail "#2229: routePickedItem's spike shortcut does not re-check the gate — a REFUSED spike arm still carries spike:true and would park as a pass"
+echo "PASS: #2229 static guards — the refusal predicate, its driveArm call site, and the spike shortcut's gate conjunct are wired"
+
 # --- temperloop#2083 static guards ------------------------------------------
 # The cases above prove the behaviour. These pin the STRUCTURAL facts a future
 # edit could undo while every case still passed.

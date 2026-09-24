@@ -4802,6 +4802,23 @@ function dualBuildLossReason(kind) {
   return 'infra';
 }
 
+// -----------------------------------------------------------------------------
+// unevidencedAcceptance — the temperloop#2229 refusal predicate.
+// -----------------------------------------------------------------------------
+// A `pass` that names ZERO criteria is indistinguishable from a vacuous — see build-level.design-notes-7.md#temperloop-2229-a-gate-pass-that-records-no-acceptance-evide
+function unevidencedAcceptance(results) {
+  return !Array.isArray(results) || results.length === 0;
+}
+// The one failure record both refusal sites carry, so an arm refused for want
+// of evidence is greppable by a single `kind` and never reads as an infra loss.
+const UNEVIDENCED_ACCEPTANCE_FAILURE = {
+  kind: 'unevidenced-acceptance',
+  detail:
+    'the arm returned a done verdict with an EMPTY acceptance_results — it records no evidence that any ' +
+    'criterion was checked, so it is not reportable as a pass (temperloop#2229). Its sibling arm records ' +
+    'its criteria; an asymmetric pair like this is what made the un-evidenced arm invisible.',
+};
+
 // driveArm — build ONE arm of ONE in-scope item through phase 1 only. — see build-level.design-notes-4.md#drivearm-build-one-arm-of-one-in-scope-item-through-phase-1-
 async function driveArm(item, dual, armName, order) {
   const model = armName === 'baseline' ? dual.baseline : dual.candidate;
@@ -4832,13 +4849,19 @@ async function driveArm(item, dual, armName, order) {
   const built = await driveItemBuild(ai, { name: armName, sibling, slug: item.slug, order });
   // temperloop#2080 round-1 review [MEDIUM]. driveItemBuildPhase returns a — see build-level.design-notes-4.md#temperloop-2080-round-1-review-medium-driveitembuildphase-re
   if (built.result && built.result._kind === 'parked') {
+    const spikeResults = built.result.parked?.acceptance_results ?? [];
+    // temperloop#2229 — the unevidenced-pass refusal, applied to the spik — see build-level.design-notes-7.md#temperloop-2229-a-gate-pass-that-records-no-acceptance-evide
+    if (unevidencedAcceptance(spikeResults)) {
+      log(`[${ai.slug}] dual-build spike arm returned a done verdict with ZERO acceptance results — refusing to record it as an evidenced pass (temperloop#2229): recorded as an incomplete loss`);
+      return { ...base, gate: 'fail', lossReason: 'incomplete', spike: true, failure: UNEVIDENCED_ACCEPTANCE_FAILURE };
+    }
     log(`[${ai.slug}] dual-build arm completed as a read-only spike verdict (no worktree, no gate) — a passing arm, not a loss`);
     return {
       ...base,
       gate: 'pass',
       lossReason: null,
       spike: true,
-      acceptanceResults: built.result.parked?.acceptance_results ?? [],
+      acceptanceResults: spikeResults,
     };
   }
   if (built.result) {
@@ -4853,6 +4876,29 @@ async function driveArm(item, dual, armName, order) {
     };
   }
   const ctx = built.ctx;
+  const acceptanceResults = ctx.verdict?.acceptance_results ?? [];
+  const armCost = {
+    tokens_in: ctx.mainCost?.tokensIn ?? null,
+    tokens_out: ctx.mainCost?.tokensOut ?? null,
+    wall_clock_ms: ctx.mainCost?.wallClockMs ?? null,
+    retry_tokens: null,
+    retry_count: 0,
+    recovery: !!ctx.recovery,
+  };
+  // temperloop#2229 — THE UNEVIDENCED-PASS REFUSAL. A green gate says the — see build-level.design-notes-7.md#temperloop-2229-a-gate-pass-that-records-no-acceptance-evide
+  if (unevidencedAcceptance(acceptanceResults)) {
+    log(`[${ai.slug}] dual-build arm reached a green gate but recorded ZERO acceptance results — refusing to record it as an evidenced pass (temperloop#2229): recorded as an incomplete loss`);
+    return {
+      ...base,
+      gate: 'fail',
+      lossReason: 'incomplete',
+      ctx,
+      wtBase: ctx.wtBase || '',
+      guardArmed: ctx.wtGuard || 'UNKNOWN',
+      cost: armCost,
+      failure: UNEVIDENCED_ACCEPTANCE_FAILURE,
+    };
+  }
   return {
     ...base,
     gate: 'pass',
@@ -4860,15 +4906,8 @@ async function driveArm(item, dual, armName, order) {
     ctx,
     wtBase: ctx.wtBase || '',
     guardArmed: ctx.wtGuard || 'UNKNOWN',
-    acceptanceResults: ctx.verdict?.acceptance_results ?? [],
-    cost: {
-      tokens_in: ctx.mainCost?.tokensIn ?? null,
-      tokens_out: ctx.mainCost?.tokensOut ?? null,
-      wall_clock_ms: ctx.mainCost?.wallClockMs ?? null,
-      retry_tokens: null,
-      retry_count: 0,
-      recovery: !!ctx.recovery,
-    },
+    acceptanceResults,
+    cost: armCost,
   };
 }
 
@@ -5273,7 +5312,20 @@ function dualBuildArmCost(pickables, armName) {
       wallClockMs += c.wall_clock_ms;
     }
   }
-  return { tokens: tokensSeen ? tokens : null, wall_clock_ms: wallSeen ? wallClockMs : null, known: tokensSeen || wallSeen };
+  // temperloop#2229 — `known` must never outrun the data. It used to be
+  // `tokensSeen || wallSeen`, so a level whose arms reported wall-clock but no
+  // tokens published `{ tokens: null, known: true }` — a cost block asserting
+  // it knew a figure it is simultaneously reporting as absent. `known` now
+  // answers ONLY for `tokens`, the tie-break's primary unit, and the fallback
+  // unit carries its own answer in `wall_clock_known` — two honest booleans
+  // instead of one that meant two different things. `cheaperArm` is unaffected:
+  // it reads the VALUES, never this flag.
+  return {
+    tokens: tokensSeen ? tokens : null,
+    wall_clock_ms: wallSeen ? wallClockMs : null,
+    known: tokensSeen,
+    wall_clock_known: wallSeen,
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -5683,7 +5735,12 @@ async function routePickedItem(p, dual, decision, tally) {
   let winner = p.arms.find((a) => a.arm === wantArm);
 
   // A spike arm produced a verdict note, not a branch — there is nothing t — see build-level.design-notes-7.md#a-spike-arm-produced-a-verdict-note-not-a-branch-there-is-no
-  if (winner && winner.spike) {
+  // `gate === 'pass'` is load-bearing, not belt-and-braces (temperloop#2229): a
+  // spike arm REFUSED for recording no acceptance evidence still carries
+  // `spike: true`, and without this conjunct it would take this shortcut and
+  // park as a pass — the exact vacuous pass the refusal exists to stop. A
+  // refused spike falls through to the re-drive below like any other loss.
+  if (winner && winner.spike && winner.gate === 'pass') {
     const rec = park(slug, null, null, winner.acceptanceResults ?? []);
     rec.parked.dual_build = { ...dualRecord, pick: { ...basePick, outcome: 'spike-no-pr' } };
     return { record: rec, pick: { ...basePick, outcome: 'spike-no-pr', pr: null, stamped: null } };
