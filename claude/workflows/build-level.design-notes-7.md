@@ -859,9 +859,18 @@ side breached on its own.
  that arm, never a per-item average that would let one cheap item outvote the
  rest. Tokens are the unit; wall-clock is the fallback ONLY when neither arm
  reported tokens at all, so a partly-instrumented level never silently
- compares tokens against milliseconds. `known` is false when the arm reported
- neither — which is what makes "the tie-break could not be evaluated" a state
- the caller names rather than a zero it mistakes for cheap.
+ compares tokens against milliseconds.
+
+ `known` and `wall_clock_known` (temperloop#2229). `known` used to be
+ `tokensSeen || wallSeen` — one boolean over two fields — so a level whose arms
+ reported wall-clock but no tokens published `{ tokens: null, known: true }`:
+ a cost block asserting it knew a figure it was simultaneously reporting as
+ absent, the same "known outruns the data" shape the unevidenced-pass refusal
+ rejects for acceptance evidence. `known` now answers ONLY for `tokens`, and
+ the fallback unit carries its own `wall_clock_known`. Both false still means
+ "the tie-break could not be evaluated" — a state the caller names rather than
+ a zero it mistakes for cheap — and `cheaperArm` is unaffected either way: it
+ reads the VALUES, never these flags.
 ```
 
 ## Pre-registered means: every rule below is fixed BEFORE the level runs,
@@ -1096,4 +1105,56 @@ side breached on its own.
  frequent producer of a `round > 1` continuation whose prior round was
  clean; the old `round > 1` premise asserted the opposite on every one
  of them.
+```
+
+## temperloop#2229 — a gate pass that records no acceptance evidence
+<a id="temperloop-2229-a-gate-pass-that-records-no-acceptance-evide"></a>
+
+```text
+ THE OBSERVED FAILURE. The 2026-09-24 A/A instrument check (run wf_8b4f38e0-299)
+ built `vault-hygiene-replace-all-open` under two arms of the SAME model. The
+ baseline arm recorded 5 acceptance_results with evidence; the candidate arm
+ recorded `[]` — and it PASSED its gate, then lost on the judge. The arm most
+ worth inspecting was the one carrying no evidence it had been checked at all.
+
+ WHY THAT IS A DEFECT AND NOT A COSMETIC GAP. `gate: 'pass'` on an arm used to
+ be derived from ONE fact — that driveItemBuild reached a green acceptance gate
+ — and the worker's own per-criterion self-check rode along as whatever the
+ verdict happened to carry. So a worker returning `status: done` with an EMPTY
+ `acceptance_results` produced a record byte-identical, at every consumer
+ (`tallyLevelPick`'s `passing` filter, the ledger row's `gate` field, the
+ level-pick escalation payload), to one that had verified every criterion. A
+ pass naming zero criteria cannot be distinguished from a vacuous pass, and the
+ two arms of a dual build are a COMPARISON: an asymmetric pair — same criteria,
+ one arm recording results, one not — silently compares an evidenced build
+ against an unevidenced one and reports the difference as a model difference.
+
+ THE REFUSAL. `unevidencedAcceptance()` is the predicate; both of driveArm's
+ gate-passing returns run it before claiming a pass, and an arm that records no
+ criteria comes back `gate: 'fail'`, `lossReason: 'incomplete'`, carrying
+ `UNEVIDENCED_ACCEPTANCE_FAILURE` as its `failure` record. Three reasons that
+ vocabulary rather than a new one:
+   - `incomplete` already MEANS this in the ledger's closed `loss_reason` set
+     (`acceptance-incomplete` maps to it), and `gate ∈ {pass,fail}` is
+     schema-validated by `dual-build-ledger.sh` — a third gate state would be a
+     row-schema break for a state the existing vocabulary already names.
+   - The refusal is NOT silent: the named `failure.kind` is
+     `unevidenced-acceptance`, distinct from every escalation-derived kind, so
+     an arm refused for want of evidence is never confused with one that
+     genuinely failed its gate or died on infra.
+   - It cannot be read as an evidenced pass by ANY consumer, which is the whole
+     acceptance criterion — the tally excludes it, the row records it as a
+     loss, and the arm summary carries the reason.
+
+ THE SPIKE CONJUNCT. `routePickedItem`'s spike shortcut parks a spike arm with
+ no PR, and it runs BEFORE the `winner.gate !== 'pass'` re-drive check. A
+ refused spike arm still carries `spike: true`, so that shortcut had to grow a
+ `&& winner.gate === 'pass'` conjunct or it would park the refused arm as a
+ pass — re-introducing the vacuous pass one branch downstream of the refusal.
+
+ WHAT IS DELIBERATELY NOT DONE. A worker's verdict is not rewritten, and the
+ single-arm path is untouched: it already escalates `acceptance-incomplete` on
+ a FAILING criterion, and an empty list there rides the PR body a human reads.
+ The dual-build path is where the record is consumed MACHINE-side — by a tally
+ that picks a winner — which is why the refusal lives here.
 ```
