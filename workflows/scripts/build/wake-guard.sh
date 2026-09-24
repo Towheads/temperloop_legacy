@@ -82,6 +82,18 @@
 # does not pre-empt. A caller that wants the full queue ceiling chains armed
 # calls; it never widens this one past the foreground cap.
 #
+# IT IS A BUDGET FOR THE WHOLE PR SET, NOT A PER-PR ALLOWANCE. `arm` polls the
+# in-flight PRs sequentially, and a per-PR bound would let a routine multi-PR
+# level (BUILD_COMBINED_TREE_PRECHECK exists precisely because a level selects
+# more than one) SUM past the foreground ceiling — at which point the harness
+# auto-backgrounds this very call and the turn ends with the verdict lost.
+# That is this item's own defect reintroduced through the new mechanism, so
+# `arm` holds ONE deadline across the set: each PR is polled with whatever
+# wall clock is LEFT, and a set that exhausts the budget returns
+# {"outcome":"TIMEOUT",…,"reason":"budget"} for the first unfinished PR rather
+# than running on. The caller chains another armed call, exactly as it already
+# does for a single PR that times out.
+#
 # ── USAGE ───────────────────────────────────────────────────────────────────
 #   wake-guard.sh arm <owner>/<repo> <pr> [<pr> ...]
 #                     [--interval <secs>] [--timeout <secs>] [--gate-bin <path>]
@@ -94,6 +106,8 @@
 #            {"outcome":"CONFLICTING","pr":…,…}                         exit 3
 #            {"outcome":"TIMEOUT","pr":…,"waited":…,…}                  exit 4
 #            {"outcome":"TIMEOUT","pr":…,"killed":true,"bound_secs":…}  exit 4
+#            {"outcome":"TIMEOUT","pr":…,"budget_secs":…,"reason":"budget…"}
+#                                                                       exit 4
 #   bound  → the wrapped command's own stdout and exit status, EXCEPT on a
 #            timeout: {"outcome":"TIMEOUT","label":…,"bound_secs":…,
 #                      "elapsed_secs":…,"killed":true}                exit 137
@@ -111,7 +125,19 @@ command -v jq >/dev/null 2>&1 || { echo '{"outcome":"ERROR","error":"jq not foun
 # fd 3 = the script's real stdout, so a die() inside a command substitution
 # still reaches the caller (the same seam gate.sh / ci-poll.sh / pr.sh use).
 exec 3>&1
+
+# The ONE file this script ever writes (cmd_arm's poll scratch), tracked at
+# script scope so every exit path — a normal return, a die(), a signal — sweeps
+# it. It is deliberately NOT a `trap … EXIT`: this file is advertised as
+# sourceable (see the dispatch guard at the bottom), and a process-wide EXIT
+# trap installed from inside a cmd_* function silently REPLACES the sourcing
+# caller's own cleanup trap, and tracks only the latest scratch across repeat
+# calls. Function-scope sweeps have neither problem.
+_WG_SCRATCH=""
+_wg_sweep() { [ -n "$_WG_SCRATCH" ] && rm -f "$_WG_SCRATCH"; _WG_SCRATCH=""; return 0; }
+
 die() {
+  _wg_sweep
   jq -cn --arg error "$1" '{outcome:"ERROR", error:$error}' >&3
   exit 1
 }
@@ -120,11 +146,74 @@ usage() {
   die "usage: wake-guard.sh arm <owner>/<repo> <pr> [<pr> ...] [--interval <secs>] [--timeout <secs>] [--gate-bin <path>] | bound --label <name> --timeout-secs <secs> -- <cmd> [args...] | assert --open <n> [--wake <poll|wakeup|background|none>]"
 }
 
+# _wg_uint <s> — echo <s> as a DECIMAL integer, or return 1.
+#
+# The `10#` prefix is load-bearing, not decoration. A digits-only check alone
+# accepts `08`/`09`, which `test -gt` happily compares in base 10 and `$(( ))`
+# then rejects as invalid OCTAL — aborting the shell mid-expansion with a bare
+# bash error and emitting NO JSON at all, which breaks the closed-outcome
+# contract this script exists to keep (a caller piping to jq gets an empty
+# parse instead of {"outcome":"ERROR",…}). Reachable from config as well as the
+# CLI, since interval/timeout default from $BUILD_WAKE_POLL_INTERVAL /
+# $BUILD_WAKE_POLL_TIMEOUT. So every caller ASSIGNS the normalised value back
+# rather than discarding it — `x="$(_wg_uint "$x")" || die …` — and `007` also
+# stops reaching `jq --argjson`, which would reject it as invalid JSON.
 _wg_uint() {
   case "${1:-}" in
     ""|*[!0-9]*) return 1 ;;
-    *) printf '%s' "$1" ;;
   esac
+  printf '%d' "$((10#$1))"
+}
+
+# _wg_retire_wd <pid> — retire a watchdog that is no longer needed. Signals the
+# GROUP first (which takes its `sleep` grandchild with it) and falls back to the
+# bare pid on a host where job control could not give it its own group.
+_wg_retire_wd() {
+  [ -n "${1:-}" ] || return 0
+  kill -- -"$1" 2>/dev/null || kill "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+  return 0
+}
+
+# --- signals reap the group too, not just the bound --------------------------
+# `set -m` below moves the watched command into its OWN process group — which
+# is exactly what takes it OUT of this script's foreground group. A signal
+# delivered to wake-guard.sh (a terminal Ctrl-C, a hangup from a closed
+# terminal or a dropped SSH session, a CI job's SIGTERM) therefore does NOT
+# reach the child. With no handler installed, this script dies and the child
+# survives FULLY DETACHED — this item's own defect class, reintroduced through
+# the signal door: `gate.sh poll` would keep burning `gh` reads with nobody
+# reading its output, its JSON verdict would never be emitted, and the scratch
+# file would leak. "Silence is indistinguishable from still running" is exactly
+# what #2210 exists to close.
+#
+# So every interactive/terminating signal a terminal or a CI job can deliver
+# runs the SAME reap the bound does, then exits. ALL FOUR, not a subset — an
+# UNARMED signal takes bash's default disposition and is strictly worse than no
+# guard at all. This is the set bounded-suite.sh (the script this one's `set -m`
+# technique is modelled on) and workflows/scripts/tests/lib/sandbox.sh already
+# install; 129/130/131/143 are the conventional 128+SIG* codes.
+_wg_reap() {
+  if [ -n "$_WG_WD_PID" ]; then
+    kill -KILL -"$_WG_WD_PID" 2>/dev/null || kill -KILL "$_WG_WD_PID" 2>/dev/null
+  fi
+  if [ -n "$_WG_CHILD_PID" ]; then
+    kill -KILL -"$_WG_CHILD_PID" 2>/dev/null || kill -KILL "$_WG_CHILD_PID" 2>/dev/null
+  fi
+  _WG_CHILD_PID=""; _WG_WD_PID=""
+  _wg_sweep
+  return 0
+}
+
+# Installed ONLY on the CLI path (from the dispatch guard at the bottom), never
+# at source time: a `trap` is process-wide, so arming one from a sourced file
+# would clobber a sourcing test's own cleanup trap — the same hazard that keeps
+# the scratch sweep out of an EXIT trap.
+_wg_install_signal_traps() {
+  trap '_wg_reap; exit 129' HUP
+  trap '_wg_reap; exit 130' INT
+  trap '_wg_reap; exit 131' QUIT
+  trap '_wg_reap; exit 143' TERM
 }
 
 # --- the watchdog ------------------------------------------------------------
@@ -163,15 +252,26 @@ _wg_uint() {
 # does exactly that) rather than capturing it.
 _WG_TIMED_OUT=0
 _WG_ELAPSED=0
+# The live pids of the bounded region, at script scope so the SIGNAL HANDLERS
+# below can reap them — see _wg_reap().
+_WG_CHILD_PID=""
+_WG_WD_PID=""
 _wg_run_bounded() {
   local bound="$1"; shift
   local rc=0 pid wd elapsed t0
   _WG_TIMED_OUT=0
   t0="$(date +%s)"
+  # BOTH background jobs are started under `set -m`, so EACH gets its own
+  # process group. For the child that is what lets the bound reap the whole
+  # tree. For the WATCHDOG it closes a smaller leak with the same shape: a bare
+  # `kill "$wd"` signals only the subshell, and its `sleep` is a separate child
+  # of that subshell — reparented to init and left idling for the FULL bound on
+  # every FAST call. `arm` derives a bound per PR, so a chained armed wake
+  # otherwise accumulates one stray `sleep` per poll. Group-killing the
+  # watchdog (below) takes its sleep with it.
   set -m
   "$@" 3>&- &
   pid=$!
-  set +m
   # `kill -KILL -$pid` signals the GROUP; the bare-pid fallback covers a host
   # where job control could not give the child its own group, so the bound
   # degrades to portable-timeout.sh's direct-child kill rather than to nothing.
@@ -179,9 +279,11 @@ _wg_run_bounded() {
     kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
   ) </dev/null >/dev/null 2>&1 3>&- &
   wd=$!
+  set +m
+  _WG_CHILD_PID="$pid"; _WG_WD_PID="$wd"
   wait "$pid" 2>/dev/null; rc=$?
-  kill "$wd" 2>/dev/null
-  wait "$wd" 2>/dev/null
+  _wg_retire_wd "$wd"
+  _WG_CHILD_PID=""; _WG_WD_PID=""
   elapsed=$(( $(date +%s) - t0 ))
   # Timed out iff BOTH the child died by signal AND the wall clock actually
   # reached the bound — the same two-part test build-level.mjs's #1071 step
@@ -205,7 +307,7 @@ cmd_bound() {
     esac
   done
   [ -n "$label" ] || die "bound: --label is required"
-  _wg_uint "$bound" >/dev/null || die "bound: --timeout-secs '$bound' invalid — must be a non-negative integer"
+  bound="$(_wg_uint "$bound")" || die "bound: --timeout-secs '$bound' invalid — must be a non-negative integer"
   [ "$bound" -gt 0 ] || die "bound: --timeout-secs must be greater than 0 — a zero bound is no bound at all"
   [ $# -ge 1 ] || die "bound: no command after --"
 
@@ -223,7 +325,7 @@ cmd_bound() {
 # blocking BY DESIGN: a blocking call is the only shape an orchestrator turn
 # cannot end in front of, which is the defect this closes.
 cmd_arm() {
-  local owner_repo="" interval="" timeout="" gate_bin=""
+  local owner_repo="" interval="" timeout="" gate_bin="" _pr_n=""
   local -a prs=()
   [ $# -ge 1 ] || usage
   owner_repo="$1"; shift
@@ -238,15 +340,15 @@ cmd_arm() {
       --timeout)  [ $# -ge 2 ] || usage; timeout="$2"; shift 2 ;;
       --gate-bin) [ $# -ge 2 ] || usage; gate_bin="$2"; shift 2 ;;
       -*)         usage ;;
-      *)          _wg_uint "$1" >/dev/null || die "pr '$1' invalid — must be a PR number"
-                  prs+=("$1"); shift ;;
+      *)          _pr_n="$(_wg_uint "$1")" || die "pr '$1' invalid — must be a PR number"
+                  prs+=("$_pr_n"); shift ;;
     esac
   done
 
   interval="${interval:-${BUILD_WAKE_POLL_INTERVAL:-30}}"
   timeout="${timeout:-${BUILD_WAKE_POLL_TIMEOUT:-540}}"
-  _wg_uint "$interval" >/dev/null || die "interval '$interval' invalid"
-  _wg_uint "$timeout" >/dev/null || die "timeout '$timeout' invalid"
+  interval="$(_wg_uint "$interval")" || die "interval '$interval' invalid"
+  timeout="$(_wg_uint "$timeout")" || die "timeout '$timeout' invalid"
   [ "$interval" -gt 0 ] || die "interval must be greater than 0"
   [ "$timeout" -gt 0 ] || die "timeout must be greater than 0"
   gate_bin="${gate_bin:-$_WG_HERE/gate.sh}"
@@ -260,29 +362,50 @@ cmd_arm() {
     return 0
   fi
 
-  # The watchdog bound is DERIVED, never a second setting: gate.sh's own
-  # deadline can be up to one sleep interval late (it checks the deadline
-  # between reads), so the outer kill sits exactly one interval past it. The
-  # watchdog is the belt to gate.sh's suspenders — it fires only when gate.sh
-  # itself wedged and never reached its own TIMEOUT.
-  local wd_bound=$(( timeout + interval ))
-
   # The poll's stdout goes to a scratch FILE, not a command substitution — see
   # the _wg_run_bounded contract above: a substitution would run the watchdog in
   # a subshell and silently discard its timeout verdict. This is the only file
-  # this script writes, and it is removed on every exit path.
+  # this script writes, and it is swept on every exit path — at FUNCTION scope,
+  # never a process-wide `trap … EXIT` (see _wg_sweep's own note).
   local scratch
   scratch="$(mktemp -t wake-guard.XXXXXX)" || die "could not create a scratch file for the armed poll"
-  # shellcheck disable=SC2064  # $scratch is expanded NOW, deliberately.
-  trap "rm -f '$scratch'" EXIT
+  _WG_SCRATCH="$scratch"
 
-  local t0 pr out rc merged_json
+  # ONE DEADLINE FOR THE WHOLE SET, not one per PR. $timeout is a LIVENESS
+  # bound on this invocation — the thing that keeps the call under the harness
+  # foreground ceiling — and a level routinely selects more than one PR, so a
+  # per-PR bound would let N ordinary queue waits SUM past that ceiling and get
+  # this very call auto-backgrounded, losing its verdict. Each PR is therefore
+  # polled with whatever wall clock is LEFT.
+  local t0 deadline pr out rc merged_json remaining wd_bound waited
   t0="$(date +%s)"
+  deadline=$(( t0 + timeout ))
   merged_json='[]'
   for pr in "${prs[@]}"; do
+    remaining=$(( deadline - $(date +%s) ))
+    if [ "$remaining" -lt 1 ]; then
+      # The budget went on the PRs before this one. Reported as a TIMEOUT
+      # naming the first UNFINISHED PR, because that is what it is from the
+      # caller's side: the wait is not over, and the caller chains another
+      # armed call — exactly as it already does for a single PR that times out.
+      # What it is NOT is a silent return with the set half-polled.
+      waited=$(( $(date +%s) - t0 ))
+      jq -cn --argjson pr "$pr" --argjson waited "$waited" --argjson b "$timeout" \
+         --argjson merged "$merged_json" \
+        '{outcome:"TIMEOUT", pr:$pr, waited:$waited, budget_secs:$b, merged:$merged,
+          reason:"budget — this armed call spent its whole per-call wall clock on earlier PRs in the set; chain another armed call"}' >&3
+      _wg_sweep
+      return 4
+    fi
+    # The watchdog bound is DERIVED, never a second setting: gate.sh's own
+    # deadline can be up to one sleep interval late (it checks the deadline
+    # between reads), so the outer kill sits exactly one interval past it. The
+    # watchdog is the belt to gate.sh's suspenders — it fires only when gate.sh
+    # itself wedged and never reached its own TIMEOUT.
+    wd_bound=$(( remaining + interval ))
     rc=0
     _wg_run_bounded "$wd_bound" bash "$gate_bin" poll "$owner_repo" "$pr" \
-      --interval "$interval" --timeout "$timeout" >"$scratch" 2>/dev/null || rc=$?
+      --interval "$interval" --timeout "$remaining" >"$scratch" 2>/dev/null || rc=$?
     out="$(cat "$scratch" 2>/dev/null || true)"
     if [ "$_WG_TIMED_OUT" -eq 1 ]; then
       # gate.sh never reached its own deadline — it wedged and was KILLED, not
@@ -291,17 +414,19 @@ cmd_arm() {
       jq -cn --argjson pr "$pr" --argjson b "$wd_bound" --argjson e "$_WG_ELAPSED" \
         '{outcome:"TIMEOUT", pr:$pr, waited:$e, killed:true, bound_secs:$b,
           reason:"the armed poll itself wedged and was killed at its bound"}' >&3
+      _wg_sweep
       return 4
     fi
     case "$rc" in
       0) merged_json="$(jq -cn --argjson acc "$merged_json" --argjson pr "$pr" '$acc + [$pr]')" ;;
-      3) printf '%s\n' "$out" >&3; return 3 ;;
-      4) printf '%s\n' "$out" >&3; return 4 ;;
+      3) printf '%s\n' "$out" >&3; _wg_sweep; return 3 ;;
+      4) printf '%s\n' "$out" >&3; _wg_sweep; return 4 ;;
       *) die "gate.sh poll failed for #$pr (exit $rc): $(printf '%s' "$out" | tail -1)" ;;
     esac
   done
   jq -cn --argjson merged "$merged_json" --argjson waited "$(( $(date +%s) - t0 ))" \
     '{outcome:"RESUMED", merged:$merged, waited:$waited}' >&3
+  _wg_sweep
   return 0
 }
 
@@ -321,7 +446,7 @@ cmd_assert() {
       *)      usage ;;
     esac
   done
-  _wg_uint "$open" >/dev/null || die "assert: --open '$open' invalid — must be a non-negative integer"
+  open="$(_wg_uint "$open")" || die "assert: --open '$open' invalid — must be a non-negative integer"
   case " $WAKE_KINDS " in
     *" $wake "*) ;;
     *) die "assert: --wake '$wake' invalid — must be one of: $WAKE_KINDS" ;;
@@ -346,6 +471,7 @@ cmd_assert() {
 # Mirrors gate.sh: a test `source`s this file to call cmd_* directly, so the
 # dispatch must NOT run on source.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  _wg_install_signal_traps
   [ $# -ge 1 ] || usage
   _wg_cmd="$1"; shift
   case "$_wg_cmd" in

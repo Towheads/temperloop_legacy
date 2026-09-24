@@ -38,13 +38,29 @@
 #   - bound: the watchdog does not depend on what it watches — a command that
 #     traps and IGNORES SIGTERM is still reaped at the bound, and the guard's
 #     source contains no `pgrep -f`/`until ! pgrep` pattern-liveness check
+#   - bound: SIGNALS reap the group too — HUP/INT/QUIT/TERM on the guard each
+#     reap the watched tree and exit 129/130/131/143 rather than dying and
+#     leaving the child DETACHED (the defect class through the signal door),
+#     each with its own RED arm that splices _wg_reap out of that one handler
+#   - bound: retiring the watchdog does not ORPHAN its own `sleep` for the full
+#     bound, with a CONTROL proving the pre-fix bare-kill shape does
+#   - arm: a MULTI-PR set shares ONE wall-clock budget, so N ordinary queue
+#     waits can never sum past the harness's foreground ceiling and get this
+#     very call auto-backgrounded; CONTROL: a wide budget merges all four
+#   - arm: sourced repeat calls keep the CALLER's EXIT trap and leave no
+#     scratch file behind (no process-wide `trap … EXIT` from a cmd_* function)
+#   - arm/assert: zero-padded values are normalised to decimal, never parsed as
+#     octal (which aborts the shell mid-expansion and emits NO JSON at all)
 #   - build-level.mjs: the GENERATED worker-gate command is executed for real —
 #     a hanging suite is killed at its bound and the sentinel says TIMEOUT
 #     (`state:finished`, `rc:137`, `timedOut:true`), while green / red / the
 #     missing-worktree refusal keep their exact pre-#2210 behaviour
 #   - static guards (the non-removable half): the generated worker-gate command
-#     carries the bound, and /build 4b's post-enqueue MERGED wait names the
-#     armed wake — each goes red if the wiring is deleted
+#     carries the bound and group-retires its watchdog, /build 4b's
+#     post-enqueue MERGED wait names the armed wake, and 4b's turn-end REFUSAL
+#     is a registered mandatory step (kernel § Mandatory-step birth rule) whose
+#     execution signal is this very guard — each goes red if the wiring is
+#     deleted
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,9 +77,16 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 ok()   { PASS=$((PASS + 1)); echo "PASS: $1"; }
 
 TMP="$(mktemp -d)"
+# pgrep/pkill -f take an EXTENDED REGEX, not a literal, and a mktemp path is
+# full of characters an ERE reads as metacharacters (`.` at minimum, and
+# whatever $TMPDIR happens to contain on another host). Escaping them keeps
+# every fixture match exact — and keeps the EXIT-time pkill from being a broad
+# unanchored sweep over a developer's process table.
+TMP_RE="$(printf '%s' "$TMP" | sed -e 's/[][(){}.*+?^$|\\]/\\&/g')"
+pg_count() { pgrep -f "$1" 2>/dev/null | wc -l | tr -d ' '; }
 cleanup() {
   # Belt: any fixture process that somehow survived must not outlive the suite.
-  pkill -f "$TMP" >/dev/null 2>&1 || true
+  pkill -f "$TMP_RE" >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -111,7 +134,7 @@ ok "assert: an unrecognised wake kind ERRORs, it is never accepted as armed"
 # ============================================================================
 # The fixture spawns grandchildren and then sleeps, which is the shape that
 # left orphaned process trees behind in the real incident.
-cat > "$TMP/hang.sh" <<EOF
+cat > "$TMP/hang.sh" <<'EOF'
 #!/usr/bin/env bash
 echo started
 bash -c 'sleep 600' &
@@ -130,7 +153,7 @@ LAST="$(printf '%s\n' "$OUT" | tail -1)"
 [ "$(jqf "$LAST" .bound_secs)" = "2" ] || fail "bound hang bound_secs: $LAST"
 [ "$ELAPSED" -ge 2 ] && [ "$ELAPSED" -le 8 ] || fail "bound hang took ${ELAPSED}s, want ~2s"
 sleep 1
-SURVIVORS="$(pgrep -f "$TMP/hang.sh" 2>/dev/null | wc -l | tr -d ' ')"
+SURVIVORS="$(pg_count "$TMP_RE/hang\.sh")"
 [ "$SURVIVORS" = "0" ] || fail "bound hang left $SURVIVORS process(es) running — DETACHED, not killed"
 ok "bound: a hanging command is KILLED at its bound, reported TIMEOUT, tree reaped"
 
@@ -141,7 +164,7 @@ CTRL=$!
 sleep 3
 kill -0 "$CTRL" 2>/dev/null || fail "control fixture died on its own — the hang assertion proves nothing"
 disown "$CTRL" 2>/dev/null || true
-kill -9 "$CTRL" 2>/dev/null; pkill -f "$TMP/hang.sh" >/dev/null 2>&1
+kill -9 "$CTRL" 2>/dev/null; pkill -f "$TMP_RE/hang\.sh" >/dev/null 2>&1
 ok "bound: CONTROL — the same fixture runs on unbounded when nothing guards it"
 
 T0=$(date +%s)
@@ -167,7 +190,7 @@ ELAPSED=$(( $(date +%s) - T0 ))
 [ "$RC" -eq 137 ] || fail "bound stubborn exit $RC, want 137"
 [ "$ELAPSED" -le 8 ] || fail "bound stubborn took ${ELAPSED}s — the guard waited on the watched process"
 sleep 1
-[ "$(pgrep -f "$TMP/stubborn.sh" 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+[ "$(pg_count "$TMP_RE/stubborn\.sh")" = "0" ] \
   || fail "bound stubborn survived — a SIGTERM-ignoring process outlived its bound"
 ok "bound: a SIGTERM-ignoring process is still reaped — the guard needs no cooperation"
 
@@ -181,6 +204,136 @@ CODE="$(sed 's/#.*//' "$SCRIPT")"
 printf '%s' "$CODE" | grep 'pgrep -f' >/dev/null && fail "wake-guard.sh greps for a command PATTERN — the watchdog must not depend on what it watches"
 printf '%s' "$CODE" | grep -E 'until[[:space:]]+!' >/dev/null && fail "wake-guard.sh polls the watched process's liveness (until ! …)"
 ok "bound: the guard carries no pattern-liveness check (the #2065 cause-3 shape)"
+
+# SIGNALS REAP THE GROUP TOO, NOT JUST THE BOUND. `set -m` moves the watched
+# command into its OWN process group — out of wake-guard.sh's foreground group
+# — so a signal delivered to the guard does NOT reach the child. With no
+# handler installed the guard dies and the child survives FULLY DETACHED: this
+# item's own defect class, arriving through the signal door instead of the
+# timeout door. All four terminating signals must reap before exiting, and each
+# green arm below is paired with its own RED arm (the same discrimination shape
+# tests/test_bounded_suite.sh case 9 uses for the script this one is modelled on).
+export SIG_PIDFILE="$TMP/sig.child.pid"
+cat > "$TMP/sigfix.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$SIG_PIDFILE"
+bash -c 'sleep 600' &
+printf '%s\n' "$!" >> "$SIG_PIDFILE"
+sleep 600
+EOF
+chmod +x "$TMP/sigfix.sh"
+
+SIG_RC=0; SIG_SELF_PID=""; SIG_GC_PID=""
+# sig_launch <guard> <signame> — start <guard> on the hanging fixture, wait
+# until its tree is genuinely up, signal it, and leave the outcome in
+# SIG_RC / SIG_SELF_PID / SIG_GC_PID.
+sig_launch() {
+  local guard="$1" signame="$2" wpid i=0
+  rm -f "$SIG_PIDFILE"
+  # `set -m` HERE IS LOAD-BEARING, not a copy of the guard's own. A shell
+  # WITHOUT job control sets SIGINT and SIGQUIT to SIG_IGN in every `&` child,
+  # and bash cannot re-trap a signal that was ignored on entry — so launching
+  # from a plain background job makes the guard DEAF to SIGINT/SIGQUIT and the
+  # case would hang (observed) or "pass" against a guard that merely ignored
+  # them. Job control gives the job its own group without that ignore, which is
+  # also how a terminal delivers Ctrl-C for real.
+  #
+  # The bound is short on purpose: if a handler ever stops responding, the
+  # guard's OWN bound ends the run in ~25s with a 137 the rc assertion below
+  # rejects, instead of this case hanging for the fixture's full sleep.
+  set -m
+  bash "$guard" bound --label "sig-$signame" --timeout-secs 25 -- "$TMP/sigfix.sh" >/dev/null 2>&1 &
+  wpid=$!
+  set +m
+  while [ "$i" -lt 100 ]; do
+    [ -s "$SIG_PIDFILE" ] && [ "$(wc -l < "$SIG_PIDFILE")" -ge 2 ] && break
+    sleep 0.1; i=$((i + 1))
+  done
+  SIG_SELF_PID="$(sed -n 1p "$SIG_PIDFILE" 2>/dev/null)"
+  SIG_GC_PID="$(sed -n 2p "$SIG_PIDFILE" 2>/dev/null)"
+  if [ -z "$SIG_SELF_PID" ] || [ -z "$SIG_GC_PID" ]; then
+    kill -9 "$wpid" 2>/dev/null
+    fail "SIG$signame: the fixture never recorded its own pid AND its grandchild's — every survival assertion would be vacuous"
+  fi
+  kill -0 "$SIG_SELF_PID" 2>/dev/null \
+    || fail "SIG$signame: the watched command was already dead BEFORE the signal — nothing was under test"
+  kill -0 "$SIG_GC_PID" 2>/dev/null \
+    || fail "SIG$signame: the grandchild was already dead BEFORE the signal — nothing was under test"
+  kill -"$signame" "$wpid" 2>/dev/null || fail "SIG$signame: could not signal the guard (pid $wpid)"
+  SIG_RC=0
+  wait "$wpid" 2>/dev/null || SIG_RC=$?
+  sleep 1
+  return 0
+}
+
+# 129/130/131/143 are the conventional 128+SIGHUP / +SIGINT / +SIGQUIT / +SIGTERM.
+for _sigpair in HUP:129 INT:130 QUIT:131 TERM:143; do
+  _signame="${_sigpair%%:*}"; _sigcode="${_sigpair##*:}"
+  sig_launch "$SCRIPT" "$_signame"
+  [ "$SIG_RC" -eq "$_sigcode" ] \
+    || fail "SIG$_signame: the guard must exit $_sigcode (128+signal), got $SIG_RC"
+  kill -0 "$SIG_SELF_PID" 2>/dev/null \
+    && fail "SIG$_signame: the WATCHED command survived the guard — \`set -m\` moved it out of the caller's group, so it is now fully DETACHED: this item's own defect class through the signal door"
+  kill -0 "$SIG_GC_PID" 2>/dev/null \
+    && fail "SIG$_signame: the watched command's GRANDCHILD survived — an orphaned process tree, exactly what the 12.5h stall left behind"
+
+  # RED ARM: splice _wg_reap out of THIS ONE handler. Without it the tree must
+  # survive — otherwise something other than the handler is doing the reaping
+  # and the green arm above proves nothing.
+  _sigmutant="$TMP/sig-mutant-$_signame.sh"
+  sed "s/trap '_wg_reap; exit $_sigcode' $_signame/trap 'exit $_sigcode' $_signame/" "$SCRIPT" > "$_sigmutant"
+  if diff -q "$SCRIPT" "$_sigmutant" >/dev/null 2>&1; then
+    fail "SIG$_signame: RED-arm splice found no \`trap '_wg_reap; exit $_sigcode' $_signame\` line — the signal is unarmed or armed in an unexpected shape, so its discrimination proof is inert"
+  fi
+  sig_launch "$_sigmutant" "$_signame"
+  if ! kill -0 "$SIG_SELF_PID" 2>/dev/null && ! kill -0 "$SIG_GC_PID" 2>/dev/null; then
+    fail "SIG$_signame: RED arm — with _wg_reap spliced out the watched tree died anyway, so the green arm above is not produced by the handler"
+  fi
+  # Reap what the RED arm deliberately left detached. GROUP first — the guard's
+  # own `set -m` made the fixture a process-group leader, and the fixture's own
+  # `sleep` is a child of it that a bare pid kill would leave behind (the very
+  # orphan this suite asserts against elsewhere, so the suite must not create
+  # one itself) — then the bare pids as the fallback.
+  kill -9 -"$SIG_SELF_PID" 2>/dev/null
+  kill -9 "$SIG_GC_PID" "$SIG_SELF_PID" 2>/dev/null
+done
+ok "bound: HUP/INT/QUIT/TERM each REAP the watched group before exiting (each with its own RED arm), never detach it"
+
+# The watchdog's own `sleep` must not outlive the call it guarded. `kill "$wd"`
+# signals only the subshell; its `sleep` is a separate child OF that subshell,
+# so a bare kill reparents it to init for the FULL bound — one stray process
+# per fast call, and `arm` arms one watchdog per PR.
+# The watched command sleeps a beat on purpose: the watchdog's `sleep` has to
+# have actually FORKED before the retire, or a race would make this assertion
+# pass vacuously.
+WD_BOUND=9173
+sleep_count() { ps -eo command 2>/dev/null | grep -c "^sleep $1\$" || true; }
+run bound --label orphan --timeout-secs "$WD_BOUND" -- bash -c 'sleep 1; exit 0'
+[ "$RC" -eq 0 ] || fail "bound orphan-probe exit $RC, want 0"
+sleep 1
+STRAY="$(sleep_count "$WD_BOUND")"
+[ "$STRAY" = "0" ] || fail "the retired watchdog orphaned $STRAY 'sleep $WD_BOUND' process(es) — it idles for the whole bound"
+ok "bound: retiring the watchdog on the fast path takes its sleep with it"
+
+# CONTROL: the PRE-FIX shape — a watchdog started WITHOUT job control (so it
+# shares the caller's process group) and retired with a bare `kill $wd` — does
+# orphan its sleep. That is what makes the assertion above discriminating
+# rather than vacuously true.
+bash -c '( sleep 9174 2>/dev/null; : ) </dev/null >/dev/null 2>&1 & __w=$!; sleep 0.5; kill "$__w" 2>/dev/null; wait "$__w" 2>/dev/null' >/dev/null 2>&1
+sleep 1
+CTRL_STRAY="$(sleep_count 9174)"
+pkill -f '^sleep 9174' >/dev/null 2>&1 || true
+[ "$CTRL_STRAY" -ge 1 ] || fail "CONTROL: the pre-fix bare-kill retire did NOT orphan its sleep here — the orphan assertion above proves nothing"
+ok "bound: CONTROL — the pre-fix bare-kill retire orphans its sleep, which is what the group retire fixes"
+
+# A zero-padded value passes a digits-only check and then aborts `$(( ))` as
+# invalid OCTAL — the shell dies mid-expansion and emits NO JSON at all, which
+# breaks the closed-outcome contract. Reachable from config as well as the CLI.
+run assert --open 09 --wake poll
+[ "$RC" -eq 0 ] || fail "assert --open 09 exit $RC, want 0 ($(cat "$TMP/err.txt"))"
+[ "$(jqf "$OUT" .outcome)" = "WAKE_ARMED" ] || fail "assert zero-padded outcome: $OUT"
+[ "$(jqf "$OUT" .open)" = "9" ] || fail "assert zero-padded open count not normalised to decimal: $OUT"
+ok "assert: a zero-padded count is normalised to decimal, never parsed as octal"
 
 # ============================================================================
 # arm — the wake source, armed
@@ -258,9 +411,78 @@ ELAPSED=$(( $(date +%s) - T0 ))
 [ "$(jqf "$OUT" .killed)" = "true" ] || fail "arm wedged-poll killed flag: $OUT"
 [ "$ELAPSED" -le 12 ] || fail "arm wedged-poll took ${ELAPSED}s — the outer bound never fired"
 sleep 1
-[ "$(pgrep -f "$TMP/wedged-gate.sh" 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+[ "$(pg_count "$TMP_RE/wedged-gate\.sh")" = "0" ] \
   || fail "arm wedged-poll left the poll running — detached, not killed"
 ok "arm: a wedged poll is killed at the derived outer bound and reported TIMEOUT"
+
+# ONE BUDGET FOR THE WHOLE PR SET. `arm` polls sequentially, and a level
+# routinely selects more than one PR, so a PER-PR bound would let N ordinary
+# queue waits SUM past the harness's foreground ceiling — at which point the
+# harness auto-backgrounds this very call and the turn ends with the verdict
+# lost. That is #2210's own defect reintroduced through the new mechanism.
+cat > "$TMP/slow-merge-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+sleep 1
+echo '{"outcome":"MERGED","pr":0,"mergedAt":"2026-09-24T00:00:00Z"}'
+exit 0
+EOF
+chmod +x "$TMP/slow-merge-gate.sh"
+
+T0=$(date +%s)
+arm owner/repo 21 22 23 24 --interval 1 --timeout 3 --gate-bin "$TMP/slow-merge-gate.sh"
+ELAPSED=$(( $(date +%s) - T0 ))
+[ "$RC" -eq 4 ] || fail "arm multi-PR budget exit $RC, want 4 — the set spent more than its one shared budget ($OUT)"
+[ "$(jqf "$OUT" .outcome)" = "TIMEOUT" ] || fail "arm multi-PR budget outcome: $OUT"
+[ "$(jqf "$OUT" .budget_secs)" = "3" ] || fail "arm multi-PR budget_secs: $OUT"
+printf '%s' "$(jqf "$OUT" .reason)" | grep 'budget' >/dev/null || fail "arm multi-PR budget reason does not name the budget: $OUT"
+[ -n "$(jqf "$OUT" .pr)" ] || fail "arm multi-PR budget names no unfinished PR: $OUT"
+[ "$ELAPSED" -le 8 ] || fail "arm multi-PR took ${ELAPSED}s against a 3s budget — the set is NOT sharing one deadline"
+ok "arm: a multi-PR set shares ONE wall-clock budget and stops at it, never sums past the foreground ceiling"
+
+# DISCRIMINATION CONTROL: the identical 4-PR fixture with a budget wide enough
+# RESUMES all four — so the TIMEOUT above is a real budget verdict, not this
+# fixture simply being unable to merge.
+T0=$(date +%s)
+arm owner/repo 21 22 23 24 --interval 1 --timeout 60 --gate-bin "$TMP/slow-merge-gate.sh"
+ELAPSED=$(( $(date +%s) - T0 ))
+[ "$RC" -eq 0 ] || fail "arm multi-PR control exit $RC, want 0 ($OUT / $(cat "$TMP/err.txt"))"
+[ "$(jqf "$OUT" .outcome)" = "RESUMED" ] || fail "arm multi-PR control outcome: $OUT"
+[ "$(jqf "$OUT" '.merged | join(",")')" = "21,22,23,24" ] || fail "arm multi-PR control merged set: $OUT"
+[ "$ELAPSED" -le 20 ] || fail "arm multi-PR control took ${ELAPSED}s"
+ok "arm: CONTROL — the same four PRs under a wide budget all RESUME, so the budget TIMEOUT discriminates"
+
+# Zero-padded interval/PR: digits-only validation accepts them and `$(( ))`
+# then rejects them as invalid octal, aborting the shell with NO JSON at all —
+# and `007` is not valid JSON for `jq --argjson` either.
+arm owner/repo 007 --interval 08 --timeout 30 --gate-bin "$TMP/slow-merge-gate.sh"
+[ "$RC" -eq 0 ] || fail "arm zero-padded exit $RC, want 0 ($OUT / $(cat "$TMP/err.txt"))"
+[ "$(jqf "$OUT" .outcome)" = "RESUMED" ] || fail "arm zero-padded outcome (no JSON = the shell aborted mid-expansion): $OUT"
+[ "$(jqf "$OUT" '.merged | join(",")')" = "7" ] || fail "arm zero-padded PR not normalised to decimal: $OUT"
+ok "arm: zero-padded interval/PR values are normalised, never parsed as octal or emitted as invalid JSON"
+
+# SOURCING SAFETY. This file advertises itself as sourceable (the dispatch
+# guard at the bottom), so cmd_arm must not install a process-wide `trap …
+# EXIT`: that silently REPLACES the sourcing caller's own cleanup trap, and
+# tracks only the latest scratch across repeat calls, leaking the earlier one.
+mkdir -p "$TMP/probe"
+cat > "$TMP/source-probe.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+trap 'printf caller-trap-ran > "$PROBE_MARK"' EXIT
+# shellcheck disable=SC1090
+. "$WG_SCRIPT"
+cmd_arm owner/repo 11 --interval 1 --timeout 20 --gate-bin "$FAKE_GATE" >/dev/null
+cmd_arm owner/repo 12 --interval 1 --timeout 20 --gate-bin "$FAKE_GATE" >/dev/null
+EOF
+PROBE_RC=0
+PROBE_MARK="$TMP/probe/mark" WG_SCRIPT="$SCRIPT" FAKE_GATE="$TMP/slow-merge-gate.sh" \
+  TMPDIR="$TMP/probe" bash "$TMP/source-probe.sh" >/dev/null 2>"$TMP/probe/err.txt" || PROBE_RC=$?
+[ "$PROBE_RC" -eq 0 ] || fail "sourced cmd_arm probe exited $PROBE_RC: $(cat "$TMP/probe/err.txt")"
+[ "$(cat "$TMP/probe/mark" 2>/dev/null || true)" = "caller-trap-ran" ] \
+  || fail "sourcing wake-guard.sh and calling cmd_arm CLOBBERED the caller's own EXIT trap"
+LEFT="$(find "$TMP/probe" -name 'wake-guard.*' 2>/dev/null | wc -l | tr -d ' ')"
+[ "$LEFT" = "0" ] || fail "cmd_arm left $LEFT scratch file(s) behind across repeat sourced calls"
+ok "arm: sourced repeat calls keep the caller's EXIT trap and leave no scratch file behind"
 
 # ============================================================================
 # build-level.mjs — the worker's own scoped gate, EXECUTED
@@ -279,7 +501,7 @@ const grab = (name) => {
 const fn = new Function([
   'const WORKER_GATE_CEILING_SECS = ' + Number(process.env.CEIL) + ';',
   grab('sq'), grab('workerGateSentinel'), grab('workerGateLog'),
-  grab('killNotDetachWatchdog'), grab('workerGateCmd'),
+  grab('killNotDetachWatchdog'), grab('retireWatchdog'), grab('workerGateCmd'),
   'return workerGateCmd;',
 ].join('\n'))();
 process.stdout.write(fn(process.argv[2], process.argv[3]));
@@ -312,7 +534,7 @@ SENT="$(cat "$(sentinel_of "$SLUG")" 2>/dev/null || echo '')"
 [ "$(jqf "$SENT" .timedOut)" = "true" ] || fail "worker gate hang sentinel timedOut: $SENT"
 [ "$(jqf "$SENT" .outcome)" = "TIMEOUT" ] || fail "worker gate hang sentinel outcome: $SENT"
 sleep 1
-[ "$(pgrep -f "$TMP/wt/scripts/quality-gates.sh" 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+[ "$(pg_count "$TMP_RE/wt/scripts/quality-gates\.sh")" = "0" ] \
   || fail "worker gate hang left the suite running — DETACHED, not killed (the 12.5h shape)"
 ok "worker gate: a hanging suite is killed at its bound and the sentinel reports TIMEOUT"
 
@@ -358,6 +580,11 @@ printf '%s' "$GEN" | grep 'kill -9 -"\$__wgp"' >/dev/null \
   || fail "the generated worker-gate command no longer group-kills the suite at its bound"
 printf '%s' "$GEN" | grep '"timedOut":true' >/dev/null \
   || fail "the generated worker-gate command no longer reports a bound kill as TIMEOUT"
+# The watchdog is retired by GROUP, not by bare pid: a bare kill signals the
+# subshell only and orphans its `sleep` for the whole ceiling.
+# shellcheck disable=SC2016  # the literal variable name IS the pattern.
+printf '%s' "$GEN" | grep 'kill -- -"\$__wgw"' >/dev/null \
+  || fail "the generated worker-gate command no longer group-retires its watchdog — its sleep is orphaned for the full bound"
 ok "static: the generated worker-gate command carries its kill-not-detach bound"
 
 grep -q 'wake-guard.sh arm' "$BUILD_MD" \
@@ -365,6 +592,20 @@ grep -q 'wake-guard.sh arm' "$BUILD_MD" \
 awk '/^2\. \*\*Timeout ceiling/ && /wake-guard\.sh arm/ { found = 1 } END { exit found ? 0 : 1 }' "$BUILD_MD" \
   || fail "/build 4b step 2 (the post-enqueue MERGED wait) no longer arms the wake"
 ok "static: /build 4b's post-enqueue MERGED wait names the armed wake"
+
+# THE REFUSAL is the last line of defense — a turn that ends with open work and
+# nothing scheduled. It is declared MANDATORY in the spec, so per the kernel's
+# § Mandatory-step birth rule it ships an execution signal in the same change:
+# this guard IS that signal (registered in mandatory-step-registry.tsv), and it
+# goes red the moment 4b stops invoking `wake-guard.sh assert`.
+grep -q 'wake-guard.sh assert' "$BUILD_MD" \
+  || fail "/build no longer invokes the turn-end refusal (wake-guard.sh assert) — a turn can end with open work and nothing scheduled again"
+awk '/wake-guard\.sh assert/ && /mandatory before ending ANY turn at this step/ { found = 1 } END { exit found ? 0 : 1 }' "$BUILD_MD" \
+  || fail "/build's wake-guard.sh assert invocation no longer carries its mandatory declaration — mandatory-step-registry.tsv's DECLARATION for it is now dangling"
+REGISTRY="$REPO_ROOT/workflows/scripts/config/mandatory-step-registry.tsv"
+grep -q 'turn-end wake assertion' "$REGISTRY" \
+  || fail "the turn-end wake assertion has no mandatory-step-registry.tsv row — a step declared mandatory with no execution signal is the #1616 defect class"
+ok "static: the turn-end refusal is a REGISTERED mandatory step, not prose (kernel § Mandatory-step birth rule)"
 
 echo
 echo "All $PASS wake-guard checks passed."
