@@ -221,6 +221,25 @@ else
   ok "a marker past CMD_RUN_RUN_ID_TTL_SECS is not adopted (a fresh id is minted)"
 fi
 
+X4="$TMP/prune"; mkdir -p "$X4/command-run-open"
+cat > "$X4/command-run-open/sess-spent__fix.json" <<'EOF'
+{"run_id":"run-spent","command":"fix","session_id":"sess-spent","board":7,"opened_at":"1970-01-01T00:00:01Z","opened_epoch":1,"emitted":2}
+EOF
+cat > "$X4/command-run-open/sess-silent__sweep.json" <<'EOF'
+{"run_id":"run-silent","command":"sweep","session_id":"sess-silent","board":3,"opened_at":"1970-01-01T00:00:01Z","opened_epoch":1,"emitted":0}
+EOF
+CMD_RUN_RAW_DIR="$X4" CLAUDE_CODE_SESSION_ID=sess-new bash "$EMIT" --open --command fix --board 7 >/dev/null 2>&1
+if [ -f "$X4/command-run-open/sess-spent__fix.json" ]; then
+  bad "--open prunes a SPENT marker (past the TTL, record already emitted)" "it survived, so the ledger grows unboundedly"
+else
+  ok "--open prunes a SPENT marker (past the TTL, record already emitted)"
+fi
+if [ -f "$X4/command-run-open/sess-silent__sweep.json" ]; then
+  ok "--open never prunes an un-emitted marker at any age — that one IS the missing-run alarm"
+else
+  bad "--open never prunes an un-emitted marker at any age" "the alarm was deleted before any guard could read it"
+fi
+
 X3="$TMP/degraded"; mkdir -p "$X3"
 : > "$X3/command-run-open"   # a FILE where the ledger dir belongs: unwritable
 REC="$(CMD_RUN_RAW_DIR="$X3" CLAUDE_CODE_SESSION_ID=sess-deg bash "$EMIT" --command fix --board 7 \

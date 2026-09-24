@@ -153,6 +153,9 @@
 #     HOLDS the marker — bumping `emitted` — when the record still reports a
 #     parked item (the run may converge later in this same run), or CLOSES it
 #     (removes it) when nothing is parked and the run is genuinely over.
+#   * `--open` also PRUNES spent markers — held past the adoption TTL with a
+#     record already emitted, so nothing can adopt them again. A marker with
+#     emitted=0 is never pruned at any age: that one IS the alarm below.
 #   * A marker left behind with emitted=0 is a run that started and never
 #     emitted. workflows/scripts/validate-command-run-reconcile.sh is the
 #     guard that reads it and goes red — on that MISSING case and on the
@@ -320,7 +323,31 @@ write_marker() {  # $1=run_id $2=opened_at $3=opened_epoch $4=emitted → 0 ok
   return 0
 }
 
+# Prune SPENT markers — held past the adoption TTL with a record already
+# emitted (emitted > 0), so no later emit can ever adopt them again and the
+# reconcile guard has nothing left to say about them. Bounds the ledger
+# directory, which otherwise grows one file per (session, command) that ended
+# on a parked item. A marker with emitted=0 is NEVER pruned at any age: that
+# one IS the missing-run signal, and erasing it here would delete the alarm
+# before the guard ever reads it. Best-effort, run once per `--open`.
+prune_spent_markers() {
+  local f m_emitted m_epoch now
+  [ -d "$open_dir" ] || return 0
+  now="$(date -u +%s)"
+  for f in "$open_dir"/*.json; do
+    [ -f "$f" ] && [ -r "$f" ] || continue
+    m_emitted="$(jq -r '.emitted // 0' "$f" 2>/dev/null)" || continue
+    m_epoch="$(jq -r '.opened_epoch // 0' "$f" 2>/dev/null)" || continue
+    case "$m_emitted" in ''|*[!0-9]*) continue ;; esac
+    case "$m_epoch" in ''|*[!0-9]*) continue ;; esac
+    [ "$m_emitted" -gt 0 ] || continue
+    [ "$((now - m_epoch))" -gt "$CMD_RUN_RUN_ID_TTL_SECS" ] || continue
+    rm -f "$f" 2>/dev/null || true
+  done
+}
+
 if [ "$open_mode" -eq 1 ]; then
+  prune_spent_markers
   [ -n "$run_id" ] || run_id="$(mint_run_id)"
   if ! write_marker "$run_id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(date -u +%s)" 0; then
     # Warn-don't-drop, same contract as every other failure here: the run id
