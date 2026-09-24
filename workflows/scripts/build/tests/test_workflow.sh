@@ -17711,6 +17711,15 @@ echo "PASS: #2193 emitted-shell tally — a complete batch and an EARLY-STOPPED 
 # from the shipping emitters on every run: the three batch-step helper scripts
 # plus build-level.mjs's own generated shell. Like K2205/K2208 it refuses to
 # pass vacuously — the extraction asserts a non-zero floor of harvested keys.
+#
+# claim.sh is DELIBERATELY not harvested (temperloop#2232). It lives outside
+# workflows/scripts/build/ and, unlike the three scripts below, emits no JSON on
+# stdout at all: the prelude wraps it as `claim.sh >/dev/null && echo '{...}'`,
+# so the step's result is the engine's own echoed literal (already covered by
+# the build-level.mjs sweep below) and claim.sh contributes no field to the
+# relay. Its stdout is suppressed precisely so it cannot — see the K2232 guard.
+# If a future change ever has claim.sh print JSON into the batch stream, it must
+# be added to the harvest list in the same change.
 K2193_OUT="$(EMITTED_KEY_FLOOR=40 MJS_PATH="$MJS" BUILD_DIR="$REPO_ROOT/workflows/scripts/build" node -e '
 const fs = require("fs");
 const path = require("path");
@@ -17759,6 +17768,103 @@ case "$K2193_OUT" in
 esac
 echo "PASS: #2193 emitter↔known-key lockstep — $K2193_OUT"
 unset K2193_OUT
+# --- K2232 PROSE-CONTAMINATION guard (temperloop#2232) -----------------------
+#
+# WHY THIS EXISTS. The prelude's claim step is the one step that wraps a helper
+# emitting NO JSON of its own: claim.sh prints a human progress line and the
+# step supplies its result with a trailing `&& echo '{"outcome":"CLAIMED"}'`.
+# On the first live drive after #2193 merged, claim.sh's prose
+# (`Claimed #2229 -> In Progress  [mini:0d0edf46]`) sat on stdout immediately
+# above that result line, and the machinery-executor relay parsed the PROSE
+# INTO the result object — inventing item/board/status/session_id and tripping
+# a relay-integrity refusal on a perfectly healthy claim.
+#
+# The tally could not catch it: tally_lines counts `^{` lines, and a prose line
+# does not start with `{`, so dispatched/ran/lines all agreed. Only the closed
+# key-set arm saw it. The fix is STRUCTURAL — `>/dev/null` on the helper's
+# stdout — because claude/agents/machinery-executor.md ALREADY said "ignore
+# non-JSON output" and "never merge ... or invent entries" and the executor did
+# it regardless (engineering principle 5).
+#
+# Two sides, because a static grep alone would not prove the emitted shell
+# actually suppresses anything, and a behavioural check alone would not prove
+# the ENGINE is the thing doing it.
+
+# Side A — the engine's claim step redirects the helper's stdout. Anchored on
+# sq(claimBin) so this goes red (not silently vacuous) if the construction moves.
+k2232_claim_line="$(grep -n 'sq(claimBin)' "$MJS" | head -1)"
+[ -n "$k2232_claim_line" ] \
+  || fail "#2232: could not find the claim step's sq(claimBin) invocation in build-level.mjs — this guard's anchor moved and it is now inert"
+printf '%s' "$k2232_claim_line" | grep -F '>/dev/null' >/dev/null \
+  || fail "#2232: the claim step must redirect the wrapped helper's stdout (>/dev/null) so its prose cannot enter the batch relay stream (got: $k2232_claim_line)"
+
+# Side B — behavioural, through the REAL batchCommand: a wrapped helper that
+# prints prose must not put that prose on the batch stream, and the identical
+# step WITHOUT the redirect must leak it. The second half is what proves this
+# test discriminates rather than passing vacuously (#1706: an assertion that
+# cannot fail is a defect) — it is the removed-fix mutation, run inline.
+_k2232_out="$WF_TEST_TMPDIR/k2232"; mkdir -p "$_k2232_out"
+cat > "$_k2232_out/fake-claim.sh" <<'K2232HELPER'
+#!/usr/bin/env bash
+# Stands in for claim.sh: prints a human progress line on STDOUT, exits 0.
+echo "Claimed #2229 → In Progress  [mini:0d0edf46]"
+exit 0
+K2232HELPER
+chmod +x "$_k2232_out/fake-claim.sh"
+
+_k2232_gen="$WF_TEST_TMPDIR/k2232-gen.mjs"
+cat > "$_k2232_gen" <<'K2232GEN'
+import { readFileSync, writeFileSync } from 'fs';
+globalThis.args = JSON.stringify({ repoRoot: '/tmp/repo', ownerRepo: 'o/r', items: [] });
+globalThis.agent = async () => null;
+globalThis.log = () => {};
+globalThis.phase = () => {};
+globalThis.parallel = async (fns) => Promise.all(fns.map((f) => f()));
+const src = readFileSync(process.env.MJS_PATH, 'utf8')
+  .replace(/^export const meta/m, 'const meta')
+  .replace('const GATE_MAX_SLICES = 8;',
+    'const GATE_MAX_SLICES = 8;\nglobalThis.__p = { batch: batchCommand };');
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+await new AsyncFunction(src)();
+const out = process.env.K2232_OUT;
+const helper = process.env.K2232_HELPER;
+// The claim step's real shape: a non-JSON-emitting helper whose result is
+// supplied by a trailing `&& echo`. FIXED = stdout suppressed; LEAKY = the
+// pre-#2232 construction, kept here only as this test's own mutation control.
+const step = (redirect) => ([{
+  kind: 'claim',
+  cmd: "'" + helper + "'" + (redirect ? ' >/dev/null' : '')
+    + ' && echo \'{"outcome":"CLAIMED"}\' || echo \'{"outcome":"CLAIM_CONFLICT"}\'',
+  continueOutcomes: ['CLAIMED'],
+}]);
+writeFileSync(out + '/fixed.sh', globalThis.__p.batch(step(true)));
+writeFileSync(out + '/leaky.sh', globalThis.__p.batch(step(false)));
+K2232GEN
+MJS_PATH="$MJS" K2232_OUT="$_k2232_out" K2232_HELPER="$_k2232_out/fake-claim.sh" \
+  node "$_k2232_gen" \
+  || fail "#2232: could not generate the claim-shaped batch shell from build-level.mjs"
+for _f in fixed.sh leaky.sh; do
+  bash -n "$_k2232_out/$_f" || fail "#2232: the emitted batch shell is not valid bash ($_f)"
+done
+
+k2232_fixed="$(bash "$_k2232_out/fixed.sh" 2>/dev/null)"
+printf '%s' "$k2232_fixed" | grep -F 'Claimed #' >/dev/null \
+  && fail "#2232: the helper's PROSE reached the batch stdout stream — the relay can parse it into the adjacent result object (got: $k2232_fixed)"
+printf '%s' "$k2232_fixed" | grep -F '"outcome":"CLAIMED"' >/dev/null \
+  || fail "#2232: suppressing the helper's stdout must NOT lose the step's own result line (got: $k2232_fixed)"
+[ "$(printf '%s\n' "$k2232_fixed" | grep -c '^{')" = "2" ] \
+  || fail "#2232: expected exactly the CLAIMED line plus the tally on a clean claim (got: $k2232_fixed)"
+printf '%s\n' "$k2232_fixed" | tail -1 | grep -F '"tally_lines":1' >/dev/null \
+  || fail "#2232: the tally must count the one JSON line the claim step printed (got: $k2232_fixed)"
+
+# The discrimination half: without the redirect the prose DOES leak. If this
+# ever stops leaking, the assertions above are no longer testing anything and
+# this guard has gone vacuous.
+k2232_leaky="$(bash "$_k2232_out/leaky.sh" 2>/dev/null)"
+printf '%s' "$k2232_leaky" | grep -F 'Claimed #' >/dev/null \
+  || fail "#2232: the un-redirected control did NOT leak the helper's prose, so this guard cannot distinguish the fix from its absence (#1706) (got: $k2232_leaky)"
+echo "PASS: #2232 prose-contamination guard — the claim step suppresses its wrapped helper's stdout; the result line and tally survive; the un-redirected control still leaks (so the check discriminates)"
+unset k2232_claim_line k2232_fixed k2232_leaky
 
 # --- K2205 EMITTED-LITERAL ↔ ENUM lockstep guard ----------------------------
 #

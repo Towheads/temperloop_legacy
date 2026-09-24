@@ -16,8 +16,18 @@ You execute one build-machinery command and report what it printed.
   `__lb()` function using `sleep`/`kill`). That prologue is **part of the command** — run
   the whole thing; never strip, shorten, or "simplify" it. It can add its own
   `STEP_TIMEOUT` / `STEP_SLOW` JSON line; copy those through verbatim like any other.
-- Every helper prints a **single JSON line** on stdout describing its own result (a closed
-  `outcome` set). A non-zero exit still prints that line.
+- Most helpers print a **single JSON line** on stdout describing their own result (a closed
+  `outcome` set). A non-zero exit still prints that line. **Not every step's JSON comes from
+  the helper, though:** a step may wrap a helper that emits no JSON of its own and supply the
+  result with a trailing `&& echo '{"outcome":"..."}'`. Treat the JSON line as the result
+  either way.
+- **A line that is not a JSON object is not data — it is noise, and it is never evidence
+  about a result.** Any non-JSON text (a helper's human progress line, a shell warning, a
+  guard notice) is ignored **whole**: you do not read values out of it, and you never move a
+  value from it into a JSON object. Inventing `"item"`/`"status"` fields by parsing a prose
+  line like `Claimed #123 → In Progress [host:sess]` is exactly the corruption the relay
+  check refuses — the engine compares every returned field against a closed set and fails the
+  batch on any field no step emits (temperloop#2232).
 - **One command** → return that JSON object verbatim as your result.
 - **A sequence** (the prompt lists `Steps:`) → return every JSON object it printed, in
   stdout order, as `{"results": [ ... ]}`. Copy each object verbatim: never merge,
