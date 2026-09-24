@@ -95,10 +95,21 @@
 # per-host and gitignored, so "this host has not emitted yet" is a real,
 # expected state and not a broken property.
 #
-# FIVE WAYS THIS GUARD ONCE FAILED **OPEN** — all five closed, all five
+# FIVE WAYS THIS GUARD ONCE FAILED **OPEN** — the five below are closed and
 # regression-tested, because a reconciliation guard that cannot fail closed is
-# strictly worse than no guard at all: it manufactures confidence. Three of
-# the five are ONE CLASS on three different surfaces, which is why the fourth
+# strictly worse than no guard at all: it manufactures confidence.
+#
+# A SIXTH IS KNOWN AND STILL OPEN — temperloop#2247. Passing `--stream`
+# alongside `--raw-dir`/$CMD_RUN_RAW_DIR skips the lake branch entirely, so an
+# explicitly-targeted lake — even an absent one — is accepted, never classified
+# and never read, and Check 1 (MISSING-RUN) never runs. So do NOT read the list
+# below as "this guard can no longer fail open": read it as the five specific
+# ways it has been shown to, and fixed. That distinction is deliberate. Five
+# rounds each closed a site and then asserted completeness here, and every one
+# of those assertions was falsified by the next review sweep; #2247 replaces
+# the site-by-site approach with an enumerated invariant.
+#
+# Three of the five are ONE CLASS on three different surfaces, which is why the fourth
 # fix was a shared classifier rather than a third bespoke patch — and the
 # fifth is that same class one level ABOVE every surface, which is why its fix
 # is in the parser rather than on a surface at all.
