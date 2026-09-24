@@ -48,6 +48,12 @@
 #     running the worktree copy, discriminating proceeds); no block / class B/C
 #     take the byte-identical pre-#1219 path with zero activation agent spawns;
 #     and the GENERATED shell is executed for real against a git fixture
+#   - claim disposition (temperloop#2230): an escalation that RETAINS resumable
+#     state (held worktrees, preserved committed work) carries
+#     claim_disposition 'hold' so the board claim is not released back to Ready
+#     while the disk still holds unlanded work; one that retains nothing carries
+#     'release' — read off the payload FACT, never the kind (the single-arm pair
+#     shares one kind), with a collapse guard over both arms
 #   - worktree-failed: worktree.sh non-CREATED → worktree-failed escalation
 #   - continuation: onlySlugs+verdicts → verdict injected into worker prompt,
 #     existing worktree reused (no create/claim), only continued slug driven
@@ -13992,6 +13998,95 @@ if (new Set(reasons).size !== 3)
 
 console.log(JSON.stringify({ ok: true }));
 "
+
+# ---------------------------------------------------------------------------
+# K2230: the CLAIM DISPOSITION of an escalation — held state holds the claim
+# ---------------------------------------------------------------------------
+# The board claim is the cross-session lock. An escalation that RETAINS
+# resumable state (held worktrees, unlanded committed work) is still being
+# driven, so its claim stays HELD; one that retains nothing releases as before.
+# Both arms live in ONE case so a collapse is caught directly rather than by two
+# independently-passing assertions, and the single-arm pair deliberately shares
+# ONE escalation KIND (acceptance-gate-failed) so the only thing separating them
+# is the FACT — a kind-name branch cannot pass this.
+# ---------------------------------------------------------------------------
+run_node_case "K2230 claim disposition: an escalation holding resumable state keeps the board claim HELD, one holding nothing releases, and the two never collapse" "
+$PREAMBLE
+$DUAL_FIXTURE
+
+const bail = (r) => { console.log(JSON.stringify({ ok: false, reason: r })); process.exit(0); };
+const factsOf = (e) => ((e.resumable_state || {}).evidence || []).map(x => x.fact);
+
+// --- ARM 1: HELD. An uncalibrated dual-build level holds every in-scope item
+// as a level-pick escalation naming both arms under worktrees_intact.
+greenArm('h1', 'baseline'); greenArm('h1', 'candidate');
+itemBarrier('h1');
+globalThis.args = { ...dualArgs(['h1']), items: [
+  { slug: 'h1', branch: 'build/h1', title: 'H1', kind: 'impl', acceptance: ['c'] },
+]};
+const heldMod = await loadLevel();
+const heldRun = await heldMod.default();
+const hEsc = (heldRun.escalations ?? []).find(e => e.slug === 'h1');
+if (!hEsc || hEsc.kind !== 'level-pick')
+  bail('fixture: expected a level-pick escalation for h1, got ' + JSON.stringify(heldRun.escalations));
+if (!Array.isArray(hEsc.payload.worktrees_intact) || hEsc.payload.worktrees_intact.length === 0)
+  bail('fixture: a held level-pick escalation must name its intact worktrees: ' + JSON.stringify(hEsc.payload.worktrees_intact));
+if (hEsc.claim_disposition !== 'hold')
+  bail('an escalation HOLDING worktrees with unlanded work must keep the board claim held, got ' + JSON.stringify(hEsc.claim_disposition));
+if (!hEsc.resumable_state || hEsc.resumable_state.retained !== true)
+  bail('the hold must be justified by a named resumable_state reading: ' + JSON.stringify(hEsc.resumable_state));
+if (factsOf(hEsc).indexOf('worktrees_intact') < 0)
+  bail('the evidence must name the FACT the hold was read off, not the kind: ' + JSON.stringify(factsOf(hEsc)));
+
+// --- ARM 2 + CONTROL: two single-arm items, SAME escalation kind, differing
+// only in whether a worktree survived. n1 preserves committed work (default
+// WORK_PRESERVED); n2 reports the no-worktree skip — nothing is held.
+setMachinery('n1', { outcome: 'CREATED', path: '/tmp/repo.wt/n1' }, { outcome: 'REVIEW_DIFF' }, { outcome: 'GATE_FAIL', detail: 'red' });
+happyWorker('n1');
+setMachinery('n2', { outcome: 'CREATED', path: '/tmp/repo.wt/n2' }, { outcome: 'REVIEW_DIFF' }, { outcome: 'GATE_FAIL', detail: 'red' });
+happyWorker('n2');
+setPreserve('n2', { outcome: 'WORK_PRESERVE_SKIP', detail: 'no worktree' });
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'n1', branch: 'build/n1', title: 'N1', kind: 'impl' },
+  { slug: 'n2', branch: 'build/n2', title: 'N2', kind: 'impl' },
+]};
+const plainMod = await loadLevel();
+const plainRun = await plainMod.default();
+const n1 = (plainRun.escalations ?? []).find(e => e.slug === 'n1');
+const n2 = (plainRun.escalations ?? []).find(e => e.slug === 'n2');
+if (!n1 || !n2) bail('fixture: expected both n1 and n2 to escalate: ' + JSON.stringify(plainRun.escalations));
+if (n1.kind !== n2.kind)
+  bail('fixture: the pair must share ONE kind so only the fact can separate them, got ' + n1.kind + ' vs ' + n2.kind);
+if (n1.claim_disposition !== 'hold')
+  bail('an escalation whose committed work was preserved still holds a worktree — its claim must be HELD, got ' + JSON.stringify(n1.claim_disposition));
+if (factsOf(n1).filter(f => f.indexOf('committed_work:') === 0).length !== 1)
+  bail('the hold must be read off the committed_work record: ' + JSON.stringify(factsOf(n1)));
+if (n2.claim_disposition !== 'release')
+  bail('an escalation holding NOTHING must release the claim exactly as before (the arm-failure path), got ' + JSON.stringify(n2.claim_disposition));
+if (!n2.resumable_state || n2.resumable_state.retained !== false || (n2.resumable_state.evidence ?? []).length !== 0)
+  bail('a released claim must be backed by an EMPTY evidence set, never an unexplained default: ' + JSON.stringify(n2.resumable_state));
+
+// --- THE COLLAPSE GUARD. If the two arms ever agree, the distinction is gone
+// and the lock is back to disagreeing with the disk.
+if (n1.claim_disposition === n2.claim_disposition)
+  bail('the two arms COLLAPSED into one behaviour: held=' + n1.claim_disposition + ' nothing-held=' + n2.claim_disposition);
+if (hEsc.claim_disposition === n2.claim_disposition)
+  bail('the level-pick hold and the nothing-held release COLLAPSED: ' + hEsc.claim_disposition);
+
+// --- A PARKED record is untouched: this field is an escalation-only surface.
+if ((plainRun.parked ?? []).some(p => 'claim_disposition' in p))
+  bail('claim_disposition must not leak onto parked records: ' + JSON.stringify(plainRun.parked));
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# The static half: the stamp sits at the ONE partition point every path's
+# escalations converge on. Remove it and every escalation returns undisposed.
+grep -q 'escalations.push(stampClaimDisposition(r.escalation))' "$MJS" \
+  || fail "#2230: buildLevel must stamp the claim disposition at the escalation partition point"
+grep -q 'esc.claim_disposition = state.retained ? CLAIM_HOLD : CLAIM_RELEASE' "$MJS" \
+  || fail "#2230: the claim disposition must be derived from the retained-state FACT, never from the escalation kind"
 
 # ---------------------------------------------------------------------------
 # K2080 round-1 review [HIGH]: no item is silently lost to an uncaught throw
