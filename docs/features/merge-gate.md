@@ -123,6 +123,48 @@ single re-poll needs no such classifier — the only states it re-polls
 (`UNKNOWN`, a lone `BEHIND`) are by definition not-yet-computed server-side
 values, and every deterministic answer is returned on the first read.
 
+## The armed wake (`wake-guard.sh`, temperloop#2210)
+
+The queue and CI are **pull-only**: nothing notifies a session that a PR
+merged, went green, or fell `BEHIND`. So a turn that ended with an open PR and
+no armed wake source never learned anything again, and silence became
+indistinguishable from "still queued" — the shape that stalled the `/build` of
+epic #2065 three times (~20 min, **12.5 h**, and once more), each one caught by
+the operator asking rather than by any mechanism.
+
+`workflows/scripts/build/wake-guard.sh` closes that structurally rather than by
+instruction:
+
+- **`arm <owner>/<repo> <pr>…`** — the wake source, armed. A **blocking**,
+  bounded, foreground poll that drives `gate.sh poll` per PR. Because it
+  blocks, the turn *cannot* end while the PR is still open, and a merge that
+  lands after the session would otherwise have yielded is seen within one
+  `$BUILD_WAKE_POLL_INTERVAL`. `RESUMED` (exit 0) / `CONFLICTING` (3) /
+  `TIMEOUT` (4) — gate.sh's own verdicts, relayed.
+- **`bound --label <l> --timeout-secs <s> -- <cmd>`** — the watchdog that
+  **kills** rather than detaches. The `Bash` tool's `timeout` parameter only
+  moves a command to the background at its bound; that is how a 500 s-bounded
+  command ran 12.5 h. This wrapper runs the command in its own process group
+  and signals the group, so nothing is left orphaned. It never asks the
+  watched process for permission to fire — no `pgrep -f`, no liveness poll,
+  just a pid captured up front and a `sleep`.
+- **`assert --open <n> --wake <kind>`** — the refusal. Open work with nothing
+  scheduled exits non-zero instead of yielding into silence.
+
+`claude/workflows/build-level.mjs` compiles the same kill-not-detach bound into
+the worker's own scoped-gate command, so a wedged `quality-gates.sh` is killed
+at the workflow's `#1071` step ceiling and its sentinel reports
+`{"state":"finished","rc":137,"outcome":"TIMEOUT","timedOut":true,…}` rather
+than sitting at `"running"` while the suite runs on unwatched.
+
+Sizing is two named settings — `BUILD_WAKE_POLL_INTERVAL` and
+`BUILD_WAKE_POLL_TIMEOUT` (a bound on **one call**, kept under the harness's
+foreground `Bash` cap). Neither is the merge-queue ceiling: how long a PR may
+legitimately sit in the queue stays `BUILD_QUEUE_TIMEOUT`, sizing open at
+temperloop#2055.
+
+Covered by `workflows/scripts/build/tests/test_wake_guard.sh`.
+
 ## Integration
 
 `/build`'s batch merge gate (`claude/commands/build.md`, the level-boundary
