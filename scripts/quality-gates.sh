@@ -673,6 +673,33 @@ KERNEL_GATES=(
   # outside the tmpdir. Same direct-`bash` form as the sibling gates above
   # (kernel Makefile is generator-owned).
   "bash workflows/scripts/tests/test_argloop_trailing_flag.sh"
+  # Shell-dialect capability-probe guard + its two regressions (temperloop#1776).
+  # Fifth member of the same STATIC-lint family, and the same structural blind
+  # spot: `declare -F <name>` is bash's "is this a function?", but zsh
+  # implements `declare` as `typeset`, whose `-F` means "float with N digits" —
+  # so the probe DECLARES A FLOAT and exits 0 for a name that does not exist.
+  # The guard is unconditionally TRUE and the fallback written beneath it is
+  # unreachable. A `#!/usr/bin/env bash` shebang does not help, because the bite
+  # is on the SOURCED path every command spec mandates ("source "$BOARD_LIB" at
+  # the top of every board bash block") and on macOS the agent's Bash tool runs
+  # zsh. Live twice: board.sh died `command not found: cache_read` on the FIRST
+  # board call of a /triage run on 2026-08-23 and again on 2026-09-24. Nothing
+  # else here catches it — shellcheck and `bash -n` both exit 0 (the line is
+  # valid bash) and every runtime test on the ubuntu bash pre-merge leg
+  # (temperloop#963) passes, because under bash the code IS correct. Hence a
+  # STATIC lint, over the tracked shell set PLUS claude/commands/*.md (a spec's
+  # fenced snippets are pasted verbatim into that zsh shell, so a spec is an
+  # execution surface for this bug). Its test asserts the lint fires on the
+  # VERBATIM pre-fix board.sh and quality-gates.sh lines, stays silent on
+  # comments that merely name the idiom (the temperloop#1152 class) and on the
+  # portable `typeset -f`, and exits non-zero rather than 0 on a degenerate
+  # input. The board suite beside it is the BEHAVIORAL half: it runs
+  # `board_resolve 7` under both bash and zsh with only board.sh sourced, and
+  # carries a negative control that restores the pre-fix probe in a throwaway
+  # copy and requires it to still die under zsh.
+  "bash scripts/lint-shell-dialect-probe.sh"
+  "bash scripts/tests/test_lint_shell_dialect_probe.sh"
+  "bash workflows/scripts/board/tests/test_capability_probe_shell_dialect.sh"
   # Main knowledge_store interface + plain-files backend suite (foundation
   # #771) — root resolution, doc-id normalization, write/read round-trip,
   # --no-clobber, atomic write, list, and (temperloop#1308) the ks_append
@@ -2875,7 +2902,7 @@ QUALITY_GATES_JOBS="${QUALITY_GATES_JOBS:-auto}"
 # passed for a while while exercising none of the parallel path (caught by
 # temperloop#1025's own slice-fixture bug). Same say-it-out-loud rule the
 # mktemp-failure fallback below already follows.
-if ! type -t gate_pool_resolve_jobs >/dev/null 2>&1; then
+if ! command -v gate_pool_resolve_jobs >/dev/null 2>&1; then
   printf 'NOTE: workflows/scripts/lib/gate-pool.sh did not load — running the gate set SERIALLY.\n' >&2
   gate_jobs=1
 else

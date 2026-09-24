@@ -62,7 +62,7 @@
 #                                `uv tool install` (temperloop#1113). Applied
 #                                only when the caller has already sourced
 #                                workflows/scripts/lib/portable-timeout.sh
-#                                (probed with `declare -F run_with_timeout`,
+#                                (probed with `command -v run_with_timeout`,
 #                                never sourced from here — this library's
 #                                dependency set stays knowledge_store.sh + jq).
 #                                Unbounded install otherwise, exactly as
@@ -162,7 +162,7 @@
 # ks_search_partition_supported   -> exit 0 iff THIS copy of the library
 #                                    implements the --partition scope. A
 #                                    caller that depends on scoping probes
-#                                    `declare -F ks_search_partition_supported`
+#                                    `command -v ks_search_partition_supported`
 #                                    before calling: on a pre-#418 library the
 #                                    function does not exist at all, which is
 #                                    the only reliable way to tell a kernel
@@ -497,7 +497,7 @@ ks_search__partition_filter() {
 # Capability probe for the partition scope (temperloop#418). Exists purely so a
 # caller can tell a library that HONOURS `--partition` from one that does not:
 # on a pre-#418 copy of this file the function is simply not defined, so
-# `declare -F ks_search_partition_supported >/dev/null` is a reliable,
+# `command -v ks_search_partition_supported >/dev/null` is a reliable,
 # zero-subprocess version-skew check. A scope-dependent caller MUST probe —
 # passing `--partition` to a library that predates it is the one remaining way
 # to get unscoped results back while believing you asked for scoped ones, and
@@ -579,7 +579,7 @@ ks_search__backend_fn() {
 ks_search__dispatch() {
   local op="$1"; shift
   local fn; fn="$(ks_search__backend_fn "$op")"
-  if ! declare -F "$fn" >/dev/null 2>&1; then
+  if ! command -v "$fn" >/dev/null 2>&1; then
     printf 'knowledge_search: backend "%s" does not implement "%s" (no %s defined)\n' \
       "$KNOWLEDGE_SEARCH_BACKEND" "$op" "$fn" >&2
     return 2
@@ -1654,7 +1654,7 @@ _ks_search_backend_basic_memory_search() {
 #
 # The first shape is what a scheduled drift-healing reindex wants, and before
 # this it was unreachable through the public seam: a caller had to reach into
-# the library-PRIVATE `_ks_bm_run` behind a `declare -F` probe to get it.
+# the library-PRIVATE `_ks_bm_run` behind a `command -v` probe to get it.
 #
 # An UNRECOGNISED argument is now an error (exit 2, the contract's
 # invalid-usage code), not silently shifted away. The old loop discarded

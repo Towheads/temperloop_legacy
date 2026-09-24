@@ -476,7 +476,7 @@ board_resolve_name() {
 # cache.sh's own "Tuning settings" comment). Turning this on has NO effect unless
 # the caller has ALSO sourced lib/cache.sh in the same process — board.sh
 # itself never sources cache.sh (kept a one-way, additive-only layering; see
-# cache.sh's own header) — _board_issues_item_list checks `declare -F
+# cache.sh's own header) — _board_issues_item_list checks `command -v
 # cache_read` and falls back to the live read (with one stderr notice) when
 # the axis is on but cache.sh isn't in scope. This is what keeps reconcile.sh
 # (which never sources cache.sh) permanently on the live-read arm regardless
@@ -658,7 +658,14 @@ _board_issues_item_list() {
   lim="${BOARD_ITEM_LIMIT:-500}"
 
   if _board_cache_store_enabled "$board"; then
-    if declare -F cache_read >/dev/null 2>&1; then
+    # `command -v`, NOT `declare -F` (temperloop#1776): this lib is SOURCED into
+    # the agent's shell by every command spec, and on macOS that shell is zsh,
+    # where `declare` is `typeset` and `-F` means "float with N digits" — so
+    # `declare -F cache_read` SUCCEEDS for an undefined name and the fallback
+    # below is unreachable. `command -v` is POSIX and false-for-absent in both
+    # shells. There is no `cache_read` binary, so the wider "function, builtin
+    # or binary" sense of `command -v` cannot make this probe true by accident.
+    if command -v cache_read >/dev/null 2>&1; then
       # cache_read serves warm-and-fresh with ZERO gh calls; on a miss/stale
       # store it pays exactly one live refresh itself (cache.sh's own
       # degradation contract — one stderr notice, never fabricated data) and
@@ -767,7 +774,7 @@ _board_issues_ensure_label() {
 # for this repo (cache_dirty itself no-ops then; see cache.sh's cache_dirty).
 #   _board_cache_dirty_after_write <owner/repo>
 _board_cache_dirty_after_write() {
-  declare -F cache_dirty >/dev/null 2>&1 && cache_dirty "$1" >/dev/null 2>&1
+  command -v cache_dirty >/dev/null 2>&1 && cache_dirty "$1" >/dev/null 2>&1
   return 0
 }
 

@@ -6,7 +6,7 @@
 # Hermetic: no daemon, no network, no uvx. The happy path (a live daemon
 # answering ~0.2s) is proven by an adopter's live measurement; here we lock the
 # CI-checkable invariants that fail SILENTLY otherwise:
-#   1. the lib registers the three backend ops via the declare -F seam,
+#   1. the lib registers the three backend ops via the command -v seam,
 #   2. the backend is selectable by KNOWLEDGE_SEARCH_BACKEND,
 #   3. FAIL-OPEN: an unreachable daemon delegates to the cold basic-memory
 #      backend (search), and available/reindex delegate too — proven by
@@ -50,10 +50,10 @@ source "$LIB_DIR/knowledge_search_mcp.sh"
 
 # ── 1. the three backend ops are registered ────────────────────────────────
 for op in search available reindex; do
-  declare -F "_ks_search_backend_basic_memory_mcp_$op" >/dev/null \
+  command -v "_ks_search_backend_basic_memory_mcp_$op" >/dev/null \
     || fail "backend op '$op' not registered (missing _ks_search_backend_basic_memory_mcp_$op)"
 done
-echo "PASS: 1 backend registers search/available/reindex via the declare -F seam"
+echo "PASS: 1 backend registers search/available/reindex via the command -v seam"
 
 # ── 2. selectable by KNOWLEDGE_SEARCH_BACKEND ──────────────────────────────
 export KNOWLEDGE_SEARCH_BACKEND="basic-memory-mcp"

@@ -14,7 +14,7 @@
 #   1. the SWEEP_ADMIT_OPERATIONAL_EPICS setting (build.config.sh)
 #   2. whether the pooled adapter helper the admission read depends on
 #      (board_blocked_by_open) is even present in this checkout's vendored
-#      board.sh (a stale-adapter probe, `declare -F`)
+#      board.sh (a stale-adapter probe, `command -v`)
 #   3. whether every per-epic gh/vault read below (labels for the parent AND
 #      every member, the live-plan-note vault probe, the edges-considered
 #      comment check) actually SUCCEEDED this run — a call-failure signal,

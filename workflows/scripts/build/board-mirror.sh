@@ -62,7 +62,7 @@ source "$SCRIPT_DIR/../board/lib/board.sh"
 # the always-live single-item arm — so sourcing cache.sh here would be inert.
 # That reasoning is invalidated by temperloop#1119 (this change): the sub-issue
 # read helpers below now call board_sub_issues, which DOES have a cached arm and
-# gates it on `declare -F cache_read` in the calling process. Without this line
+# gates it on `command -v cache_read` in the calling process. Without this line
 # the routing above would buy nothing and would emit one fallback notice per
 # read. Guarded on existence and `if`-form (this script is set -e) for the same
 # reasons as #1118's two sites.

@@ -173,7 +173,7 @@ echo "PASS: cached-vs-live parity — identical normalized item set (live arm vs
 
 # --- 4b: degradation path — axis on, cache.sh functions NOT in scope --------
 # Simulate "cache.sh was never sourced" without a subshell: unset its public
-# function symbols so `declare -F cache_read` (the exact predicate board.sh's
+# function symbols so `command -v cache_read` (the exact predicate board.sh's
 # dispatcher checks) reports absent, then restore them afterward.
 unset -f cache_read cache_dirty cache_refresh_snapshot cache_refresh_details \
          cache_refresh cache_stale cache_clear cache_read_details \

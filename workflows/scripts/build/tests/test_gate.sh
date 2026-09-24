@@ -84,7 +84,7 @@ export DIAGNOSE_QUEUE_RAW_DIR="$TMP/diagnose-queue-raw"
 
 # Confirm the shared fixture system is live: board.sh's _board_gh seam is in
 # scope (same harness gate.sh + the board tests share).
-declare -F _board_gh >/dev/null || fail "board.sh not sourced — shared fixture system missing"
+command -v _board_gh >/dev/null || fail "board.sh not sourced — shared fixture system missing"
 echo "PASS: gate.sh sources board.sh — one shared fixture system (_board_gh in scope)"
 
 # --- read: stable MERGEABLE/CLEAN -------------------------------------------

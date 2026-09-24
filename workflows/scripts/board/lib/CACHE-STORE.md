@@ -185,7 +185,7 @@ the one read call site this store is wired into. Dispatch requires BOTH:
    **and**
 2. the calling process has separately `source`d this file — `board.sh` never
    sources `cache.sh` itself (kept one-way, per the "Design seam" section
-   above); `_board_issues_item_list` checks `declare -F cache_read` and, if
+   above); `_board_issues_item_list` checks `command -v cache_read` and, if
    it's absent, falls back to the plain live `gh issue list` read with one
    stderr notice (fail-safe: an enabled-but-unsourced axis degrades to
    exactly today's behavior, never a silent misread).

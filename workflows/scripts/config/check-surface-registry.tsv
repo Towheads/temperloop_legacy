@@ -302,3 +302,14 @@ workflows/scripts/validate-command-run-reconcile.sh:--open-dir	absent	covered	wo
 workflows/scripts/validate-command-run-reconcile.sh:--open-dir	unreadable	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an UNREADABLE explicitly-named --open-dir: exit 1 (CANNOT EVALUATE), not 0
 workflows/scripts/validate-command-run-reconcile.sh:--open-dir	empty	not-applicable	-	an EMPTY open ledger is the HEALTHY steady state, not a degenerate input: a marker exists only between a run's --open and its terminal emit, so a present, readable ledger holding no markers means every run that opened has closed. Failing it would turn this guard red on every correctly-behaving host -- the inverse of the unread-input class. The two shapes that ARE unread inputs on this surface (absent-when-named, and present-but-unlistable) are covered above, and the positive assertion that an empty readable ledger stays exit 0 is asserted in the same suite.
 
+# ── scripts/lint-shell-dialect-probe.sh (temperloop#1776) — the shell-dialect
+#    capability-probe lint. Unlike its three older siblings (which are on
+#    check-surface-discovery.tsv as `pending` for want of an input seam), this
+#    one takes explicit FILE arguments AND fails closed on a degenerate input,
+#    so it ships its three cases from the start. "Empty" here is the empty
+#    resolved FILE SET, not a zero-byte file: a zero-byte file is legitimately
+#    clean, whereas a lint with nothing to scan is the vacuous pass epic #1409
+#    exists to close. Fixtures in its own suite. ────────────────────────────
+scripts/lint-shell-dialect-probe.sh	absent	covered	scripts/tests/test_lint_shell_dialect_probe.sh	absent file: exit 2 (CANNOT EVALUATE), not 0
+scripts/lint-shell-dialect-probe.sh	unreadable	covered	scripts/tests/test_lint_shell_dialect_probe.sh	unreadable file: exit 2 (CANNOT EVALUATE), not 0
+scripts/lint-shell-dialect-probe.sh	empty	covered	scripts/tests/test_lint_shell_dialect_probe.sh	empty resolved file set: exit 2 (CANNOT EVALUATE), not 0

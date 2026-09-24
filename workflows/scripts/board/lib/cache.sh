@@ -41,7 +41,7 @@
 #     on board.sh and never sources it.
 #   - a bare board number (e.g. "4")           -> resolved via board.sh's
 #     `board_repo()`, IF board.sh has already been sourced in this shell
-#     (checked with `declare -F board_repo`). If it hasn't, this fails loud
+#     (checked with `command -v board_repo`). If it hasn't, this fails loud
 #     with a one-line stderr hint rather than guessing — cache.sh never
 #     sources board.sh itself; the caller decides whether to compose them.
 # This is what keeps board.sh's own sync set self-contained: a consumer that
@@ -88,7 +88,7 @@ _cache_resolve_repo() {
       return 1
       ;;
   esac
-  if declare -F board_repo >/dev/null 2>&1; then
+  if command -v board_repo >/dev/null 2>&1; then
     board_repo "$arg"
     return $?
   fi

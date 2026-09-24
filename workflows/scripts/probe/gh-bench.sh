@@ -131,7 +131,7 @@ if [ "$dry_run" -eq 0 ]; then
   # shellcheck source=workflows/scripts/board/lib/board.sh
   . "$HERE/../board/lib/board.sh"
   # Issue-plane read cache (F#988 Contract). board.sh's cached read arm gates
-  # on `declare -F cache_read` and board.sh NEVER sources cache.sh itself
+  # on `command -v cache_read` and board.sh NEVER sources cache.sh itself
   # (board.sh:479-483) — a deliberate one-way layering that keeps reconcile.sh
   # permanently on the live arm. So the CALLER must source it, exactly like
   # worklist.sh:50-53, or `resolve_cold`/`resolve_warm` below silently measure
@@ -175,7 +175,7 @@ _run_section() {
       # to sit here; that variable is dead (its only remaining mention in
       # board.sh is a comment describing the removed Projects-v2 cache), so it
       # forced nothing — resolve_cold and resolve_warm were byte-identical.
-      declare -F cache_dirty >/dev/null 2>&1 && cache_dirty "$REPO" >/dev/null 2>&1
+      command -v cache_dirty >/dev/null 2>&1 && cache_dirty "$REPO" >/dev/null 2>&1
       board_resolve "$board" >/dev/null 2>&1 || true
       ;;
     resolve_warm) board_resolve "$board" >/dev/null 2>&1 || true ;;
@@ -267,7 +267,7 @@ echo "gh-bench: budget spent this run — core(REST)=${core_spent} calls [the tr
 # either arm would be a lie. What IS true of the whole process is whether
 # lib/cache.sh got sourced at all (the precondition for either arm to mean
 # anything) — report that fact instead, folded into --label the same way.
-if declare -F cache_read >/dev/null 2>&1; then
+if command -v cache_read >/dev/null 2>&1; then
   total_label="${label}-cache-available"
 else
   total_label="${label}-cache-unavailable"

@@ -207,7 +207,7 @@ ks__backend_fn() {
 ks__dispatch() {
   local op="$1"; shift
   local fn; fn="$(ks__backend_fn "$op")"
-  if ! declare -F "$fn" >/dev/null 2>&1; then
+  if ! command -v "$fn" >/dev/null 2>&1; then
     printf 'knowledge_store: backend "%s" does not implement "%s" (no %s defined)\n' \
       "$KNOWLEDGE_STORE_BACKEND" "$op" "$fn" >&2
     return 2
@@ -435,12 +435,12 @@ ks_list()   { ks__dispatch list   "$@"; }
 ks_sync_available() {
   local fn avail_fn
   fn="$(ks__backend_fn sync)"
-  if ! declare -F "$fn" >/dev/null 2>&1; then
+  if ! command -v "$fn" >/dev/null 2>&1; then
     printf 'skipped — sync unavailable for backend %s\n' "$KNOWLEDGE_STORE_BACKEND" >&2
     return 3
   fi
   avail_fn="$(ks__backend_fn sync_available)"
-  if declare -F "$avail_fn" >/dev/null 2>&1; then
+  if command -v "$avail_fn" >/dev/null 2>&1; then
     "$avail_fn" || return $?
   fi
   return 0

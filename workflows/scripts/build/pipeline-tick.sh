@@ -548,7 +548,7 @@ read_ready_items() {
       # shellcheck source=/dev/null
       . "$lib"
       # Issue-plane read cache (F#988). board.sh's cached read arms gate on
-      # `declare -F cache_read` and board.sh never sources cache.sh itself (a
+      # `command -v cache_read` and board.sh never sources cache.sh itself (a
       # deliberate one-way layering, board.sh:521-526), so this caller must —
       # otherwise `board.<N>.cache=on` is inert here and board_resolve below
       # takes the live arm with a per-call stderr notice. Guarded on existence

@@ -563,7 +563,7 @@ ks_search_available [--probe]     -> exit 0/3 probe, no stdout.
                                      installs — use this for a cheap
                                      predicate / graceful-skip check.
 ks_search_partition_supported     -> exit 0 iff THIS library implements the
-                                     --partition scope (a `declare -F`
+                                     --partition scope (a `command -v`
                                      version-skew probe — § Project partition)
 ```
 
@@ -652,7 +652,7 @@ scope argument must **error**, never widen the corpus:
   semantic path found nothing).
 - A filter that **cannot run** (no `jq`) returns nothing and **exit 4** — it
   never falls back to the unfiltered stream.
-- A **version-skew** caller probes `declare -F ks_search_partition_supported`
+- A **version-skew** caller probes `command -v ks_search_partition_supported`
   first. On a pre-#418 copy of the library that function does not exist, and
   that is the only reliable way to distinguish a library that *honours* the
   scope from one that would silently ignore it. No care inside this library
@@ -697,7 +697,7 @@ rebuild, **without** the forced full re-embed. Measured on a 977-note live
 store (foundation#1425, 2026-07-28): `--full --search` = **61s**, bare
 `--full` = **587s**. Before temperloop#888 that shape was unreachable through
 this seam — a caller had to reach into the library-private `_ks_bm_run` behind
-a `declare -F` probe — so any consumer that still does so can drop the probe
+a `command -v` probe — so any consumer that still does so can drop the probe
 and call the public seam.
 
 An **unrecognised** argument is rejected: exit 2 (the invalid-usage code
