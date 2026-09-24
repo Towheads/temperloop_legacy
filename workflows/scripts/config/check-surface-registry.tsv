@@ -255,3 +255,16 @@ workflows/scripts/config/check-join-keys.sh	empty	covered	workflows/scripts/test
 workflows/scripts/check-workflow-script-size.sh	absent	covered	workflows/scripts/tests/test_workflow_script_size.sh	an absent workflows dir SKIPs explicitly rather than passing silently
 workflows/scripts/check-workflow-script-size.sh	unreadable	covered	workflows/scripts/tests/test_workflow_script_size.sh	an unreadable .mjs FAILS rather than measuring as zero bytes
 workflows/scripts/check-workflow-script-size.sh	empty	covered	workflows/scripts/tests/test_workflow_script_size.sh	an empty .mjs is measured, not skipped
+
+# -- validate-command-run-reconcile.sh (temperloop#2220: the command-run
+#    stream must reduce to exactly ONE record per run -- a property that
+#    breaks both by DUPLICATION and by SILENCE). Its inputs are the stream
+#    file(s) and the open ledger, both explicitly targetable (--stream /
+#    --open-dir), so all three degenerate shapes are real and covered. NOTE
+#    the one documented exit-0 case that is NOT a degenerate input: a
+#    DEFAULT-mode run finding no command-runs-*.jsonl at all. The lake is
+#    per-host and gitignored, so "this host has emitted nothing yet" is an
+#    expected state, not an unread input -- asserted in the same suite.
+workflows/scripts/validate-command-run-reconcile.sh	absent	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an absent explicitly-named stream: exit 1 (CANNOT EVALUATE), not 0
+workflows/scripts/validate-command-run-reconcile.sh	unreadable	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an unreadable explicitly-named stream: exit 1 (CANNOT EVALUATE), not 0
+workflows/scripts/validate-command-run-reconcile.sh	empty	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an empty explicitly-named stream: exit 1 (CANNOT EVALUATE), not 0

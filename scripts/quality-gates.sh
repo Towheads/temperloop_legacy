@@ -379,6 +379,17 @@ KERNEL_GATES=(
   # Same direct-`bash` form as the sibling emitter gates (the kernel Makefile
   # is generator-owned; no new target added here).
   "bash workflows/scripts/tests/test_command_run_emit.sh"
+  # command-run RECONCILIATION (temperloop#2220) -- the stream must reduce to
+  # exactly ONE record per run, a property that breaks in BOTH directions: a
+  # /fix run that parks at the merge gate and merges later in the SAME run
+  # emits twice, and a run whose terminal emit is never called emits nothing
+  # at all. The fixture suite proves the run_id + open-ledger fix and shows
+  # the guard red-then-green on each half. The guard itself reads THIS HOST's
+  # own lake: in CI there is none (the lake is gitignored and per-host),
+  # which is its one documented exit-0 path, so it never gates a PR on
+  # another machine's data -- on a developer box it is a real alarm.
+  "bash workflows/scripts/tests/test_command_run_reconcile.sh"
+  "bash workflows/scripts/validate-command-run-reconcile.sh"
   # command-run emitter's epics_reviewed/epics_closed/epics_left_open
   # schema extension (temperloop item "epic-closing-gate", epic #1847) — the
   # /sweep end-of-run epic-closing gate's tally. Covers: the three fields are

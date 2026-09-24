@@ -95,8 +95,14 @@ else
   elif ! grep -Fq 'disposition_total' "$EMIT_SCRIPT"; then
     echo "FAIL  emit-command-run.sh parses --resolved/--reported-no-op but no longer asserts merged + resolved + parked + reported_no_op == items_processed — a disposition added without a field would under-report silently again (temperloop#1084/#1103)"
     fail=1
+  elif ! grep -Eq -- '--run-id\)' "$EMIT_SCRIPT" || ! grep -Eq -- '--open\)' "$EMIT_SCRIPT"; then
+    echo "FAIL  emit-command-run.sh no longer parses --run-id / --open — the stable run id (temperloop#2220) is what makes a park-then-merge run reducible to ONE item instead of two, and the open ledger is the only trace a run that emitted nothing leaves behind"
+    fail=1
+  elif ! grep -Eq -- 'run_id: [$]run_id' "$EMIT_SCRIPT"; then
+    echo "FAIL  emit-command-run.sh parses --run-id/--open but no longer writes run_id into the record — the flags would be accepted and silently dropped, leaving every record unreducible (temperloop#2220)"
+    fail=1
   else
-    echo "ok    emit-command-run.sh parses --resolved / --reported-no-op and asserts the disposition sum"
+    echo "ok    emit-command-run.sh parses --resolved / --reported-no-op / --run-id / --open, asserts the disposition sum, and writes run_id"
   fi
 fi
 
@@ -185,9 +191,31 @@ check_epics_reviewed() {  # $1=label $2=path
   echo "ok    $label declares the Step 3.6A epic-closing gate and passes --epics-reviewed"
 }
 
+# --- 6. every caller doc must OPEN the run ledger (temperloop#2220) ---------
+# The terminal emit alone cannot make the stream reducible: a /fix run can emit
+# TWICE (park at the merge gate, merge after the operator approves, same run),
+# and a run that emits NOTHING leaves no trace at all. The `--open` call at the
+# run's start is what mints the stable run_id and records that the run started,
+# so dropping it silently re-opens BOTH failures — a double-counted item, and a
+# silent run no guard can see. Same presence-lint shape as check_wiring above.
+check_open_ledger() {  # $1=label $2=path $3=expected --command value
+  local label="$1" file="$2" cmdval="$3"
+  [ -f "$file" ] || return 0   # missing-doc case already reported by check_wiring
+  if ! grep -E -- "--open[[:space:]]+--command[[:space:]]+${cmdval}\b" "$file" >/dev/null; then
+    echo "FAIL  $label ($file) no longer opens the run ledger — expected an \`emit-command-run.sh --open --command ${cmdval}\` call at the run's start. Without it a park-then-merge run's records carry no shared run_id (the item is counted twice), and a run that emits nothing leaves no marker for workflows/scripts/validate-command-run-reconcile.sh to catch (temperloop#2220)"
+    fail=1
+    return
+  fi
+  echo "ok    $label opens the run ledger (--open --command $cmdval)"
+}
+
 check_wiring "sweep.md"  "$SWEEP_MD"  "sweep"
 check_wiring "triage.md" "$TRIAGE_MD" "triage"
 check_wiring "fix.md"    "$FIX_MD"    "fix"
+
+check_open_ledger "sweep.md"  "$SWEEP_MD"  "sweep"
+check_open_ledger "triage.md" "$TRIAGE_MD" "triage"
+check_open_ledger "fix.md"    "$FIX_MD"    "fix"
 
 check_resolved "sweep.md"  "$SWEEP_MD"
 check_resolved "triage.md" "$TRIAGE_MD"

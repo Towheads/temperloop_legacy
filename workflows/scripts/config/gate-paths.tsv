@@ -279,6 +279,8 @@ make test-prune-branches	scripts/prune-merged-branches.sh scripts/tests/test_pru
 # ── Registry / prose / presentation-plane lints ─────────────────────────────
 make validate-command-run-emit	workflows/scripts/validate-command-run-emit.sh workflows/scripts/emit-command-run.sh claude/commands/**
 bash workflows/scripts/tests/test_command_run_emit.sh	workflows/scripts/emit-command-run.sh workflows/scripts/validate-command-run-emit.sh workflows/scripts/tests/test_command_run_emit.sh claude/commands/sweep.md claude/commands/triage.md claude/commands/fix.md meta/data/raw/README.md
+bash workflows/scripts/validate-command-run-reconcile.sh	workflows/scripts/validate-command-run-reconcile.sh workflows/scripts/emit-command-run.sh
+bash workflows/scripts/tests/test_command_run_reconcile.sh	workflows/scripts/emit-command-run.sh workflows/scripts/validate-command-run-reconcile.sh workflows/scripts/validate-command-run-emit.sh workflows/scripts/tests/test_command_run_reconcile.sh claude/commands/sweep.md claude/commands/triage.md claude/commands/fix.md meta/data/raw/README.md
 bash workflows/scripts/tests/test_command_run_emit_epics.sh	workflows/scripts/emit-command-run.sh workflows/scripts/tests/test_command_run_emit_epics.sh claude/commands/sweep.md workflows/scripts/build/sweep-epic-closing-gate.sh
 make validate-issue-touch-emit	workflows/scripts/validate-issue-touch-emit.sh workflows/scripts/emit-issue-touch.sh workflows/scripts/board/** claude/commands/**
 make validate-resume-recovery-emit	workflows/scripts/validate-resume-recovery-emit.sh workflows/scripts/emit-resume-recovery.sh claude/commands/build.md

@@ -16,7 +16,10 @@
 # Usage:
 #   emit-command-run.sh --command sweep|triage|fix --board <N> \
 #     --items-processed <N> --merged <N> --resolved <N> --parked <N> \
-#     --reported-no-op <N> [--epic <N>]
+#     --reported-no-op <N> [--epic <N>] [--run-id <id>]
+#   emit-command-run.sh --open --command sweep|triage|fix [--board <N>]
+#     → mints this run's stable run id, records it in the OPEN LEDGER, and
+#       prints it. Called ONCE, at the start of a run. See THE RUN LEDGER.
 #
 # Appends ONE JSONL line to:
 #   ${CMD_RUN_RAW_DIR:-<repo>/meta/data/raw}/command-runs-YYYY-MM.jsonl
@@ -26,7 +29,7 @@
 # canonical sink spec: meta/data/raw/README.md (lake path + schema-version
 # convention; this stream's own record shape is documented below).
 #
-# Record shape: {ts, session_id, command, board, items_processed, merged, resolved, parked, reported_no_op, epic?}
+# Record shape: {ts, session_id, run_id, command, board, items_processed, merged, resolved, parked, reported_no_op, epic?}
 #   ts               ISO-8601 UTC, `Z` suffix (matches the raw/ stream convention)
 #   session_id       the RAW $CLAUDE_CODE_SESSION_ID (full value, UNTRUNCATED) —
 #                     the join key every other raw/ stream keys on
@@ -37,6 +40,21 @@
 #                     truncating here would break the join to Layer-2 session
 #                     telemetry this record exists to support. null when the
 #                     env var is unset (e.g. a manual/non-Claude-Code run).
+#   run_id           the STABLE id of the RUN this record belongs to
+#                     (temperloop#2220). Every record this script writes from
+#                     #2220 on carries it; its ABSENCE is a reliable pre-#2220
+#                     marker, read as UNKNOWN — the same append-only,
+#                     never-backfilled convention as `resolved` /
+#                     `reported_no_op` below. It is what makes the stream
+#                     REDUCIBLE: several records can describe ONE run (a /fix
+#                     run parks at the merge gate, the operator approves it
+#                     later in the same run, and the run emits again with
+#                     --merged 1), so a consumer collapses by run_id and takes
+#                     the LAST record rather than summing every line. A
+#                     pre-#2220 record without the field reduces as its own
+#                     singleton run — the tolerant read, since this stream is
+#                     never rewritten. Purely additive, so no schema_version
+#                     bump (meta/data/raw/README.md convention).
 #   command          "sweep" | "triage" | "fix" (whatever --command was passed,
 #                     verbatim)
 #   board            the board id (--board), or null
@@ -118,6 +136,35 @@
 #                     below (see THE ONE LOUD FAILURE), the same shape as the
 #                     items_processed partition but independent of it.
 #
+# THE RUN LEDGER — the other half of `run_id` (temperloop#2220).
+# A run id alone makes a DOUBLE emit reducible. It does nothing about the
+# inverse failure the same issue turned up: a run that emits NOTHING (seven
+# consecutive /fix dispositions, zero records — the terminal emit simply was
+# not called). Detecting that needs a witness that the run STARTED, so this
+# script keeps a tiny open ledger beside the stream:
+#
+#   ${CMD_RUN_RAW_DIR:-<repo>/meta/data/raw}/command-run-open/<session>__<command>.json
+#     {run_id, command, session_id, board, opened_at, opened_epoch, emitted}
+#
+#   * `--open` (run start) mints a run id, writes the marker with emitted=0,
+#     and prints the id.
+#   * A normal emit ADOPTS that marker's run id (so the caller never has to
+#     carry the string between steps), appends its record, and then either
+#     HOLDS the marker — bumping `emitted` — when the record still reports a
+#     parked item (the run may converge later in this same run), or CLOSES it
+#     (removes it) when nothing is parked and the run is genuinely over.
+#   * A marker left behind with emitted=0 is a run that started and never
+#     emitted. workflows/scripts/validate-command-run-reconcile.sh is the
+#     guard that reads it and goes red — on that MISSING case and on the
+#     DUPLICATE case alike, since "exactly one reducible record per run" is
+#     one property that breaks in two directions.
+#
+# A marker is only ADOPTED while it is fresher than CMD_RUN_RUN_ID_TTL_SECS,
+# so a stale one from an earlier run can never silently merge two runs into
+# one; past the TTL the emit mints a fresh id instead. The ledger is
+# best-effort throughout: an unwritable ledger degrades to a freshly minted,
+# per-emit run id and never blocks or fails the emit.
+#
 # WARN, DON'T DROP: any INFRASTRUCTURE failure here (jq missing, sink
 # unwritable, disk full, a malformed count) warns to stderr and exits 0. A
 # telemetry emit must never fail or block the calling command — see the
@@ -173,6 +220,8 @@ self="$(basename "$0")"
 
 command=""
 board=""
+run_id=""
+open_mode=0
 items_processed=""
 merged=""
 resolved=""
@@ -202,6 +251,8 @@ while [ $# -gt 0 ]; do
     --parked) parked="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     --reported-no-op) reported_no_op="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     --epic) epic="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    --run-id) run_id="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    --open) open_mode=1; shift ;;
     --epics-reviewed) epics_reviewed="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     --epics-closed) epics_closed="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
     --epics-left-open) epics_left_open="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
@@ -219,6 +270,66 @@ fi
 
 if ! command -v jq >/dev/null 2>&1; then
   printf '%s: WARN jq not found — no record emitted (command=%s)\n' "$self" "$command" >&2
+  exit 0
+fi
+
+# ── THE RUN LEDGER (temperloop#2220) ─────────────────────────────────────
+# Resolve the raw sink dir the same way pipeline-cron.sh resolves
+# PIPELINE_RAW_DIR: an explicit override env var first, else the repo this
+# script lives in (workflows/scripts/../../meta/data/raw), so it works from
+# any checkout that vendors this file, not just a hardcoded
+# $HOME/dev/foundation path. Resolved HERE rather than just before the
+# append, because `--open` writes the ledger and never reaches that point.
+here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+raw_root="$(cd -P "$here/../.." 2>/dev/null && pwd || echo "$HOME/dev/foundation")"
+raw_dir="${CMD_RUN_RAW_DIR:-$raw_root/meta/data/raw}"
+open_dir="$raw_dir/command-run-open"
+
+# How long an open marker stays ADOPTABLE. Past it, an emit mints a fresh run
+# id rather than adopting a marker some earlier run left behind — a stale
+# adoption would silently merge two runs into one, which is the same
+# under-count this field exists to prevent, one layer over.
+: "${CMD_RUN_RUN_ID_TTL_SECS:=43200}"
+
+# The ledger is keyed on (session, command): one run of one command per
+# session at a time, which is what every caller spec actually does.
+# Only the KEY is sanitised — never the resolved sink path, which may
+# legitimately contain characters this filter would mangle.
+marker_key="$(printf '%s__%s' "${CLAUDE_CODE_SESSION_ID:-nosession}" "$command" | tr -c 'A-Za-z0-9._-' '_')"
+marker_path="$open_dir/$marker_key.json"
+
+mint_run_id() {  # → a fresh, sortable, collision-resistant run id
+  printf 'run-%s-%04x%04x\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$RANDOM" "$RANDOM"
+}
+
+write_marker() {  # $1=run_id $2=opened_at $3=opened_epoch $4=emitted → 0 ok
+  mkdir -p "$open_dir" 2>/dev/null || return 1
+  jq -nc \
+    --arg run_id "$1" \
+    --arg command "$command" \
+    --arg session_id "${CLAUDE_CODE_SESSION_ID:-}" \
+    --arg board "$board" \
+    --arg opened_at "$2" \
+    --argjson opened_epoch "$3" \
+    --argjson emitted "$4" \
+    '{run_id: $run_id, command: $command,
+      session_id: (if $session_id == "" then null else $session_id end),
+      board: (if $board == "" then null else ($board | tonumber? // $board) end),
+      opened_at: $opened_at, opened_epoch: $opened_epoch, emitted: $emitted}' \
+    > "$marker_path" 2>/dev/null || return 1
+  return 0
+}
+
+if [ "$open_mode" -eq 1 ]; then
+  [ -n "$run_id" ] || run_id="$(mint_run_id)"
+  if ! write_marker "$run_id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(date -u +%s)" 0; then
+    # Warn-don't-drop, same contract as every other failure here: the run id
+    # is still printed, so the run stays reducible even with no ledger — only
+    # the MISSING-run detection degrades.
+    printf '%s: WARN could not write the run-id open marker under %s (command=%s) — the run id below is still usable\n' \
+      "$self" "$open_dir" "$command" >&2
+  fi
+  printf '%s\n' "$run_id"
   exit 0
 fi
 
@@ -298,22 +409,48 @@ fi
 
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 month="$(date -u +%Y-%m)"
+now_epoch="$(date -u +%s)"
 session_id="${CLAUDE_CODE_SESSION_ID:-}"
-
-# Resolve the raw sink dir the same way pipeline-cron.sh resolves PIPELINE_RAW_DIR:
-# an explicit override env var first, else the repo this script lives in
-# (workflows/scripts/../../meta/data/raw), so it works from any checkout that
-# vendors this file, not just a hardcoded $HOME/dev/foundation path.
-here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-raw_root="$(cd -P "$here/../.." 2>/dev/null && pwd || echo "$HOME/dev/foundation")"
-raw_dir="${CMD_RUN_RAW_DIR:-$raw_root/meta/data/raw}"
 raw_file="$raw_dir/command-runs-${month}.jsonl"
 
 mkdir -p "$raw_dir" 2>/dev/null || true
 
+# RESOLVE THE RUN ID (temperloop#2220) — explicit flag, else this run's open
+# marker, else a freshly minted one. The marker arm is what lets a caller
+# park now and merge later in the SAME run without carrying the id between
+# steps; the freshness bound is what stops a marker an earlier run abandoned
+# from silently swallowing this one.
+marker_opened_at=""
+marker_opened_epoch=0
+marker_emitted=0
+marker_run_id=""
+if [ -r "$marker_path" ]; then
+  marker_run_id="$(jq -r '.run_id // empty' "$marker_path" 2>/dev/null)" || marker_run_id=""
+  marker_opened_at="$(jq -r '.opened_at // empty' "$marker_path" 2>/dev/null)" || marker_opened_at=""
+  marker_opened_epoch="$(jq -r '.opened_epoch // 0' "$marker_path" 2>/dev/null)" || marker_opened_epoch=0
+  marker_emitted="$(jq -r '.emitted // 0' "$marker_path" 2>/dev/null)" || marker_emitted=0
+  case "$marker_opened_epoch" in ''|*[!0-9]*) marker_opened_epoch=0 ;; esac
+  case "$marker_emitted" in ''|*[!0-9]*) marker_emitted=0 ;; esac
+fi
+
+if [ -n "$run_id" ]; then
+  : # explicit --run-id always wins
+elif [ -n "$marker_run_id" ] && [ "$((now_epoch - marker_opened_epoch))" -le "$CMD_RUN_RUN_ID_TTL_SECS" ]; then
+  run_id="$marker_run_id"
+else
+  run_id="$(mint_run_id)"
+  marker_opened_at=""
+  marker_opened_epoch=0
+  marker_emitted=0
+fi
+
+[ -n "$marker_opened_at" ] || marker_opened_at="$ts"
+[ "$marker_opened_epoch" -gt 0 ] || marker_opened_epoch="$now_epoch"
+
 record="$(jq -nc \
   --arg ts "$ts" \
   --arg session_id "$session_id" \
+  --arg run_id "$run_id" \
   --arg command "$command" \
   --arg board "$board" \
   --argjson items_processed "$items_processed" \
@@ -329,6 +466,7 @@ record="$(jq -nc \
   '{
     ts: $ts,
     session_id: (if $session_id == "" then null else $session_id end),
+    run_id: $run_id,
     command: $command,
     board: (if $board == "" then null else ($board | tonumber? // $board) end),
     items_processed: $items_processed,
@@ -353,6 +491,19 @@ if ! printf '%s\n' "$record" >> "$raw_file" 2>/dev/null; then
 fi
 
 printf '%s\n' "$record"
+
+# HOLD OR CLOSE THE OPEN MARKER (temperloop#2220). A record that still
+# reports a PARKED item is not necessarily the run's last word — the merge
+# gate is exactly the park a later emit in the SAME run converges — so the
+# marker is held (with `emitted` bumped, which is what tells the reconcile
+# guard this run did emit). Nothing parked means the run reached a terminal
+# disposition, so the marker is closed. Best-effort throughout: a ledger
+# failure never touches the record already on disk, and never fails the emit.
+if [ "$parked" -gt 0 ]; then
+  write_marker "$run_id" "$marker_opened_at" "$marker_opened_epoch" "$((marker_emitted + 1))" || true
+else
+  rm -f "$marker_path" 2>/dev/null || true
+fi
 
 # The record is safely on disk; NOW fail loudly if the counts don't add up —
 # either partition, independently (see the header's "SECOND, INDEPENDENT
