@@ -3478,6 +3478,29 @@ function stripReviewModelMark(text) {
   return String(text ?? '').replace(new RegExp(REVIEW_MODEL_MARK_RE.source, 'gim'), '').replace(/\n{3,}$/, '\n');
 }
 
+// reviewRenderNormalize — THE ONE normalization applied to a reviewer's stored
+// return before ANY consumer of the scope guard looks at it (temperloop#2224,
+// round-1 finding 1). It exists to make a divergence STRUCTURALLY impossible
+// rather than merely currently-absent: the capture-time log half in
+// runReviewers() and the render half in reviewBodySuffix() both call this, so
+// they key off byte-identical text and cannot disagree about what — or how
+// much — was withheld.
+//
+// THE BUG IT CLOSES. The two halves used to read DIFFERENT text: the render
+// seam composed scopeReviewSection(stripReviewModelMark(text)) while the log
+// half read the RAW return. REVIEW_MODEL_MARK_RE matches a `3e-model` line
+// ANYWHERE, not just at the tail, so a reviewer that emitted its model mark
+// ABOVE its own `## Summary` split them — with the mark alone up there, the
+// stripped text has an EMPTY preamble (the body withholds nothing and carries
+// no marker) while the raw text has a one-line one (the log announces
+// "withholding 1 line(s)"); with chatter as well, the two line counts simply
+// differ. That falsifies the guard's central promise — the PR body's marker
+// says HOW MUCH was withheld and the run log says WHAT, and a reader is told
+// to recover the text from the log — so it shipped a pointer that could lie.
+function reviewRenderNormalize(text) {
+  return stripReviewModelMark(text);
+}
+
 // --- §3e REVIEW-BLOCK SCOPE GUARD (temperloop#2224) --------------------------
 // THE LEAK: PR #2223's `## Review notes` carries, inside the
 // `typescript-reviewer` block and ABOVE that seat's own `## Summary`, reviewer
@@ -3500,7 +3523,28 @@ function stripReviewModelMark(text) {
 // THE ANCHOR IS THE SEATS' OWN DECLARED FORMAT — every reviewer seat under
 // claude/agents/ declares an `## Output` block whose first heading is
 // `## Summary`, so text above the first `## Summary` is outside that format by
-// construction.
+// construction. That invariant is PINNED, not merely asserted here: the K2224
+// seat-anchor guard in workflows/scripts/build/tests/test_workflow.sh walks
+// every claude/agents/**/*.md that declares an `## Output` block and goes red
+// if any seat's first declared heading is not `## Summary`, so a future seat
+// that changes its output format breaks the build instead of silently
+// un-anchoring this rule (temperloop#2224, round-1 finding 2).
+//
+// WHAT IS SCOPED, AND WHAT DELIBERATELY IS NOT. Exactly one surface is scoped:
+// the PR body, at reviewBodySuffix()'s render seam. Three in-run relays of the
+// same reviewer text are NOT scoped and are left verbatim on purpose —
+//   * the STORED section text (what reviewSeverityCounts and
+//     reviewHasBlockingFinding parse),
+//   * the parked record's `review.rounds` / `blocking[].findings`, and
+//   * reviewContinuationSection()'s `## Prior round N findings` block, which
+//     relays the prior round's verbatim return into the NEXT round's reviewer
+//     prompt.
+// All three are ephemeral or machine-read, not the durable artifact a human
+// reads months later, and a next-round reviewer is better served by exactly
+// what the prior seat returned than by a filtered version of it. So read this
+// section's claims narrowly: the PR body carries only review; the in-run
+// relays still carry whatever the reviewer emitted (temperloop#2224, round-1
+// finding 3).
 //
 // OVER-FILTERING IS WORSE THAN THE LEAK, so this fails toward PRESERVING:
 // truncating a real HIGH would turn a VISIBLE noise problem into an INVISIBLE
@@ -3916,7 +3960,11 @@ async function runReviewers(item, wt, priorFindingsText) {
     // marker says HOW MUCH was withheld; this says WHAT, so nothing is lost,
     // only relocated off the durable artifact. Capture-time on purpose: the
     // render seam runs twice per item (3f and 3g.5) and would double-report.
-    const outOfScope = reviewOutOfScopePreamble(textStr);
+    // temperloop#2224 finding 1 — reviewRenderNormalize(), NOT the raw return:
+    // the render half normalizes before scoping, so this half must too or the
+    // two can report different withheld text. Pinned by the K2224 log/body
+    // agreement case and by a structural guard over this very line.
+    const outOfScope = reviewOutOfScopePreamble(reviewRenderNormalize(textStr));
     if (outOfScope) {
       log(
         `[${item.slug}] §3e review — ${route.reviewer}: withholding ` +
@@ -4201,8 +4249,10 @@ function reviewBodySuffix(rounds) {
     for (const sec of r.sections ?? []) {
       const heading = i === 0 ? sec.reviewer : `${sec.reviewer} (ci-fix round ${i})`;
       sectionParts.push(
-        // temperloop#2131 — strip the reviewer's self-reported-model telemetry
-        // line HERE, at the one render seam, so the stored section text stays
+        // temperloop#2131 — reviewRenderNormalize() strips the reviewer's
+        // self-reported-model telemetry line HERE, at the one render seam
+        // (and, per temperloop#2224 finding 1, at the capture-time log half
+        // too, so the two cannot disagree), so the stored section text stays
         // the reviewer's verbatim return (what reviewTally parses the model
         // out of) while the PR body is byte-identical to a reviewer that never
         // emitted the line.
@@ -4210,7 +4260,7 @@ function reviewBodySuffix(rounds) {
         // same seam: out-of-scope preamble above the seat's own `## Summary`
         // is withheld (marked, never silently) so orchestrator-conversation
         // residue a reviewer emitted cannot reach the durable artifact.
-        `${reviewBlockMarker(sec.reviewer, i)}\n### ${heading}\n${neutralizeReviewBlockMark(scopeReviewSection(stripReviewModelMark(sec.text)))}`,
+        `${reviewBlockMarker(sec.reviewer, i)}\n### ${heading}\n${neutralizeReviewBlockMark(scopeReviewSection(reviewRenderNormalize(sec.text)))}`,
       );
     }
   });

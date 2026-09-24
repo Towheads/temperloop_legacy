@@ -73,6 +73,16 @@
 #     end; the three preserve-verbatim concessions hand their input back
 #     untouched; an UNFIXED render seam leaks, so the assertion discriminates;
 #     and the leak reaches no part of the real pr-batch PR-open command
+#   - 3e review-block scope guard, round-3 findings (temperloop#2224): the
+#     capture-time log half and the PR-body render half derive the withheld
+#     preamble from the SAME normalized text, so a reviewer that emits its
+#     "3e-model" telemetry line ABOVE its own "## Summary" cannot make the run
+#     log and the PR marker disagree about what was withheld (the raw-reading
+#     control shows they DO disagree without the fix); every seat charter under
+#     claude/agents/ still declares "## Summary" as the first heading of its
+#     "## Output" block, which is the invariant the anchor rests on; and each
+#     arm of the preserve-verbatim severity alternation is exercised against a
+#     negative control
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd ../../../.. && pwd)"
@@ -18115,8 +18125,8 @@ run_node_case "K2224 scope guard (discrimination): with scopeReviewSection splic
 $PREAMBLE
 const LEAK = readFileSync(process.env.K2224_LEAK, 'utf8');
 const ANCHOR = 'return await buildLevel();';
-const SEAM = 'neutralizeReviewBlockMark(scopeReviewSection(stripReviewModelMark(sec.text)))';
-const UNFIXED = 'neutralizeReviewBlockMark(stripReviewModelMark(sec.text))';
+const SEAM = 'neutralizeReviewBlockMark(scopeReviewSection(reviewRenderNormalize(sec.text)))';
+const UNFIXED = 'neutralizeReviewBlockMark(reviewRenderNormalize(sec.text))';
 const emit = (reason) => { console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true })); process.exit(0); };
 if (MJS_SRC.indexOf(SEAM) === -1)
   emit('reviewBodySuffix no longer composes scopeReviewSection at its render seam — the scope guard was removed or reshaped, and this control can no longer show what it discriminates against');
@@ -18212,6 +18222,345 @@ if (!reason && cleanPr.promptFull.indexOf('scope guard (temperloop#2224)') !== -
 if (!reason && cleanPr.promptFull.indexOf('Clarity/conciseness are strong') === -1)
   reason = 'the control review must reach the PR body untouched: ' + cleanPr.promptFull.slice(0, 400);
 console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
+
+# ============================================================================
+# K2224-R3 — ROUND-3 REVIEWER FINDINGS (temperloop#2224)
+#
+# FINDING 1 [MEDIUM], the load-bearing one. The scope guard has TWO halves and
+# they used to read DIFFERENT text. The render half in reviewBodySuffix()
+# normalized first (it stripped the `<!-- 3e-model: -->` telemetry line, then
+# scoped); the capture-time log half in runReviewers() read the RAW reviewer
+# return. REVIEW_MODEL_MARK_RE matches that line ANYWHERE in the text, not just
+# at the tail, so a reviewer that emitted its model mark ABOVE its own
+# `## Summary` split the two halves apart:
+#   * mark ALONE above the anchor -> normalized preamble is EMPTY (the body
+#     withholds nothing and carries no marker) while the raw preamble is one
+#     line (the run log announces "withholding 1 line(s)");
+#   * mark PLUS chatter above the anchor -> both withhold, but the two line
+#     counts differ (raw 3, normalized 1).
+# That matters because of the promise the guard ships: the PR body's marker
+# says HOW MUCH was withheld and the run log says WHAT, and the marker points
+# the reader at the log to recover it. Two halves that disagree make that
+# pointer a lie — a dishonest guard is worse than a visible leak. Both halves
+# now call the SAME reviewRenderNormalize(), so they cannot diverge.
+#
+# Neither round-2 fixture carried a model mark, so this failure had NO test
+# coverage at all. The new fixture is the one that pins it:
+#   fixtures/review-block-model-mark-above-anchor-2224.md
+#
+# FINDING 2 [MEDIUM] — the anchor's invariant ("every seat's declared
+# `## Output` block opens with `## Summary`") was asserted in a comment with no
+# guard. The seat-anchor guard below walks claude/agents/**/*.md and goes red
+# when a seat declares something else, so a future seat cannot silently
+# un-anchor the rule.
+#
+# FINDING 4 [LOW] — concession 2's alternation was only ever exercised on its
+# HIGH and `## Findings` arms; MEDIUM, LOW and `## What's solid` were untested.
+# The concession-alternation case below covers all five, plus a NEGATIVE
+# control (a severity NOT in the alternation) so the case cannot pass vacuously.
+# ============================================================================
+export K2224_MARK="$REPO_ROOT/workflows/scripts/build/tests/fixtures/review-block-model-mark-above-anchor-2224.md"
+[ -f "$K2224_MARK" ] || fail "#2224 r3: the model-mark-above-anchor fixture is missing at $K2224_MARK"
+grep -q '3e-model:' "$K2224_MARK" \
+  || fail "#2224 r3: the model-mark fixture no longer carries a 3e-model telemetry line — it reproduces nothing and this suite would pass vacuously"
+grep -q '^## Summary' "$K2224_MARK" \
+  || fail "#2224 r3: the model-mark fixture must still carry the ## Summary anchor the guard keys off"
+_k2224_mark_ln="$(grep -n '3e-model:' "$K2224_MARK" | head -1 | cut -d: -f1)"
+_k2224_anchor_ln="$(grep -n '^## Summary' "$K2224_MARK" | head -1 | cut -d: -f1)"
+[ "$_k2224_mark_ln" -lt "$_k2224_anchor_ln" ] \
+  || fail "#2224 r3: the model mark must sit ABOVE the ## Summary anchor (mark line $_k2224_mark_ln, anchor line $_k2224_anchor_ln) — below it the two halves never diverged and this fixture pins nothing"
+unset _k2224_mark_ln _k2224_anchor_ln
+
+# --- K2224-R3 structural guard: ONE normalizer, both halves -----------------
+# The behavioural cases below prove the two halves AGREE today. This prong
+# pins WHY: they call the same named function. It goes red the moment either
+# site is edited back to reading text the other does not read — the exact
+# regression finding 1 caught, which no behavioural assertion can catch until
+# someone happens to write a fixture for the new divergence.
+_k2224_norm_def="$(grep -cE '^function reviewRenderNormalize\(' "$MJS" || true)"
+[ "$_k2224_norm_def" = "1" ] \
+  || fail "#2224 r3: expected exactly ONE reviewRenderNormalize definition in build-level.mjs, found $_k2224_norm_def — the single normalization seam the capture half and the render half share is gone or duplicated"
+grep -q 'const outOfScope = reviewOutOfScopePreamble(reviewRenderNormalize(textStr));' "$MJS" \
+  || fail "#2224 r3: runReviewers() no longer derives the withheld preamble from reviewRenderNormalize(textStr). Reading the RAW return here is finding 1's bug: the render half normalizes first, so the run log and the PR body's marker would report different withheld text and the marker's 'recover it from the run log' pointer becomes a lie."
+grep -q 'scopeReviewSection(reviewRenderNormalize(sec.text))' "$MJS" \
+  || fail "#2224 r3: reviewBodySuffix()'s render seam no longer composes scopeReviewSection(reviewRenderNormalize(sec.text)) — the two halves of the scope guard can no longer be shown to key off the same text"
+unset _k2224_norm_def
+echo "PASS: #2224 r3 structural guard — the capture half and the render half both derive from reviewRenderNormalize(), so they cannot read differently-processed text"
+
+# --- K2224-R3 seat-anchor invariant guard (finding 2) -----------------------
+# THE INVARIANT: scopeReviewSection() decides what is "outside this seat's
+# review" by anchoring on the seat's own declared output format — the first
+# `## Summary` heading. That is only sound while every reviewer seat actually
+# declares `## Summary` as the first heading of its `## Output` block. Round 1
+# verified it held for all 13 seats BY HAND and wrote the result in a comment;
+# a comment does not go red when seat 14 declares `## Verdict` instead. This
+# does. Exact-match on the `## Output` heading on purpose: `## Output style
+# notes` is a different, later section in every charter.
+_k2224_agents_dir="$REPO_ROOT/claude/agents"
+[ -d "$_k2224_agents_dir" ] \
+  || fail "#2224 r3: no claude/agents/ directory at $_k2224_agents_dir — this is the kernel's own checkout, where the seat charters the review-block anchor depends on are expected to exist. Refusing to report success on an input this guard could not evaluate."
+_k2224_seats_checked=0
+_k2224_seat_bad=""
+while IFS= read -r _k2224_seat; do
+  grep -qE '^##[[:space:]]+Output[[:space:]]*$' "$_k2224_seat" || continue
+  _k2224_seats_checked=$((_k2224_seats_checked + 1))
+  _k2224_seat_first="$(awk '/^##[[:space:]]+Output[[:space:]]*$/{f=1;next} f && /^#/{print;exit}' "$_k2224_seat")"
+  if [ "$_k2224_seat_first" != "## Summary" ]; then
+    _k2224_seat_bad="$_k2224_seat_bad
+  ${_k2224_seat#"$REPO_ROOT"/} declares '${_k2224_seat_first:-<no heading at all inside its ## Output block>}'"
+  fi
+done < <(find -L "$_k2224_agents_dir" -type f -name '*.md' 2>/dev/null | sort)
+[ "$_k2224_seats_checked" -ge 13 ] \
+  || fail "#2224 r3: the seat-anchor guard only found $_k2224_seats_checked charter(s) declaring a '## Output' block under claude/agents/ (13 are expected). Either the charters moved, the heading grammar changed, or the walk broke — in any of those cases this guard can no longer go red, so fix the walk rather than lowering the floor."
+[ -z "$_k2224_seat_bad" ] \
+  || fail "#2224 r3: a reviewer seat declares an output format whose FIRST heading is not '## Summary'. build-level.mjs's REVIEW_SECTION_ANCHOR_RE anchors the §3e review-block scope guard on exactly that heading, so this seat's whole review would sit ABOVE the anchor and be treated as out-of-scope preamble. Fix the seat back to '## Summary', or change the anchor and this guard together. Offending seat(s):$_k2224_seat_bad"
+grep -q 'REVIEW_SECTION_ANCHOR_RE.*Summary' "$MJS" \
+  || fail "#2224 r3: build-level.mjs's REVIEW_SECTION_ANCHOR_RE no longer anchors on 'Summary', but the seats above still declare '## Summary' as their first output heading — the code and the charters have drifted apart"
+echo "PASS: #2224 r3 seat-anchor invariant — all $_k2224_seats_checked seat charters under claude/agents/ declare '## Summary' as the first heading of their '## Output' block, matching the anchor build-level.mjs scopes on"
+unset _k2224_agents_dir _k2224_seats_checked _k2224_seat_bad _k2224_seat _k2224_seat_first
+
+run_node_case "K2224 r3 (finding 1, unit): the log half and the render half agree on what was withheld when a model mark sits ABOVE the seat's ## Summary" "
+$PREAMBLE
+const MARK = readFileSync(process.env.K2224_MARK, 'utf8');
+const CLEAN = readFileSync(process.env.K2224_CLEAN, 'utf8');
+const ANCHOR = 'return await buildLevel();';
+const emit = (reason) => { console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true })); process.exit(0); };
+if (MJS_SRC.indexOf(ANCHOR) === -1)
+  emit('the module tail anchor moved — this unit seam is inert and would pass vacuously');
+globalThis.args = { ...baseArgs, items: [] };
+delete globalThis.__k2224r3;
+await new AsyncFunction(MJS_SRC.replace(ANCHOR, 'globalThis.__k2224r3 = { reviewBodySuffix, scopeReviewSection, reviewOutOfScopePreamble, reviewRenderNormalize }; return;'))();
+const api = globalThis.__k2224r3;
+if (!api || typeof api.reviewRenderNormalize !== 'function')
+  emit('reviewRenderNormalize is not defined — the single normalization seam the two halves share is missing');
+
+// The capture half's own arithmetic, reproduced exactly as runReviewers() does
+// it, so this case measures the SHIPPED rule and not a paraphrase of it.
+const lines = (p) => (p ? p.trim().split('\\n').length : 0);
+const markerCount = (body) => {
+  const m = /scope guard \(temperloop#2224\): ([0-9]+) line\(s\)/.exec(body);
+  return m ? Number(m[1]) : 0;
+};
+const roundOf = (text) => ({
+  ran: [{ reviewer: 'typescript-reviewer', mandatory: false }],
+  skipped: [],
+  sections: [{ reviewer: 'typescript-reviewer', text }],
+  round: 1,
+  round_kind: 'review',
+});
+let reason = null;
+
+// --- ARM A: model mark + chatter above the anchor -------------------------
+// Raw reading: 3 lines. Normalized reading: 1. The body can only ever show
+// the normalized number, so the log half must show it too.
+const bodyA = api.reviewBodySuffix([roundOf(MARK)]);
+const logA = lines(api.reviewOutOfScopePreamble(api.reviewRenderNormalize(MARK)));
+const rawA = lines(api.reviewOutOfScopePreamble(MARK));
+if (rawA === logA)
+  reason = 'arm A: the raw and normalized readings agree (' + rawA + '), so this fixture cannot discriminate the divergence it exists to pin';
+else if (markerCount(bodyA) !== logA)
+  reason = 'arm A: the PR body marker says ' + markerCount(bodyA) + ' line(s) but the capture-time log half computes ' + logA + ' — the two halves disagree about what was withheld, so the marker pointing a reader at the run log is a lie';
+else if (logA !== 1)
+  reason = 'arm A: expected exactly 1 withheld line after normalization, got ' + logA;
+else if (bodyA.indexOf('3e-model:') !== -1)
+  reason = 'arm A: the model-mark telemetry line reached the rendered PR body';
+else if (bodyA.indexOf('Already have the diff from the earlier view') !== -1)
+  reason = 'arm A: the out-of-scope chatter line reached the rendered PR body';
+else if (bodyA.indexOf(MARK.slice(MARK.indexOf('## Summary'))) === -1)
+  reason = 'arm A: the seat review from ## Summary on must survive byte-identically: ' + JSON.stringify(bodyA.slice(0, 400));
+
+// --- ARM B: the model mark ALONE above the anchor -------------------------
+// The reviewer's exact stated case: after normalization there is NOTHING
+// above the anchor, so the body withholds nothing and carries no marker —
+// and the log must therefore announce nothing either.
+const MARKONLY = '<!-- 3e-model: a-test-model-id -->\\n\\n' + CLEAN;
+if (!reason) {
+  const bodyB = api.reviewBodySuffix([roundOf(MARKONLY)]);
+  const logB = lines(api.reviewOutOfScopePreamble(api.reviewRenderNormalize(MARKONLY)));
+  const rawB = lines(api.reviewOutOfScopePreamble(MARKONLY));
+  if (rawB !== 1)
+    reason = 'arm B: the RAW reading must see the lone mark as 1 withheld line (got ' + rawB + '), or this arm cannot discriminate the bug';
+  else if (logB !== 0)
+    reason = 'arm B: after normalization nothing sits above the anchor, so the log half must withhold 0 lines, got ' + logB;
+  else if (markerCount(bodyB) !== 0 || bodyB.indexOf('scope guard (temperloop#2224)') !== -1)
+    reason = 'arm B: a block whose only preamble was the stripped telemetry line must carry NO scope-guard marker';
+  else if (bodyB.indexOf(CLEAN) === -1)
+    reason = 'arm B: the review below the mark must survive byte-identically: ' + JSON.stringify(bodyB.slice(0, 400));
+}
+emit(reason);
+"
+
+run_node_case "K2224 r3 (finding 1, end-to-end): the real run log and the real PR-open command report the SAME withheld preamble" "
+$PREAMBLE
+const TAB = String.fromCharCode(9);
+const tsv = '.ts' + TAB + 'typescript-reviewer' + TAB + 'claude/agents/reviewers/typescript-reviewer.md\\n';
+const MARK = readFileSync(process.env.K2224_MARK, 'utf8');
+const emit = (reason) => { console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true })); process.exit(0); };
+
+const logLines = [];
+globalThis.log = (m) => { logLines.push(String(m)); };
+
+setMachinery('mark-above-anchor',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/mark-above-anchor' },
+  { outcome: 'REVIEW_DIFF', files: ['src/a.ts'], tsv, tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv),
+    review_rounds: 0, review_prior_sha: '', review_head_sha: 'abcdef1234567' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'a5c' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'a5c', branch: 'build/mark-above-anchor' },
+  { outcome: 'PR_OPENED', pr_number: 2224 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('mark-above-anchor');
+setReview('mark-above-anchor', MARK);
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'mark-above-anchor', branch: 'build/mark-above-anchor', title: 'Model mark above the anchor', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+let reason = null;
+if ((result.parked ?? []).length !== 1) reason = 'expected 1 parked: ' + JSON.stringify(result);
+
+const pr = callLog.find(c => (c.opts.label||'').startsWith('pr-batch:mark-above-anchor'));
+if (!reason && !pr) reason = 'no pr-batch call for mark-above-anchor';
+
+const withheld = logLines.filter(l => l.indexOf('out-of-scope preamble') !== -1);
+if (!reason && withheld.length !== 1)
+  reason = 'expected exactly one withholding notice in the run log, got ' + JSON.stringify(withheld);
+let logN = -1;
+if (!reason) {
+  const m = /withholding ([0-9]+) line\(s\) of out-of-scope preamble/.exec(withheld[0]);
+  if (!m) reason = 'the run-log notice does not state a line count: ' + JSON.stringify(withheld[0]);
+  else logN = Number(m[1]);
+}
+let bodyN = -1;
+if (!reason) {
+  const m = /scope guard \(temperloop#2224\): ([0-9]+) line\(s\)/.exec(pr.promptFull);
+  if (!m) reason = 'the PR-open command carries no counted scope-guard marker';
+  else bodyN = Number(m[1]);
+}
+// THE CONTRACT: the body says HOW MUCH, the log says WHAT. They must agree.
+if (!reason && logN !== bodyN)
+  reason = 'the run log announced ' + logN + ' withheld line(s) while the PR body marker announced ' + bodyN + ' — the two halves of the scope guard disagree about what was withheld';
+// And what the log says it withheld must be what the body is actually missing.
+if (!reason && withheld[0].indexOf('Already have the diff from the earlier view') === -1)
+  reason = 'the run log must name the withheld text verbatim — it is the reader recovery path the PR marker points at: ' + JSON.stringify(withheld[0]);
+if (!reason && pr.promptFull.indexOf('Already have the diff from the earlier view') !== -1)
+  reason = 'the out-of-scope chatter reached the PR-open command';
+if (!reason && pr.promptFull.indexOf('3e-model:') !== -1)
+  reason = 'the model-mark telemetry line reached the PR-open command';
+if (!reason && pr.promptFull.indexOf('1 file in scope for this seat') === -1)
+  reason = 'the seat review itself must still reach the PR body: ' + pr.promptFull.slice(0, 400);
+emit(reason);
+"
+
+run_node_case "K2224 r3 (finding 1, discrimination): with the capture half reading the RAW return again, the run log and the PR body disagree" "
+$PREAMBLE
+const TAB = String.fromCharCode(9);
+const tsv = '.ts' + TAB + 'typescript-reviewer' + TAB + 'claude/agents/reviewers/typescript-reviewer.md\\n';
+const MARK = readFileSync(process.env.K2224_MARK, 'utf8');
+const emit = (reason) => { console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true })); process.exit(0); };
+const FIXED = 'reviewOutOfScopePreamble(reviewRenderNormalize(textStr))';
+const UNFIXED = 'reviewOutOfScopePreamble(textStr)';
+if (MJS_SRC.indexOf(FIXED) === -1)
+  emit('runReviewers() no longer normalizes before deriving the withheld preamble — this control can no longer show what it discriminates against');
+
+const logLines = [];
+globalThis.log = (m) => { logLines.push(String(m)); };
+
+setMachinery('mark-unfixed',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/mark-unfixed' },
+  { outcome: 'REVIEW_DIFF', files: ['src/a.ts'], tsv, tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv),
+    review_rounds: 0, review_prior_sha: '', review_head_sha: 'abcdef1234567' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'a5c' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'a5c', branch: 'build/mark-unfixed' },
+  { outcome: 'PR_OPENED', pr_number: 2224 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('mark-unfixed');
+setReview('mark-unfixed', MARK);
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'mark-unfixed', branch: 'build/mark-unfixed', title: 'Unfixed capture half', kind: 'impl', acceptance: ['c'] },
+]};
+
+const fn = new AsyncFunction(MJS_SRC.replace(FIXED, UNFIXED));
+const a = globalThis.args;
+globalThis.args = typeof a === 'string' ? a : JSON.stringify(a);
+await fn();
+
+let reason = null;
+const pr = callLog.find(c => (c.opts.label||'').startsWith('pr-batch:mark-unfixed'));
+if (!pr) reason = 'no pr-batch call for mark-unfixed';
+const withheld = logLines.filter(l => l.indexOf('out-of-scope preamble') !== -1);
+if (!reason && withheld.length !== 1)
+  reason = 'the UNFIXED capture half emitted ' + withheld.length + ' withholding notices, expected 1: ' + JSON.stringify(withheld);
+let logN = -1, bodyN = -1;
+if (!reason) {
+  const lm = /withholding ([0-9]+) line\(s\) of out-of-scope preamble/.exec(withheld[0]);
+  const bm = /scope guard \(temperloop#2224\): ([0-9]+) line\(s\)/.exec(pr.promptFull);
+  if (!lm) reason = 'the UNFIXED run log states no line count: ' + JSON.stringify(withheld[0]);
+  else if (!bm) reason = 'the UNFIXED PR body carries no counted marker';
+  else { logN = Number(lm[1]); bodyN = Number(bm[1]); }
+}
+if (!reason && logN === bodyN)
+  reason = 'the UNFIXED capture half reported the SAME count (' + logN + ') as the PR body, so the fixed-path agreement assertion proves nothing';
+// And the specific divergence finding 1 named: the raw reading counts the
+// stripped telemetry line, the body cannot.
+if (!reason && !(logN > bodyN))
+  reason = 'expected the UNFIXED raw reading to over-count (log ' + logN + ' vs body ' + bodyN + ')';
+emit(reason);
+"
+
+run_node_case "K2224 r3 (finding 4): every arm of concession 2's alternation preserves its block verbatim, and a severity outside the alternation does not" "
+$PREAMBLE
+const ANCHOR = 'return await buildLevel();';
+const emit = (reason) => { console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true })); process.exit(0); };
+if (MJS_SRC.indexOf(ANCHOR) === -1)
+  emit('the module tail anchor moved — this unit seam is inert and would pass vacuously');
+globalThis.args = { ...baseArgs, items: [] };
+delete globalThis.__k2224r3c;
+await new AsyncFunction(MJS_SRC.replace(ANCHOR, 'globalThis.__k2224r3c = { scopeReviewSection, reviewOutOfScopePreamble }; return;'))();
+const api = globalThis.__k2224r3c;
+if (!api || typeof api.scopeReviewSection !== 'function')
+  emit('scopeReviewSection was not exposed by the unit seam');
+
+const TAIL = '\\n\\n## Summary\\nthe seat review proper\\n';
+// Every arm of concession 2's alternation. Round 2 exercised only the HIGH and
+// Findings-heading arms; MEDIUM, LOW and the What-is-solid heading shipped
+// untested, so three quarters of the alternation was unpinned.
+const arms = [
+  ['HIGH', '### [HIGH] a finding emitted before the summary\\ndetail'],
+  ['MEDIUM', '### [MEDIUM] a finding emitted before the summary\\ndetail'],
+  ['LOW', '### [LOW] a finding emitted before the summary\\ndetail'],
+  ['Findings-heading', '## Findings\\n### [MEDIUM] one\\ntext'],
+  ['Whats-solid-heading', '## What\\'s solid\\n- a thing that holds'],
+];
+let reason = null;
+for (const arm of arms) {
+  if (reason) break;
+  const text = arm[1] + TAIL;
+  if (api.reviewOutOfScopePreamble(text) !== '')
+    reason = 'concession-2 arm ' + arm[0] + ': review content above the anchor must establish NO boundary — over-filtering the PR body is the failure this concession exists to prevent';
+  else if (api.scopeReviewSection(text) !== text)
+    reason = 'concession-2 arm ' + arm[0] + ': the block must be returned byte-identical';
+}
+// NEGATIVE CONTROL — a severity word the alternation does NOT list is not
+// review content by this rule, so it must still be withheld. Without this the
+// arms above would pass against an alternation that matched anything.
+if (!reason) {
+  const outside = '### [CRITICAL] not a severity this grammar declares\\ndetail' + TAIL;
+  if (api.reviewOutOfScopePreamble(outside) === '')
+    reason = 'the negative control was preserved too, so the alternation is matching more than HIGH, MEDIUM and LOW and the arms above prove nothing';
+  if (!reason && api.scopeReviewSection(outside) === outside)
+    reason = 'the negative control was returned unchanged, so this case cannot discriminate';
+}
+emit(reason);
 "
 
 echo ""
