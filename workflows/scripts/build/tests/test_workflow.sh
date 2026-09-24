@@ -16354,12 +16354,32 @@ console.log(JSON.stringify({ ok: true }));
 "
 
 # --- temperloop#2229 static guards ------------------------------------------
-K2229_ARM="$(awk '/^async function driveArm/,/^}$/' "$MJS")"
+# The awk ranges match `function <name>(` — the opening paren matters: an
+# unanchored `/^async function driveArm/` also matches a DIFFERENT function
+# whose name merely begins with it (`driveArmPair`), which would hand the guard
+# the wrong body and let it assert against code it was never pointed at. Found
+# while mutation-testing the assertions below: the first rename attempt did not
+# trip the guard at all, because the prefix still matched.
+# temperloop#2252: each awk RANGE CAPTURE is asserted non-empty BEFORE it is
+# grepped. Without this, renaming the anchored function (or moving the `^}$`
+# terminator) yields an empty capture, the grep finds nothing, and the guard
+# fails with the wrong REASON — "driveArm never calls unevidencedAcceptance"
+# when the truth is "no function called driveArm exists any more". It still
+# fails closed, so this is diagnostic honesty rather than a false green, but it
+# sends the next author hunting for a deleted call site that is still there.
+# Same remedy as the K2083_BMD precedent below. This repo has been bitten by the
+# moved-anchor class repeatedly, most severely in #2236, where a harvest missed
+# an entire class of key while clearing its own size floor.
+K2229_ARM="$(awk '/^async function driveArm\(/,/^}$/' "$MJS")"
+[ -n "$K2229_ARM" ] \
+  || fail "#2229 guard anchor moved: no 'async function driveArm' block found in build-level.mjs — the guard could not locate the function it keys on, so it proves nothing about the call site. Re-point the awk range; do NOT delete the guard."
 printf '%s' "$K2229_ARM" | grep -F 'unevidencedAcceptance(' >/dev/null \
   || fail "#2229: driveArm never calls unevidencedAcceptance — an arm could report a gate pass with no acceptance evidence again"
 grep -q 'function unevidencedAcceptance' "$MJS" \
   || fail "#2229: build-level.mjs has no unevidencedAcceptance predicate — the refusal has no single named place"
-K2229_ROUTE="$(awk '/^async function routePickedItem/,/^}$/' "$MJS")"
+K2229_ROUTE="$(awk '/^async function routePickedItem\(/,/^}$/' "$MJS")"
+[ -n "$K2229_ROUTE" ] \
+  || fail "#2229 guard anchor moved: no 'async function routePickedItem' block found in build-level.mjs — the guard could not locate the function it keys on, so it proves nothing about the spike shortcut. Re-point the awk range; do NOT delete the guard."
 printf '%s' "$K2229_ROUTE" | grep -F "winner.spike && winner.gate === 'pass'" >/dev/null \
   || fail "#2229: routePickedItem's spike shortcut does not re-check the gate — a REFUSED spike arm still carries spike:true and would park as a pass"
 echo "PASS: #2229 static guards — the refusal predicate, its driveArm call site, and the spike shortcut's gate conjunct are wired"
