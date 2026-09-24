@@ -184,7 +184,11 @@
 #     carry the string between steps), appends its record, and then either
 #     HOLDS the marker — bumping `emitted` — when the record still reports a
 #     parked item (the run may converge later in this same run), or CLOSES it
-#     (removes it) when nothing is parked and the run is genuinely over.
+#     (removes it) when nothing is parked and the run is genuinely over. It
+#     closes ONLY the marker it ADOPTED: a marker on the same key that this
+#     emit did not adopt — an aged `emitted=0` alarm, or a malformed one with
+#     no run_id — is left in place for the guard to find, never swept up as a
+#     side effect of some other run finishing.
 #   * `--open` also PRUNES spent markers — held past the adoption TTL with a
 #     record already emitted, so nothing can adopt them again. A marker with
 #     emitted=0 is never pruned at any age: that one IS the alarm below.
@@ -645,7 +649,20 @@ printf '%s\n' "$record"
 # failure never touches the record already on disk, and never fails the emit.
 if [ "$parked" -gt 0 ]; then
   write_marker "$run_id" "$marker_opened_at" "$marker_opened_epoch" "$((marker_emitted + 1))" || true
-else
+elif [ -n "$marker_run_id" ] && [ "$marker_run_id" = "$run_id" ]; then
+  # CLOSE ONLY THE MARKER THIS EMIT ACTUALLY ADOPTED. An unconditional `rm`
+  # here deleted whatever happened to sit on this ledger key — including a
+  # marker this run never adopted, which is precisely the MISSING-RUN alarm:
+  # an `emitted=0` marker aged past $CMD_RUN_RUN_ID_TTL_SECS (so a fresh id
+  # was minted instead of adopting it), or a MALFORMED one carrying no
+  # run_id at all (a hard MARKER-MALFORMED failure for the guard). Both were
+  # erased before validate-command-run-reconcile.sh could ever read them,
+  # contradicting this file's own twice-stated invariant that an emitted=0
+  # marker is never removed at any age — and silently vaporising the MISSING
+  # half of the property. prune_spent_markers() and `--open` already guard
+  # this case; the close path was the one hole. An unadopted marker is left
+  # exactly where it is: it belongs to some other run, and only its own run
+  # (or prune_spent_markers, once it is spent) may retire it.
   rm -f "$marker_path" 2>/dev/null || true
 fi
 

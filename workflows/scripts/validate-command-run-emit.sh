@@ -201,7 +201,13 @@ check_epics_reviewed() {  # $1=label $2=path
 check_open_ledger() {  # $1=label $2=path $3=expected --command value
   local label="$1" file="$2" cmdval="$3"
   [ -f "$file" ] || return 0   # missing-doc case already reported by check_wiring
-  if ! grep -E -- "--open[[:space:]]+--command[[:space:]]+${cmdval}\b" "$file" >/dev/null; then
+  # ANCHOR ON A NON-`-` BOUNDARY, never `\b`. `\b` matches between `e` and
+  # `-`, so `--open --command triage-feedback` — a line triage.md legitimately
+  # carries — satisfied the presence check for `triage` all by itself: drop
+  # the main `/triage` open call entirely and this lint stayed green, which is
+  # the exact regression it exists to catch. A trailing space-or-end-of-line
+  # is what actually separates one --command value from a longer one.
+  if ! grep -E -- "--open[[:space:]]+--command[[:space:]]+${cmdval}([[:space:]]|$)" "$file" >/dev/null; then
     echo "FAIL  $label ($file) no longer opens the run ledger — expected an \`emit-command-run.sh --open --command ${cmdval}\` call at the run's start. Without it a park-then-merge run's records carry no shared run_id (the item is counted twice), and a run that emits nothing leaves no marker for workflows/scripts/validate-command-run-reconcile.sh to catch (temperloop#2220)"
     fail=1
     return

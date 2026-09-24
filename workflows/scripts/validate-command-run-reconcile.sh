@@ -53,14 +53,23 @@
 # temperloop#1409 class). So: no jq, an explicitly-targeted stream that is
 # absent / unreadable / empty, an explicitly-targeted open-dir that is not a
 # readable directory, an unparseable stream, an unreadable marker, or a
-# non-numeric $CMD_RUN_OPEN_GRACE_SECS are all exit 1. The ONE case that is
-# legitimately exit 0 is the DEFAULT mode finding no `command-runs-*.jsonl` at
-# all: the lake is per-host and gitignored, so "this host has not emitted yet"
-# is a real, expected state and not a broken property.
+# non-numeric $CMD_RUN_OPEN_GRACE_SECS are all exit 1 — and so is the LAKE
+# DIRECTORY itself when it is not a directory, or is a directory this process
+# cannot list (unreadable/unsearchable), or was named EXPLICITLY (`--raw-dir`
+# or $CMD_RUN_RAW_DIR) and is absent or holds no `command-runs-*.jsonl`. The
+# explicit/default asymmetry is the same one `--stream` and `--open-dir`
+# already implement: a caller who NAMES a lake has asserted it exists, so an
+# empty result set from it is an unread input, not a clean run.
 #
-# TWO WAYS THIS GUARD ONCE FAILED **OPEN** — both closed, both regression-
-# tested, because a reconciliation guard that cannot fail closed is strictly
-# worse than no guard at all: it manufactures confidence.
+# The ONE case that is legitimately exit 0 is DEFAULT mode — no `--raw-dir`,
+# no $CMD_RUN_RAW_DIR — finding a present, readable lake directory (or no
+# lake directory at all) with no `command-runs-*.jsonl` in it: the lake is
+# per-host and gitignored, so "this host has not emitted yet" is a real,
+# expected state and not a broken property.
+#
+# THREE WAYS THIS GUARD ONCE FAILED **OPEN** — all three closed, all three
+# regression-tested, because a reconciliation guard that cannot fail closed is
+# strictly worse than no guard at all: it manufactures confidence.
 #   * A SPACED LAKE PATH. The file list was accumulated as a space-joined
 #     string and expanded unquoted into `cat $stream_files`. A path containing
 #     a space split into non-existent fragments, `cat`'s error went to
@@ -77,6 +86,19 @@
 #     every marker while still exiting 0. A malformed setting now FAILS the
 #     guard loudly rather than disabling the half of it that the setting
 #     bounds.
+#   * AN UN-LISTABLE LAKE DIRECTORY. The first two were closed on the FILE
+#     surface only; the DIRECTORY surface kept the same hole one level up.
+#     `for f in "$raw_dir"/command-runs-*.jsonl` with `[ -f "$f" ] || continue`
+#     cannot tell "directory readable, no files" from "directory unreadable /
+#     absent / not a directory at all" — every one of them fell into the
+#     `[ -z "$streams" ]` arm and printed the sanctioned exit-0 sentence. A
+#     lake HOLDING A REAL RECORD, merely `chmod 000`, therefore asserted that
+#     this host had emitted no telemetry and that there was no property to
+#     break: a conclusion fabricated from a read that failed. The directory is
+#     now CLASSIFIED BEFORE the glob (not-a-directory and unlistable both fail
+#     closed in either mode), and an explicitly-named lake that is absent or
+#     holds no matching file fails closed too — the same asymmetry `--stream`
+#     and `--open-dir` already implement.
 #
 # SETTINGS (named, never valued here — the kernel's § Named-setting
 # convention; `workflows/scripts/config/setting-registry.tsv` records the
@@ -162,13 +184,51 @@ explicit_streams=0
 [ -n "$streams" ] && explicit_streams=1
 
 if [ "$explicit_streams" -eq 0 ]; then
-  [ -n "$raw_dir" ] || raw_dir="${CMD_RUN_RAW_DIR:-$repo_root/meta/data/raw}"
+  # Was the lake NAMED, or defaulted? The distinction is the whole basis of
+  # the fail-closed asymmetry below: a caller who names a lake has asserted it
+  # exists, exactly as `--stream` and `--open-dir` already treat their targets.
+  raw_dir_explicit=0
+  if [ -n "$raw_dir" ]; then
+    raw_dir_explicit=1                       # --raw-dir <dir>
+  elif [ -n "${CMD_RUN_RAW_DIR:-}" ]; then
+    raw_dir="$CMD_RUN_RAW_DIR"               # $CMD_RUN_RAW_DIR
+    raw_dir_explicit=1
+  else
+    raw_dir="$repo_root/meta/data/raw"       # the default, per-host lake
+  fi
+
+  # CLASSIFY THE DIRECTORY BEFORE GLOBBING IT (the header's third "failed
+  # OPEN"). The glob below plus `[ -f "$f" ] || continue` collapses four very
+  # different states into one empty file list — readable-but-empty, unreadable,
+  # absent, and not-a-directory — and the empty-list arm prints the sanctioned
+  # exit-0 sentence over ALL of them. A lake that holds a real record but is
+  # `chmod 000` then asserts this host emitted nothing: a conclusion fabricated
+  # from a read that failed, which is the exact class this guard exists to
+  # close. So each state is named and dispositioned here, before the glob runs.
+  if [ -e "$raw_dir" ] && [ ! -d "$raw_dir" ]; then
+    printf '%s: FAIL CANNOT EVALUATE — %s is not a directory, so the command-run lake it names can never be listed. An unlistable lake is an unread input, never an empty one.\n' "$self" "$raw_dir" >&2
+    exit 1
+  fi
+  if [ -d "$raw_dir" ]; then
+    if [ ! -r "$raw_dir" ] || [ ! -x "$raw_dir" ]; then
+      printf '%s: FAIL CANNOT EVALUATE — %s is not a readable, searchable directory, so a lake this process cannot LIST is indistinguishable from one that is genuinely empty. Fix its permissions; a reconciliation guard never reports "this host has emitted nothing" over a directory it could not open.\n' "$self" "$raw_dir" >&2
+      exit 1
+    fi
+  elif [ "$raw_dir_explicit" -eq 1 ]; then
+    printf '%s: FAIL CANNOT EVALUATE — the lake %s was named explicitly (--raw-dir, or the CMD_RUN_RAW_DIR setting) but does not exist. A named lake that is absent is a mistargeted probe, not a host that has emitted nothing.\n' "$self" "$raw_dir" >&2
+    exit 1
+  fi
+
   for f in "$raw_dir"/command-runs-*.jsonl; do
     [ -f "$f" ] || continue
     streams="$streams$f
 "
   done
   if [ -z "$streams" ]; then
+    if [ "$raw_dir_explicit" -eq 1 ]; then
+      printf '%s: FAIL CANNOT EVALUATE — no command-runs-*.jsonl under %s, which was named explicitly (--raw-dir, or the CMD_RUN_RAW_DIR setting). The caller asserted this lake; an empty result set from it is an unread input, not a clean run. (Only DEFAULT mode treats an empty lake as "this host has emitted nothing yet".)\n' "$self" "$raw_dir" >&2
+      exit 1
+    fi
     printf '%s: ok — no command-runs-*.jsonl under %s; this host has emitted no command-run telemetry yet, so there is no reconciliation property to break.\n' "$self" "$raw_dir"
     exit 0
   fi
@@ -311,6 +371,13 @@ if [ -n "$open_dir" ] && [ -d "$open_dir" ]; then
     # Still inside the grace window ⇒ plausibly still in flight; say nothing.
     [ "$((now_epoch - m_epoch))" -ge "$CMD_RUN_OPEN_GRACE_SECS" ] || continue
     seen="$(printf '%s' "$report" | jq -r --arg r "$m_rid" '[.runs[] | select(.run_id == $r)] | length')"
+    # A COUNT THAT IS NOT A NUMBER READS AS ZERO, i.e. "no record found", so
+    # the arm below still fires. Bare `[ "$seen" -eq 0 ]` on an empty or
+    # non-numeric $seen exits 2, which `if` reads as FALSE — skipping the
+    # MISSING-RUN report for that marker while the guard still exits 0. Same
+    # fail-open shape as the *_SECS comparison above; same `case` guard as
+    # every other numeric read in this loop.
+    case "$seen" in ''|*[!0-9]*) seen=0 ;; esac
     if [ "$m_emitted" -eq 0 ] || [ "$seen" -eq 0 ]; then
       printf 'FAIL  MISSING-RUN  run_id=%s command=%s target=%s opened_at=%s — this run opened and never produced a reducible record (emitted=%s, records in stream=%s). The run happened; the terminal emit did not. Call emit-command-run.sh at EVERY terminal route of /%s — passing the SAME --target the --open call used, or the terminal emit cannot find this marker to adopt — then remove %s.\n' \
         "$m_rid" "$m_cmd" "$m_tgt" "$m_at" "$m_emitted" "$seen" "$m_cmd" "$m"

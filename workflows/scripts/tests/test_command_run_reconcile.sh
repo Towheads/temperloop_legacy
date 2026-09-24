@@ -37,6 +37,23 @@
 #       error that the surrounding `|| continue` read as an ordinary "no",
 #       silently skipping the MISSING-RUN check while still exiting 0.
 #
+# Sections 14-17 cover the round-3 review findings. 14 and 15 are the same
+# two classes as 11 and 13 — fail-open, and an alarm erased before it is read
+# — surviving on surfaces the round-2 fix did not reach:
+#   14. the lake DIRECTORY (not the stream FILE) could not be listed, and an
+#       unreadable / absent / not-a-directory lake read identically to an
+#       empty one — so a lake HOLDING A RECORD, merely chmod 000, asserted
+#       that this host had emitted no telemetry at all.
+#   15. the terminal emit's close path `rm`-ed whatever sat on the ledger key,
+#       including a marker it never ADOPTED — deleting the aged emitted=0
+#       MISSING-RUN alarm that emit-command-run.sh twice promises is never
+#       removed at any age.
+#   16. a record count that could not be read made `[ "$seen" -eq 0 ]` exit 2,
+#       which `if` reads as FALSE — skipping the MISSING-RUN arm for that
+#       marker while the guard still exited 0.
+#   17. `\b` in the caller-doc presence lint let `--open --command
+#       triage-feedback` satisfy the `triage` check by itself.
+#
 # Synthetic lake under a throwaway tmpdir (CMD_RUN_RAW_DIR / --raw-dir).
 # Zero network; never writes outside the tmpdir.
 
@@ -307,8 +324,18 @@ recon --stream "$TMP/garbage.jsonl"
 check_eq "an unparseable stream: exit 1 (CANNOT EVALUATE), not 0" "1" "$RECON_RC"
 recon --open-dir "$TMP/no-such-dir" --stream "$L1/command-runs-2026-09.jsonl"
 check_eq "an absent explicitly-named open-dir: exit 1 (CANNOT EVALUATE), not 0" "1" "$RECON_RC"
-recon --raw-dir "$TMP/empty-lake"
-check_eq "the ONE documented exit-0 exception: a default lake that has emitted nothing yet" "0" "$RECON_RC"
+# The ONE documented exit-0 exception belongs to DEFAULT mode ONLY, so it is
+# exercised through a fake repo root — `--raw-dir`/$CMD_RUN_RAW_DIR are
+# EXPLICIT targeting and now fail closed (section 14). repo_root is derived
+# from the script's own location, so a copy under $FR/workflows/scripts sees
+# $FR/meta/data/raw as its default lake.
+FR="$TMP/fakerepo"; mkdir -p "$FR/workflows/scripts" "$FR/meta/data/raw"
+cp "$RECON" "$FR/workflows/scripts/validate-command-run-reconcile.sh"
+RECON_OUT="$(bash "$FR/workflows/scripts/validate-command-run-reconcile.sh" 2>&1)"; RECON_RC=$?
+check_eq "the ONE documented exit-0 exception: a DEFAULT lake, present and readable, that has emitted nothing yet" "0" "$RECON_RC"
+rm -rf "$FR/meta"
+RECON_OUT="$(bash "$FR/workflows/scripts/validate-command-run-reconcile.sh" 2>&1)"; RECON_RC=$?
+check_eq "…and a DEFAULT lake directory that does not exist at all is the same expected state" "0" "$RECON_RC"
 
 echo "── 9. the wiring is mechanically enforced in the caller docs ──"
 grep_ok "fix.md opens the run ledger" "--open --command fix" "$FIX_MD"
@@ -524,6 +551,161 @@ if [ "$(printf '%s' "$TTL_REC" | jq -r '.run_id')" = "run-ancient" ]; then
     "a marker far past the default TTL was adopted, so the bad value disabled the bound"
 else
   ok "the freshness bound still holds after the fallback (a fresh id is minted)"
+fi
+
+echo "── 14. the guard must FAIL CLOSED on a lake DIRECTORY it cannot list (round 3, HIGH A) ──"
+# Round 2 closed the fail-open on the FILE surface. The DIRECTORY surface kept
+# the identical hole one level up: `for f in "$raw_dir"/command-runs-*.jsonl`
+# with `[ -f "$f" ] || continue` cannot tell "readable, no files" from
+# "unreadable / absent / not a directory" — all four landed in the empty-list
+# arm and printed the sanctioned exit-0 sentence. A lake HOLDING A RECORD,
+# merely chmod 000, therefore asserted this host had emitted no telemetry.
+DIRL="$TMP/dir-lake"; mkdir -p "$DIRL"
+printf '%s\n' "$ONE_REC" > "$DIRL/command-runs-2026-09.jsonl"
+recon --raw-dir "$DIRL"
+check_eq "control: the same lake, readable, reduces its one record" \
+  "0 1" "$RECON_RC $(printf '%s\n' "$RECON_OUT" | sed -n 's/.*ok — \([0-9]*\) record(s).*/\1/p')"
+
+if [ "$(id -u)" -ne 0 ]; then
+  chmod 000 "$DIRL"
+  recon --raw-dir "$DIRL"
+  check_eq "an UNREADABLE lake DIRECTORY: exit 1, never 'this host has emitted no telemetry yet'" "1" "$RECON_RC"
+  case "$RECON_OUT" in *"no command-run telemetry yet"*)
+      bad "an unreadable lake directory never claims the host emitted nothing" "it claimed exactly that: [$RECON_OUT]" ;;
+    *) ok "an unreadable lake directory never claims the host emitted nothing" ;; esac
+  case "$RECON_OUT" in *"not a readable, searchable directory"*)
+      ok "and the failure says the DIRECTORY could not be listed" ;;
+    *) bad "and the failure says the DIRECTORY could not be listed" "got [$RECON_OUT]" ;; esac
+  chmod 755 "$DIRL"
+  recon --raw-dir "$DIRL"
+  check_eq "GREEN again once the same directory is readable (the discriminating twin)" "0" "$RECON_RC"
+else
+  ok "the unreadable-lake-directory case [skipped: running as root, where chmod 000 is not a read barrier]"
+fi
+
+: > "$TMP/lake-is-a-file"
+recon --raw-dir "$TMP/lake-is-a-file"
+check_eq "a --raw-dir that is NOT A DIRECTORY: exit 1 (CANNOT EVALUATE), not 0" "1" "$RECON_RC"
+recon --raw-dir "$TMP/no-such-lake-dir"
+check_eq "an absent explicitly-named --raw-dir: exit 1 (CANNOT EVALUATE), not 0" "1" "$RECON_RC"
+mkdir -p "$TMP/named-but-empty"
+recon --raw-dir "$TMP/named-but-empty"
+check_eq "an explicitly-named lake holding no command-runs-*.jsonl: exit 1 (CANNOT EVALUATE), not 0" "1" "$RECON_RC"
+RECON_OUT="$(CMD_RUN_RAW_DIR="$TMP/no-such-lake-dir" bash "$RECON" 2>&1)"; RECON_RC=$?
+check_eq "\$CMD_RUN_RAW_DIR is explicit targeting too: an absent one fails closed" "1" "$RECON_RC"
+
+echo "── 15. the close path closes ONLY the marker this emit adopted (round 3, MEDIUM B) ──"
+# `rm -f "$marker_path"` on every nothing-parked emit deleted whatever sat on
+# the ledger key — including an aged, UNADOPTED emitted=0 marker, which IS the
+# MISSING-RUN alarm this file twice promises is never erased at any age.
+AD="$TMP/adopt"; mkdir -p "$AD/command-run-open"
+AD_RID="$(CMD_RUN_RAW_DIR="$AD" CLAUDE_CODE_SESSION_ID=sess-ad bash "$EMIT" \
+  --open --command fix --board 7 --target 2220 2>/dev/null)"
+# Age the alarm past the adoption TTL, so the next emit MINTS rather than adopts.
+AD_MK="$AD/command-run-open/sess-ad__fix__2220.json"
+if [ -f "$AD_MK" ]; then
+  jq -c '.opened_epoch = 1' "$AD_MK" > "$AD_MK.aged" && mv -f "$AD_MK.aged" "$AD_MK"
+  AD_REC="$(CMD_RUN_RAW_DIR="$AD" CLAUDE_CODE_SESSION_ID=sess-ad bash "$EMIT" \
+    --command fix --board 7 --target 2220 \
+    --items-processed 1 --merged 1 --resolved 0 --parked 0 --reported-no-op 0 2>/dev/null)"
+  if [ "$(printf '%s' "$AD_REC" | jq -r '.run_id')" = "$AD_RID" ]; then
+    bad "the aged marker is NOT adopted (a fresh id is minted)" "the stale id was adopted"
+  else
+    ok "the aged marker is NOT adopted (a fresh id is minted)"
+  fi
+  if [ -f "$AD_MK" ]; then
+    ok "an AGED, UNADOPTED emitted=0 marker SURVIVES a terminal emit on the same key"
+  else
+    bad "an AGED, UNADOPTED emitted=0 marker SURVIVES a terminal emit on the same key" \
+      "the MISSING-RUN alarm was deleted by a run that never adopted it"
+  fi
+  recon --raw-dir "$AD"
+  check_eq "so the guard still finds it (RED on the run that opened and never emitted)" "1" "$RECON_RC"
+  case "$RECON_OUT" in *MISSING-RUN*"$AD_RID"*) ok "naming the surviving alarm's run id" ;;
+    *) bad "naming the surviving alarm's run id" "got [$RECON_OUT]" ;; esac
+else
+  bad "the --open call wrote a marker to adopt" "no marker at $AD_MK"
+fi
+
+# A MALFORMED marker (no run_id) is a hard MARKER-MALFORMED failure for the
+# guard; the close path must not silently delete that either.
+MM="$TMP/malformed"; mkdir -p "$MM/command-run-open"
+printf '%s\n' '{"command":"fix","session_id":"sess-mm","board":7,"target":"2220","opened_at":"1970-01-01T00:00:01Z","opened_epoch":1,"emitted":0}' \
+  > "$MM/command-run-open/sess-mm__fix__2220.json"
+CMD_RUN_RAW_DIR="$MM" CLAUDE_CODE_SESSION_ID=sess-mm bash "$EMIT" \
+  --command fix --board 7 --target 2220 \
+  --items-processed 1 --merged 1 --resolved 0 --parked 0 --reported-no-op 0 >/dev/null 2>&1
+if [ -f "$MM/command-run-open/sess-mm__fix__2220.json" ]; then
+  ok "a MALFORMED marker survives a terminal emit too (the guard's MARKER-MALFORMED fail is not erased)"
+else
+  bad "a MALFORMED marker survives a terminal emit too" "it was deleted before the guard could read it"
+fi
+recon --raw-dir "$MM"
+check_eq "and the guard goes RED on it" "1" "$RECON_RC"
+case "$RECON_OUT" in *MARKER-MALFORMED*) ok "naming MARKER-MALFORMED" ;;
+  *) bad "naming MARKER-MALFORMED" "got [$RECON_OUT]" ;; esac
+
+# The discriminating twin: the marker this emit DID adopt is still closed.
+AD2="$TMP/adopt-twin"; mkdir -p "$AD2"
+CMD_RUN_RAW_DIR="$AD2" CLAUDE_CODE_SESSION_ID=sess-ad2 bash "$EMIT" \
+  --open --command fix --board 7 --target 2220 >/dev/null 2>&1
+CMD_RUN_RAW_DIR="$AD2" CLAUDE_CODE_SESSION_ID=sess-ad2 bash "$EMIT" \
+  --command fix --board 7 --target 2220 \
+  --items-processed 1 --merged 1 --resolved 0 --parked 0 --reported-no-op 0 >/dev/null 2>&1
+check_eq "an ADOPTED marker is still closed by its own terminal emit (the twin)" \
+  "0" "$(marker_count "$AD2/command-run-open")"
+
+echo "── 16. a record count that could not be read fails CLOSED (round 3, LOW C) ──"
+# `[ "$seen" -eq 0 ]` on an empty/non-numeric $seen exits 2, which `if` reads
+# as FALSE — skipping the MISSING-RUN arm for that marker while the guard
+# still exits 0. The shim below makes exactly that one jq query return nothing,
+# over a lake that is otherwise perfectly GREEN.
+REAL_JQ="$(command -v jq)"
+SHIM="$TMP/shim"; mkdir -p "$SHIM"
+cat > "$SHIM/jq" <<SHIMEOF
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in *'select(.run_id == \$r)'*) exit 0 ;; esac
+done
+exec "$REAL_JQ" "\$@"
+SHIMEOF
+chmod +x "$SHIM/jq"
+SC="$TMP/seen-count"; mkdir -p "$SC/command-run-open"
+printf '%s\n' '{"ts":"2026-09-23T19:31:04Z","run_id":"run-counted","session_id":"sess-sc","command":"fix","board":7,"items_processed":1,"merged":1,"resolved":0,"parked":0,"reported_no_op":0}' \
+  > "$SC/command-runs-2026-09.jsonl"
+printf '%s\n' '{"run_id":"run-counted","command":"fix","session_id":"sess-sc","board":7,"opened_at":"1970-01-01T00:00:01Z","opened_epoch":1,"emitted":1}' \
+  > "$SC/command-run-open/sess-sc__fix.json"
+recon --raw-dir "$SC"
+check_eq "control: the marker's run IS in the stream, so the guard is green" "0" "$RECON_RC"
+RECON_OUT="$(PATH="$SHIM:$PATH" bash "$RECON" --raw-dir "$SC" 2>&1)"; RECON_RC=$?
+check_eq "a record count that came back UNREADABLE fails CLOSED, never a silent skip" "1" "$RECON_RC"
+case "$RECON_OUT" in *MISSING-RUN*) ok "and reports it as MISSING-RUN (records in stream=0), the safe direction" ;;
+  *) bad "and reports it as MISSING-RUN" "got [$RECON_OUT]" ;; esac
+
+echo "── 17. the --command presence check cannot be satisfied by a LONGER command (round 3, LOW D) ──"
+if [ -f "$LINT" ]; then
+  # `\b` matches between `e` and `-`, so triage.md's own legitimate
+  # `--open --command triage-feedback` line satisfied the `triage` check all
+  # by itself: drop the MAIN /triage open call and the lint stayed green.
+  SUF="$TMP/lintsuffix"
+  mkdir -p "$SUF/workflows/scripts" "$SUF/claude/commands"
+  cp "$EMIT" "$SUF/workflows/scripts/emit-command-run.sh"
+  cp "$LINT" "$SUF/workflows/scripts/validate-command-run-emit.sh"
+  cp "$FIX_MD" "$SWEEP_MD" "$SUF/claude/commands/"
+  sed 's/--open --command triage --board/--open --command triage-feedback --board/' \
+    "$TRIAGE_MD" > "$SUF/claude/commands/triage.md"
+  if bash "$SUF/workflows/scripts/validate-command-run-emit.sh" >/dev/null 2>&1; then
+    bad "a --command <x>-suffix call cannot satisfy the <x> presence check" \
+      "the lint stayed green with only an \`--open --command triage-feedback\` line"
+  else
+    ok "a --command <x>-suffix call cannot satisfy the <x> presence check"
+  fi
+  cp "$TRIAGE_MD" "$SUF/claude/commands/triage.md"
+  if bash "$SUF/workflows/scripts/validate-command-run-emit.sh" >/dev/null 2>&1; then
+    ok "and is green again on the real triage.md (the discriminating twin)"
+  else
+    bad "and is green again on the real triage.md" "still red"
+  fi
 fi
 
 printf '\n'

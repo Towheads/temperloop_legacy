@@ -133,6 +133,14 @@ that never got a record at all (a run that started and silently emitted
 nothing). Summing `items_processed` across raw lines, without reducing first,
 double-counts every park→merge run.
 
+The guard **fails closed on any lake it cannot evaluate**, and treats a lake
+you NAME differently from the one it defaults to. A named lake (`--raw-dir` or
+`$CMD_RUN_RAW_DIR`), like a named `--stream` or `--open-dir`, has been asserted
+to exist: absent, unlistable, not-a-directory, or holding no
+`command-runs-*.jsonl` are all exit 1 there. Only **default** mode treats an
+empty or absent lake as the real, expected state "this host has emitted nothing
+yet" and exits 0.
+
 **The open ledger** sits beside the stream at `command-run-open/` and is
 **not** part of it — it is scratch state a run opens and closes, never an
 append-only record. One marker file per run, keyed
@@ -143,7 +151,10 @@ collapsed two concurrent `/fix` runs in one session onto one marker and one
 run id, so every caller passes the **same** `--target` on its `--open` call and
 on its terminal emit (a `/fix` target, a `/sweep` or `/triage` board). `--open`
 never overwrites a marker that is still live on its key, and never deletes a
-stale un-emitted one — that marker *is* the missing-run alarm. The guard runs
+stale un-emitted one — that marker *is* the missing-run alarm. A terminal emit
+closes **only the marker it adopted**, for the same reason: a marker on that
+key that this run did not adopt (an aged `emitted=0` alarm, or a malformed one
+with no `run_id`) belongs to some other run and is left for the guard to find. The guard runs
 over the live lake from `/tidy`'s environment-hygiene sweep, not from
 `scripts/quality-gates.sh`: this lake is per-host mutable state, and one
 abandoned marker must not turn the merge gate red for every later PR on that

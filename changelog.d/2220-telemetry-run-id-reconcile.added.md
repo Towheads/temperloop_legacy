@@ -26,6 +26,37 @@
   that FAILED is now distinguishable from one that found nothing. A non-numeric
   `CMD_RUN_OPEN_GRACE_SECS` is likewise a hard failure rather than a silent skip
   of the MISSING-RUN check it bounds.
+- **…and on a lake DIRECTORY it cannot list** (#2220). The fix above reached the
+  stream FILE only; the lake DIRECTORY kept the identical hole one level up.
+  `for f in "$raw_dir"/command-runs-*.jsonl` with `[ -f "$f" ] || continue`
+  folded "readable, no files", "unreadable", "absent" and "not a directory"
+  into one empty file list, and the empty-list arm printed the sanctioned
+  exit-0 sentence over all four — so a lake **holding a real record**, merely
+  `chmod 000`, reported that this host had emitted no telemetry and that there
+  was no property to break. The directory is now classified before the glob:
+  not-a-directory and unlistable fail closed in either mode, and a lake named
+  **explicitly** (`--raw-dir` or `$CMD_RUN_RAW_DIR`) also fails closed when it
+  is absent or holds no matching file — the same explicit/default asymmetry
+  `--stream` and `--open-dir` already implement. The one documented exit-0
+  case is unchanged but narrowed to what it always meant: **default** mode,
+  no matching files. A record count that could not be read now also fails
+  closed as MISSING-RUN rather than silently skipping that marker.
+- **A terminal emit now closes only the open-ledger marker it adopted** (#2220).
+  `emit-command-run.sh`'s close path `rm`-ed whatever sat on the ledger key
+  whenever nothing was parked — including a marker the run never adopted: an
+  aged `emitted=0` marker (past `CMD_RUN_RUN_ID_TTL_SECS`, so a fresh id was
+  minted instead) or a malformed one carrying no `run_id`. Both are exactly
+  what `validate-command-run-reconcile.sh` reads as MISSING-RUN and
+  MARKER-MALFORMED, so the alarm was erased before the guard could see it,
+  contradicting the documented invariant that an `emitted=0` marker is never
+  removed at any age. An unadopted marker is now left in place; only its own
+  run, or `--open`'s spent-marker prune, retires it.
+- **`validate-command-run-emit.sh`'s `--command` presence check no longer
+  accepts a longer command name** (#2220). It anchored on `\b`, which matches
+  between `e` and `-`, so `triage.md`'s own legitimate
+  `--open --command triage-feedback` line satisfied the `triage` check by
+  itself — drop the main `/triage` open call and the lint stayed green. It now
+  anchors on whitespace-or-end-of-line.
 - **The command-run open ledger is keyed per RUN, not per (session, command)**
   (#2220). Two `/fix` runs driven concurrently from one session — ordinary
   operator usage — collapsed onto one marker and one `run_id`, and the second

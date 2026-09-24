@@ -268,3 +268,20 @@ workflows/scripts/check-workflow-script-size.sh	empty	covered	workflows/scripts/
 workflows/scripts/validate-command-run-reconcile.sh	absent	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an absent explicitly-named stream: exit 1 (CANNOT EVALUATE), not 0
 workflows/scripts/validate-command-run-reconcile.sh	unreadable	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an unreadable explicitly-named stream: exit 1 (CANNOT EVALUATE), not 0
 workflows/scripts/validate-command-run-reconcile.sh	empty	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an empty explicitly-named stream: exit 1 (CANNOT EVALUATE), not 0
+
+# -- validate-command-run-reconcile.sh:--raw-dir (temperloop#2220 round 3,
+#    HIGH A). The rows above are all scoped to an explicitly-named STREAM
+#    FILE. The LAKE DIRECTORY is a second, independently-degenerate input
+#    surface -- and it carried the same fail-open one level up: the glob
+#    `"$raw_dir"/command-runs-*.jsonl` plus `[ -f "$f" ] || continue` folded
+#    "readable, no files", "unreadable", "absent" and "not a directory" into
+#    one empty file list, and the empty-list arm printed the sanctioned exit-0
+#    sentence over all four. A lake HOLDING A REAL RECORD, merely chmod 000,
+#    therefore asserted that this host had emitted no telemetry at all. The
+#    directory is now classified BEFORE the glob, and an EXPLICITLY-named lake
+#    (--raw-dir / $CMD_RUN_RAW_DIR) fails closed on all three shapes -- the
+#    same asymmetry --stream and --open-dir already implement. The exit-0
+#    exception noted above survives, narrowed to DEFAULT mode alone.
+workflows/scripts/validate-command-run-reconcile.sh:--raw-dir	absent	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an absent explicitly-named --raw-dir: exit 1 (CANNOT EVALUATE), not 0
+workflows/scripts/validate-command-run-reconcile.sh:--raw-dir	unreadable	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an UNREADABLE lake DIRECTORY: exit 1, never 'this host has emitted no telemetry yet'
+workflows/scripts/validate-command-run-reconcile.sh:--raw-dir	empty	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an explicitly-named lake holding no command-runs-*.jsonl: exit 1 (CANNOT EVALUATE), not 0
