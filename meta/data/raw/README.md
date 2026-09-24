@@ -85,12 +85,13 @@ run did not do. A `/triage --feedback` run (sweep **plus** queue walk) still
 emits one `"triage"` record for its sweep; giving its queue walk counters of
 its own is a follow-on, not covered here.
 
-Record shape: `{ts, session_id, command, board, items_processed, merged, resolved, parked, reported_no_op, epic?, epics_reviewed?, epics_closed?, epics_left_open?}`
+Record shape: `{ts, session_id, run_id, command, board, items_processed, merged, resolved, parked, reported_no_op, epic?, epics_reviewed?, epics_closed?, epics_left_open?}`
 
 | field | type | notes |
 |---|---|---|
 | `ts` | string | ISO-8601 UTC, `Z` suffix |
 | `session_id` | string \| null | raw, untruncated `$CLAUDE_CODE_SESSION_ID` — the join key other raw/ streams key on; `null` for a non-Claude-Code/manual run |
+| `run_id` | string, **absent on pre-#2220 records** | the stable id of the RUN this record belongs to (temperloop#2220), from `--run-id` or the run's own open-ledger marker. Several records can describe ONE run, so this is the key a consumer reduces on — see **Reduction** below. Absent means UNKNOWN, never "its own run by design"; purely additive, no `schema_version` bump |
 | `command` | string | `"sweep"` \| `"triage"` \| `"triage-feedback"` \| `"fix"`, verbatim from `--command`. `"triage-feedback"` is a `/triage --feedback-only` run (queue walk, no sweep — see above); purely additive, no `schema_version` bump, but note a reader filtering on `command == "triage"` will **not** see these runs, which is intended |
 | `board` | number \| string \| null | the logical board number (`--board`), or `null` if omitted |
 | `items_processed` | integer | how many items the run drove/considered |
@@ -100,6 +101,75 @@ Record shape: `{ts, session_id, command, board, items_processed, merged, resolve
 | `reported_no_op` | integer, **absent on pre-#1103 records** | how many were a terminal "nothing to do" outcome that is **not** a merge, a verdict-resolve, or a park — `/fix` only, today: an `already-done` target, or an `claimed-elsewhere` target owned by another session. See the absent-means-unknown caveat below |
 | `epic` | number \| string, OPTIONAL | the epic issue number the run drove against (e.g. `/assess --epic N`, or `/build` on a plan note with an `epic:` frontmatter field), from `--epic`. ABSENT from the record entirely (not `null`) when the caller doesn't pass `--epic` — purely additive, no `schema_version` bump |
 | `epics_reviewed` / `epics_closed` / `epics_left_open` | integer, OPTIONAL (epic #1847 "epic-as-metadata for operational work", item "epic-closing-gate") | `/sweep`'s end-of-run epic-closing gate tally: how many **Operational** epic parents the gate reviewed this run, how many it closed, and how many it left open (`epics_closed + epics_left_open == epics_reviewed`, enforced by the emitter). Present as a group only when `--epics-reviewed` was passed at all (the activation signal — a run with no epic-admitted members this cycle omits all three, not `0`s); `--epics-reviewed 0 --epics-closed 0 --epics-left-open 0` is itself a valid, explicit zero-epic record, distinct from the fields being altogether absent. This is the ONLY signal in this stream for an **Operational** epic's funnel stage: its healthy path is epic → members-drained-via-sweep, with no plan-note step, so an Operational epic appearing (or not appearing) here is never evidence of a stalled assessment — see `workflows/scripts/telemetry-brief.sh` § 2b, which reads this group class-conditionally alongside the (Foundational-only, `/build`-emitted) `item-efficiency` per-epic rollup. Purely additive, no `schema_version` bump |
+
+**Reduction: one run, one record — group by `run_id` and take the LAST record
+(temperloop#2220).** This stream is per-RECORD, not per-run: several records
+can legitimately describe one run. The motivating case is `/fix` at the merge
+gate — the run emits `parked: 1` when the merge is held, the operator approves
+it later **in the same run**, and the run emits again with `merged: 1`. Both
+lines are true when written and neither can retract the other (the stream is
+append-only and is **never** backfilled), so the reconciliation happens at READ
+time:
+
+```sh
+# the canonical reduction — exactly one record per run, last write wins.
+# A run_id-less (pre-#2220) record keys on its own position, so it reduces as
+# its OWN singleton run rather than collapsing with every other legacy line.
+# (`input_line_number` does NOT work here: under -s it is the last line read,
+# so every legacy record would share one key and silently merge.)
+jq -s -c 'to_entries
+          | map(.value + {_k: (.value.run_id // "legacy:\(.key)")})
+          | group_by(._k)
+          | map(sort_by(.ts) | last | del(._k))' meta/data/raw/command-runs-*.jsonl
+```
+
+`workflows/scripts/validate-command-run-reconcile.sh` is both the reference
+implementation of that reduction (`--reduce`) and the **guard** over the
+property it depends on — *exactly one reducible record per run*. That property
+breaks in two directions and the guard fails on both: a record written after
+this host's run-id cutover that carries no `run_id` (unreducible — several
+records for one run that can never be collapsed), and an open-ledger marker
+that never got a record at all (a run that started and silently emitted
+nothing). Summing `items_processed` across raw lines, without reducing first,
+double-counts every park→merge run.
+
+The guard **fails closed on any lake it cannot evaluate**, and treats a lake
+you NAME differently from the one it defaults to. A named lake (`--raw-dir` or
+`$CMD_RUN_RAW_DIR`), like a named `--stream` or `--open-dir`, has been asserted
+to exist: absent, unlistable, not-a-directory, or holding no
+`command-runs-*.jsonl` are all exit 1 there. Only **default** mode treats an
+empty or absent lake as the real, expected state "this host has emitted nothing
+yet" and exits 0.
+
+**The open ledger** sits beside the stream at `command-run-open/` and is
+**not** part of it — it is scratch state a run opens and closes, never an
+append-only record. One marker file per run, keyed
+`<session>__<command>[__<target>].json`, carrying
+`{run_id, command, session_id, board, target, opened_at, opened_epoch, emitted}`.
+The `target` component is load-bearing: a (session, command) key alone
+collapsed two concurrent `/fix` runs in one session onto one marker and one
+run id, so every caller passes the **same** `--target` on its `--open` call and
+on its terminal emit (a `/fix` target, a `/sweep` or `/triage` board). `--open`
+never overwrites a marker that is still live on its key, and never deletes a
+stale un-emitted one — that marker *is* the missing-run alarm. A terminal emit
+closes **only the marker it adopted**, for the same reason: a marker on that
+key that this run did not adopt (an aged `emitted=0` alarm, or a malformed one
+with no `run_id`) belongs to some other run and is left for the guard to find. The guard runs
+over the live lake from `/tidy`'s environment-hygiene sweep, not from
+`scripts/quality-gates.sh`: this lake is per-host mutable state, and one
+abandoned marker must not turn the merge gate red for every later PR on that
+host. Its hermetic fixture suite is what CI gates.
+
+⚠ **Pre-#2220 records carry no `run_id`, and the backlog is never repaired.**
+A record with no `run_id` reduces as **its own singleton run** — the tolerant
+read, and the only one available: nothing in the data can say which legacy
+lines belonged to one run, and stamping them now would assert a `ts` that is
+not when the run happened. So a legacy park→merge pair still reduces to two
+runs. A consumer should treat the legacy segment as approximate (it over-counts
+multi-record runs) and the post-cutover segment — everything at or after the
+earliest `run_id`-bearing record — as exact. The guard reports legacy runs by
+count and never fails on them; it fails only on a run-id-less record written
+*after* the cutover, which is the wiring regressing rather than history.
 
 **Invariant: `merged + resolved + parked + reported_no_op == items_processed`.**
 Every item a run drives reaches exactly one terminal disposition, so the four
@@ -163,20 +233,20 @@ reader tell the two eras apart without a version bump.
 Example record:
 
 ```json
-{"ts":"2026-07-05T14:03:11Z","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","command":"sweep","board":3,"items_processed":4,"merged":3,"resolved":0,"parked":1,"reported_no_op":0}
+{"ts":"2026-07-05T14:03:11Z","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","run_id":"run-20260705T140016Z-3f9a2b1c","command":"sweep","board":3,"items_processed":4,"merged":3,"resolved":0,"parked":1,"reported_no_op":0}
 ```
 
 Example record, run against an epic (`--epic` passed):
 
 ```json
-{"ts":"2026-07-05T14:03:11Z","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","command":"sweep","board":3,"items_processed":4,"merged":3,"resolved":0,"parked":1,"reported_no_op":0,"epic":42}
+{"ts":"2026-07-05T14:03:11Z","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","run_id":"run-20260705T140016Z-3f9a2b1c","command":"sweep","board":3,"items_processed":4,"merged":3,"resolved":0,"parked":1,"reported_no_op":0,"epic":42}
 ```
 
 Example record, a `/fix` run that resolved `already-done` (the temperloop#1103
 case — `reported_no_op` is the only non-zero disposition count):
 
 ```json
-{"ts":"2026-08-08T14:51:26Z","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","command":"fix","board":7,"items_processed":1,"merged":0,"resolved":0,"parked":0,"reported_no_op":1}
+{"ts":"2026-08-08T14:51:26Z","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","run_id":"run-20260808T145101Z-c0ffee11","command":"fix","board":7,"items_processed":1,"merged":0,"resolved":0,"parked":0,"reported_no_op":1}
 ```
 
 Example pre-#1084 record (no `resolved` key — the counts do **not** reconcile,

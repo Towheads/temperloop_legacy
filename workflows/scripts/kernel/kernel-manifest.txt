@@ -499,6 +499,7 @@ kernel workflows/scripts/model-comparison/*
 kernel workflows/scripts/validate-activation-registry.sh
 kernel workflows/scripts/validate-agent-charter-links.sh
 kernel workflows/scripts/validate-command-run-emit.sh
+kernel workflows/scripts/validate-command-run-reconcile.sh
 kernel workflows/scripts/validate-diagnose-queue-emit.sh
 kernel workflows/scripts/validate-feature-docs.sh
 kernel workflows/scripts/validate-issue-touch-emit.sh

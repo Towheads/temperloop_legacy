@@ -58,7 +58,7 @@ for how triage hands off invented work that lands at its door instead.
 **`--feedback-only` takes a reduced path through this step.** Do these two things, in order, then jump straight to Step 6:
 
 - **0a. Reject contradictory doc paths — check this FIRST, before anything else.** If `$1..$N` is non-empty, STOP with: `/triage: --feedback-only runs the pending-feedback queue alone — it does not ingest analysis docs. Drop the doc paths, or drop --feedback-only to sweep them.` Doc intake is Step 1, which this flag skips, so honouring half the invocation would let the operator believe a sweep ingested them. This check lives **here**, at the point it fires — the Failure-modes entry below is its recap, not its trigger. <!-- cite: TR.18 class:half-honored-invocation -->
-- **0b. Run items 2 and 3 ONLY** (with item 2's scope rule relaxed per its own bullet).
+- **0b. Run items 2, 3 and 7 ONLY** (with item 2's scope rule relaxed per its own bullet; item 7 opens the run's telemetry ledger, which Step 6.5's own emit needs exactly as Step 4.9's does).
 
 Items 1, 4, 5 and 6 are skipped: item 1 (Obsidian tools) serves doc intake and decision-route notes, item 4 (`board_resolve`) is the whole-board read the sweep needs, item 5 validates doc paths, item 6's settings back Step 1's intake exclusion — Step 6 uses none of them (it sources `build.config.sh` itself, for its own operator-identity read). Skipping item 4 in particular is the flag's whole point: it is the expensive whole-board read, and Step 6 needs only `board_repo` (a static map lookup) plus per-item `board_parent_issue` (REST, no prior resolve).
 
@@ -70,8 +70,9 @@ Run in parallel:
 4. **Resolve board state once via the adapter.** `source "$BOARD_LIB"; board_resolve "$BOARD"` issues a SINGLE whole-board item read and caches it in the shell (`BOARD_ITEMS_JSON`) — so nothing re-lists per item, and the whole-board read cost lives in one place (GH #396). Status is carried on `fnd:status:*` labels and the adapter owns that encoding — no per-board special-casing here. `board_set_status` takes `BOARD_OPT_BACKLOG` / `BOARD_OPT_READY` / `BOARD_OPT_DONE` by name.
 5. For each analysis-doc path in `$1..$N`: `Read` on the path resolved against the knowledge store root (`workflows/scripts/lib/knowledge_store.contract.md`) to confirm it exists; note word count (≥10k → chunked reads in Step 1).
 6. **Source the tunable-setting config** — `source workflows/scripts/build/build.config.sh` (bare repo-relative, the same shape `/build` Step 0 item 6 uses). This is the ONE place this spec's tunables get their values, per the kernel's § Named-setting convention: every later reference names the setting symbolically (`$TRIAGE_INTAKE_EXCLUDE_LABELS`) and never restates its value inline. Best-effort (`|| true`) — a checkout that doesn't vendor the file simply skips it, and the Step-1 exclusion still applies because `triage-intake-exclusion.sh` carries its own documented fallback.
+7. **Open this run's telemetry ledger** (best-effort, `|| true`-safe, absent-checkout-safe — the opening half of Step 4.9's emit, temperloop#2220 — stable command-run id). **Runs after item 3** — it needs `$BOARD`, the same cross-item data dependency `/sweep` Step 0 item 5 calls out for `ownerRepo`: item 3 is where `$BOARD` is inferred when neither `--board` nor `--project` was given (the common case), each numbered item is typically its own Bash call with no persisted shell state, and an empty `$BOARD` here keys the marker WITHOUT a target while Step 4.9's emit — by then holding a resolved board — computes the target-bearing key, adopts nothing, mints a second id, and strands this marker at `emitted=0` until it ages into a MISSING-RUN alarm that is FALSE. A guard that manufactures a wrong alarm is worse than one that stays quiet, so the ordering is load-bearing, not stylistic. The call: `"$(git rev-parse --show-toplevel)/workflows/scripts/emit-command-run.sh" --open --command triage --board "$BOARD" --target "$BOARD" || true` — and on a `--feedback-only` run, `--open --command triage-feedback` instead, matching the `--command` value Step 6.5 emits under (the ledger is keyed on that value, so opening under the wrong one leaves the run's real emit unmatched). `--target "$BOARD"` is keyed on too and must match the terminal emit's: the board is `/triage`'s run identity, so two boards triaged concurrently from one session no longer collapse onto one marker and one run id (temperloop#2220 round 2). ONE call, here, at the run's start. It mints this run's stable `run_id` and records it in the open ledger, so the stream stays **reducible to exactly one record per run** in both directions: several records describing one run collapse on the shared id, and a run that emits **nothing at all** leaves an un-emitted marker behind as its only trace. The terminal emit adopts the marker's id by itself; no id is carried between steps. A failure here is a no-op (the emit still writes a record, with a freshly minted id). `workflows/scripts/validate-command-run-reconcile.sh` is the guard that reads both halves.
 
-If any check fails, surface in one line and stop.
+If any check fails, surface in one line and stop. Item 7 (the telemetry ledger open) never stops a run.
 
 ## Step 0.6 — AskUserQuestion recurring-class intake (attention → candidate defaults)
 
@@ -357,7 +358,7 @@ All board bash blocks below `source "$BOARD_LIB"` first (Step 0.3); let `repo="$
 
 ```bash
 "$(git rev-parse --show-toplevel)/workflows/scripts/emit-command-run.sh" \
-  --command triage --board "$BOARD" \
+  --command triage --board "$BOARD" --target "$BOARD" \
   --items-processed <K+M+Q — total candidates considered, Step 0.6/Step 1 (the full Backlog scan, INCLUDING the N the milestone filter deferred and the X the label exclusion skipped)> \
   --merged <S — survivors promoted to Ready (active phase), Step 4.7> \
   --resolved <C+D — culled (Step 4.8) + decisions routed off-board (Step 4.8)> \
@@ -536,7 +537,7 @@ So a `--feedback-only` run emits its own record under a **distinct `command` val
 
 ```bash
 "$(git rev-parse --show-toplevel)/workflows/scripts/emit-command-run.sh" \
-  --command triage-feedback --board "$BOARD" \
+  --command triage-feedback --board "$BOARD" --target "$BOARD" \
   --items-processed <Q — queue size, 6.4> \
   --merged <A+B+F — clarifications answered + decisions answered + escalations disposed> \
   --parked <G — deferred, left in the queue>

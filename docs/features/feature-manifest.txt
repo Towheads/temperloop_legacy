@@ -196,12 +196,14 @@ telemetry workflows/scripts/emit-resume-recovery.sh
 telemetry workflows/scripts/tests/test_diagnose_queue_emit.sh
 telemetry workflows/scripts/tests/test_resume_recovery_emit.sh
 telemetry workflows/scripts/validate-command-run-emit.sh
+telemetry workflows/scripts/validate-command-run-reconcile.sh
 telemetry workflows/scripts/validate-diagnose-queue-emit.sh
 telemetry workflows/scripts/validate-issue-touch-emit.sh
 telemetry workflows/scripts/validate-knowledge-search-emit.sh
 telemetry workflows/scripts/validate-resume-recovery-emit.sh
 telemetry workflows/scripts/telemetry-brief.sh
 telemetry workflows/scripts/tests/test_command_run_emit.sh
+telemetry workflows/scripts/tests/test_command_run_reconcile.sh
 # test_command_run_emit_epics.sh (temperloop item "epic-closing-gate", epic
 # #1847 (epic-as-metadata for operational work)) is the dedicated fixture
 # suite for the epics_reviewed/epics_closed/

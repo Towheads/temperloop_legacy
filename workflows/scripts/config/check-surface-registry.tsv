@@ -255,3 +255,50 @@ workflows/scripts/config/check-join-keys.sh	empty	covered	workflows/scripts/test
 workflows/scripts/check-workflow-script-size.sh	absent	covered	workflows/scripts/tests/test_workflow_script_size.sh	an absent workflows dir SKIPs explicitly rather than passing silently
 workflows/scripts/check-workflow-script-size.sh	unreadable	covered	workflows/scripts/tests/test_workflow_script_size.sh	an unreadable .mjs FAILS rather than measuring as zero bytes
 workflows/scripts/check-workflow-script-size.sh	empty	covered	workflows/scripts/tests/test_workflow_script_size.sh	an empty .mjs is measured, not skipped
+
+# -- validate-command-run-reconcile.sh (temperloop#2220: the command-run
+#    stream must reduce to exactly ONE record per run -- a property that
+#    breaks both by DUPLICATION and by SILENCE). Its inputs are the stream
+#    file(s) and the open ledger, both explicitly targetable (--stream /
+#    --open-dir), so all three degenerate shapes are real and covered. NOTE
+#    the one documented exit-0 case that is NOT a degenerate input: a
+#    DEFAULT-mode run finding no command-runs-*.jsonl at all. The lake is
+#    per-host and gitignored, so "this host has emitted nothing yet" is an
+#    expected state, not an unread input -- asserted in the same suite.
+workflows/scripts/validate-command-run-reconcile.sh	absent	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an absent explicitly-named stream: exit 1 (CANNOT EVALUATE), not 0
+workflows/scripts/validate-command-run-reconcile.sh	unreadable	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an unreadable explicitly-named stream: exit 1 (CANNOT EVALUATE), not 0
+workflows/scripts/validate-command-run-reconcile.sh	empty	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an empty explicitly-named stream: exit 1 (CANNOT EVALUATE), not 0
+
+# -- validate-command-run-reconcile.sh:--raw-dir (temperloop#2220 round 3,
+#    HIGH A). The rows above are all scoped to an explicitly-named STREAM
+#    FILE. The LAKE DIRECTORY is a second, independently-degenerate input
+#    surface -- and it carried the same fail-open one level up: the glob
+#    `"$raw_dir"/command-runs-*.jsonl` plus `[ -f "$f" ] || continue` folded
+#    "readable, no files", "unreadable", "absent" and "not a directory" into
+#    one empty file list, and the empty-list arm printed the sanctioned exit-0
+#    sentence over all four. A lake HOLDING A REAL RECORD, merely chmod 000,
+#    therefore asserted that this host had emitted no telemetry at all. The
+#    directory is now classified BEFORE the glob, and an EXPLICITLY-named lake
+#    (--raw-dir / $CMD_RUN_RAW_DIR) fails closed on all three shapes -- the
+#    same asymmetry --stream and --open-dir already implement. The exit-0
+#    exception noted above survives, narrowed to DEFAULT mode alone.
+workflows/scripts/validate-command-run-reconcile.sh:--raw-dir	absent	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an absent explicitly-named --raw-dir: exit 1 (CANNOT EVALUATE), not 0
+workflows/scripts/validate-command-run-reconcile.sh:--raw-dir	unreadable	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an UNREADABLE lake DIRECTORY: exit 1, never 'this host has emitted no telemetry yet'
+workflows/scripts/validate-command-run-reconcile.sh:--raw-dir	empty	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an explicitly-named lake holding no command-runs-*.jsonl: exit 1 (CANNOT EVALUATE), not 0
+
+# -- validate-command-run-reconcile.sh:--open-dir (temperloop#2220 round 4).
+#    The OPEN LEDGER is the THIRD directory surface of the same class, and it
+#    carried the same fail-open from this guard's first commit through three
+#    review rounds -- the tell that the CLASS, not any one surface, was what
+#    stayed open. `--open-dir` was validated for directory-ness ALONE while
+#    its own message claimed readability, and Check 1's loop was gated on a
+#    bare `[ -d ]`: a ledger that IS a directory but cannot be LISTED made
+#    the `*.json` glob fail to expand, `[ -f "$m" ] || continue` swallowed the
+#    unexpanded pattern, and an aged emitted=0 MISSING-RUN alarm sitting in
+#    that ledger became invisible while the guard printed its clean verdict.
+#    Both directory surfaces now share ONE classifier (classify_dir), so a
+#    fourth surface inherits the guard rather than repeating the bug.
+workflows/scripts/validate-command-run-reconcile.sh:--open-dir	absent	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an absent explicitly-named open-dir: exit 1 (CANNOT EVALUATE), not 0
+workflows/scripts/validate-command-run-reconcile.sh:--open-dir	unreadable	covered	workflows/scripts/tests/test_command_run_reconcile.sh	an UNREADABLE explicitly-named --open-dir: exit 1 (CANNOT EVALUATE), not 0
+workflows/scripts/validate-command-run-reconcile.sh:--open-dir	empty	not-applicable	-	an EMPTY open ledger is the HEALTHY steady state, not a degenerate input: a marker exists only between a run's --open and its terminal emit, so a present, readable ledger holding no markers means every run that opened has closed. Failing it would turn this guard red on every correctly-behaving host -- the inverse of the unread-input class. The two shapes that ARE unread inputs on this surface (absent-when-named, and present-but-unlistable) are covered above, and the positive assertion that an empty readable ledger stays exit 0 is asserted in the same suite.
+

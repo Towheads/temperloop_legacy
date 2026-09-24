@@ -83,6 +83,7 @@ workflows/scripts/validate-activation-registry.sh	top-level validator entrypoint
 workflows/scripts/validate-capture-backstop.sh	top-level validator entrypoint (workflows/scripts/validate-*.sh family) — human-runnable directly, matches its 15 siblings at mode 755
 workflows/scripts/validate-check-surface-degenerate-coverage.sh	top-level validator entrypoint (workflows/scripts/validate-*.sh family) — this item's own motivating instance: lost its bit in an incidental rebase mode-change, invisible to CI since scripts/quality-gates.sh invokes it via `bash` (temperloop#1326)
 workflows/scripts/validate-command-run-emit.sh	top-level validator entrypoint (workflows/scripts/validate-*.sh family) — human-runnable directly, matches its 15 siblings at mode 755
+workflows/scripts/validate-command-run-reconcile.sh	top-level validator entrypoint (workflows/scripts/validate-*.sh family) — human-runnable directly over a host lake (temperloop#2220), matches its siblings at mode 755
 workflows/scripts/validate-design-brief.sh	top-level validator entrypoint (workflows/scripts/validate-*.sh family) — human-runnable directly, matches its 15 siblings at mode 755
 workflows/scripts/validate-diagnose-queue-emit.sh	top-level validator entrypoint (workflows/scripts/validate-*.sh family) — human-runnable directly, matches its 15 siblings at mode 755
 workflows/scripts/validate-docs-footer.sh	top-level validator entrypoint (workflows/scripts/validate-*.sh family) — human-runnable directly, matches its 15 siblings at mode 755

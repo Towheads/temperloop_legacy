@@ -56,7 +56,9 @@ Reuse `/build` Step 0's probe verbatim. Run in parallel:
    - **`workflowBackgroundAvailable` (tier 2's activation condition (c)).** **Not statically probeable** — a permission-classifier refusal is decided at invocation time, and a probe that actually launched something would break `--dry-run`'s zero-mutation guarantee. Set it **`unknown`** here and let **first use determine it**: Step 2's tier-2 launch is the single determination point and its existing degradation notice is the consumer, and because a run makes **exactly one** background launch this can never become a per-chunk rediscovery. Naming the remedy up front is still Step 0's job — the notice above's remedy applies verbatim to the background arm. This is the half the live 2026-08-02 refusal actually hit (temperloop#1048).
    - Initialize the run-scoped **consecutive-refusal count** at zero. Step 3's refused-invocation disposition owns it.
 
-If any of checks 1–6 fails, surface in one line and stop; check 7's foreground arm stops with its own fuller notice, since a one-liner cannot carry the remedy that arm owes.
+8. **Open this run's telemetry ledger** (best-effort, `|| true`-safe, absent-checkout-safe — the opening half of Step 3.6B's emit, temperloop#2220 — stable command-run id). **Runs after item 2** — it needs `$BOARD`, exactly as item 5 runs after item 3 for `ownerRepo`: item 2 is where `$BOARD` is inferred when `--board` is omitted (the common case), each numbered item is typically its own Bash call with no persisted shell state, and an empty `$BOARD` here would key the marker WITHOUT a target while Step 3.6B's emit — by then holding a resolved board — computes the target-bearing key, adopts nothing, mints a second id, and strands this marker at `emitted=0` until it ages into a MISSING-RUN alarm that is FALSE. A guard that manufactures a wrong alarm is worse than one that stays quiet, so the ordering is load-bearing, not stylistic. `"$(git rev-parse --show-toplevel)/workflows/scripts/emit-command-run.sh" --open --command sweep --board "$BOARD" --target "$BOARD" || true`. ONE call, here, at the run's start. `--target` keys the ledger marker and MUST match Step 3.6B's emit — the board is `/sweep`'s run identity, so two boards swept concurrently from one session get their own marker and their own run id instead of collapsing onto one (temperloop#2220 round 2). It mints this run's stable `run_id` and records it in the open ledger, so the stream stays **reducible to exactly one record per run** in both directions: several records describing one run collapse on the shared id, and a run that emits **nothing at all** — the failure a duplicate-only guard walks straight past — leaves an un-emitted marker behind as its only trace. Step 3.6B's emit adopts the marker's id by itself; no id is carried between steps. A failure here is a no-op (the emit still writes a record, with a freshly minted id), so this never stalls a run. `workflows/scripts/validate-command-run-reconcile.sh` is the guard that reads both halves.
+
+If any of checks 1–6 fails, surface in one line and stop; check 7's foreground arm stops with its own fuller notice, since a one-liner cannot carry the remedy that arm owes. Item 8 (the telemetry ledger open) never stops a run.
 
 ## Step 1 — Build the singleton pool
 
@@ -364,7 +366,7 @@ Then, for **each distinct epic `#E` in this run's review population**:
 
 ```bash
 "$(git rev-parse --show-toplevel)/workflows/scripts/emit-command-run.sh" \
-  --command sweep --board "$BOARD" \
+  --command sweep --board "$BOARD" --target "$BOARD" \
   --items-processed <Phase-2 checklist size> \
   --merged <count of "merged" terminal dispositions> \
   --resolved <count of "resolved (verdict)" terminal dispositions> \

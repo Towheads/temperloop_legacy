@@ -54,6 +54,16 @@
 #      3.6A epic-closing gate (matched on BOTH the `epics_reviewed` field name
 #      and the `Step 3.6A` anchor) must pass `--epics-reviewed` on its emit
 #      call, so the signal is unconditional on the DOC side.
+#   6. (temperloop#2220 — stable command-run id) a caller doc no longer OPENS
+#      the run ledger at the run's start (`--open --command <cmd>`). Without
+#      it a park-then-merge run's two records share no run_id and the item is
+#      counted twice, and a run that emits nothing leaves no marker at all.
+#   7. (temperloop#2220 round 5) a doc's `--open` call interpolates a shell
+#      variable (`--board "$BOARD"` / `--target "$BOARD"`) without declaring
+#      the ORDERING dependency that makes it non-empty, or states the
+#      never-stops-a-run carve-out in wording the other docs do not share.
+#      See check_open_ordering below for why an empty `--target` is worse
+#      than a skipped check: it manufactures a FALSE MISSING-RUN alarm.
 #
 # This mirrors the validate-capture-backstop.sh shape (same script style, same
 # hard-fail-on-half-present contract, wired into scripts/quality-gates.sh
@@ -95,8 +105,14 @@ else
   elif ! grep -Fq 'disposition_total' "$EMIT_SCRIPT"; then
     echo "FAIL  emit-command-run.sh parses --resolved/--reported-no-op but no longer asserts merged + resolved + parked + reported_no_op == items_processed — a disposition added without a field would under-report silently again (temperloop#1084/#1103)"
     fail=1
+  elif ! grep -Eq -- '--run-id\)' "$EMIT_SCRIPT" || ! grep -Eq -- '--open\)' "$EMIT_SCRIPT"; then
+    echo "FAIL  emit-command-run.sh no longer parses --run-id / --open — the stable run id (temperloop#2220) is what makes a park-then-merge run reducible to ONE item instead of two, and the open ledger is the only trace a run that emitted nothing leaves behind"
+    fail=1
+  elif ! grep -Eq -- 'run_id: [$]run_id' "$EMIT_SCRIPT"; then
+    echo "FAIL  emit-command-run.sh parses --run-id/--open but no longer writes run_id into the record — the flags would be accepted and silently dropped, leaving every record unreducible (temperloop#2220)"
+    fail=1
   else
-    echo "ok    emit-command-run.sh parses --resolved / --reported-no-op and asserts the disposition sum"
+    echo "ok    emit-command-run.sh parses --resolved / --reported-no-op / --run-id / --open, asserts the disposition sum, and writes run_id"
   fi
 fi
 
@@ -185,9 +201,86 @@ check_epics_reviewed() {  # $1=label $2=path
   echo "ok    $label declares the Step 3.6A epic-closing gate and passes --epics-reviewed"
 }
 
+# --- 6. every caller doc must OPEN the run ledger (temperloop#2220) ---------
+# The terminal emit alone cannot make the stream reducible: a /fix run can emit
+# TWICE (park at the merge gate, merge after the operator approves, same run),
+# and a run that emits NOTHING leaves no trace at all. The `--open` call at the
+# run's start is what mints the stable run_id and records that the run started,
+# so dropping it silently re-opens BOTH failures — a double-counted item, and a
+# silent run no guard can see. Same presence-lint shape as check_wiring above.
+check_open_ledger() {  # $1=label $2=path $3=expected --command value
+  local label="$1" file="$2" cmdval="$3"
+  [ -f "$file" ] || return 0   # missing-doc case already reported by check_wiring
+  # ANCHOR ON A NON-`-` BOUNDARY, never `\b`. `\b` matches between `e` and
+  # `-`, so `--open --command triage-feedback` — a line triage.md legitimately
+  # carries — satisfied the presence check for `triage` all by itself: drop
+  # the main `/triage` open call entirely and this lint stayed green, which is
+  # the exact regression it exists to catch. A trailing space-or-end-of-line
+  # is what actually separates one --command value from a longer one.
+  if ! grep -E -- "--open[[:space:]]+--command[[:space:]]+${cmdval}([[:space:]]|$)" "$file" >/dev/null; then
+    echo "FAIL  $label ($file) no longer opens the run ledger — expected an \`emit-command-run.sh --open --command ${cmdval}\` call at the run's start. Without it a park-then-merge run's records carry no shared run_id (the item is counted twice), and a run that emits nothing leaves no marker for workflows/scripts/validate-command-run-reconcile.sh to catch (temperloop#2220)"
+    fail=1
+    return
+  fi
+  echo "ok    $label opens the run ledger (--open --command $cmdval)"
+}
+
+# --- 7. an --open call that INTERPOLATES a variable must declare its ordering
+# Content-derived, the same shape as the checks above: the trigger is the open
+# call passing a shell variable (`--board "$BOARD"` / `--target "$BOARD"`), not
+# this script knowing which docs do.
+#
+# WHY A LINT AND NOT A REVIEW NOTE (temperloop#2220). Each Step-0 item is
+# typically its own Bash call with no persisted shell state, and every one of
+# these docs computes `$BOARD` in an EARLIER numbered item of the SAME "Run in
+# parallel:" list. Under a literal reading, an open call with no ordering
+# call-out can therefore run with `$BOARD` still empty — and `--target` is the
+# load-bearing half of the ledger marker key. An empty one writes the marker
+# under the target-LESS key; the terminal emit, by then holding a resolved
+# board, computes the target-BEARING key, adopts nothing, and mints a second
+# id. The orphan is never pruned (`prune_spent_markers()` leaves `emitted=0`
+# alone, deliberately) and ages into a MISSING-RUN alarm that is FALSE. This
+# does not merely disable the guard: it manufactures a wrong alarm, which is
+# the worst failure available to a reconciliation signal — it teaches the
+# reader to ignore it. The convention already exists in these same files
+# ("Runs **after** item 3 (it needs `ownerRepo`)"); this makes it mechanical.
+#
+# Also asserts the CARVE-OUT WORDING is the same sentence in all three docs: a
+# best-effort step stated three different ways invites an executor to treat
+# one of them as blocking.
+check_open_ordering() {  # $1=label $2=path $3=expected --command value
+  local label="$1" file="$2" cmdval="$3" line
+  [ -f "$file" ] || return 0   # missing-doc case already reported by check_wiring
+  line="$(grep -E -- "--open[[:space:]]+--command[[:space:]]+${cmdval}([[:space:]]|$)" "$file" | head -1)"
+  if [ -z "$line" ]; then
+    return 0                   # absent open call already reported by check_open_ledger
+  fi
+  if printf '%s' "$line" | grep -E -q -- '--(board|target)[[:space:]]+"\$'; then
+    if ! printf '%s' "$line" | grep -E -q 'Runs[[:space:]]+\*{0,2}after\*{0,2}[[:space:]]+item[[:space:]]+[0-9]'; then
+      echo "FAIL  $label ($file) opens the run ledger with a shell variable (--board/--target \"\$…\") but the item carries no ordering call-out. Add the convention this repo already uses for a cross-item data dependency inside a 'Run in parallel:' list — \"Runs after item N — it needs \\\`\$BOARD\\\`\". Without it the open call can run before the board is inferred, keying the marker WITHOUT a target while the terminal emit keys it WITH one: the emit adopts nothing, mints a second run id, and the orphaned emitted=0 marker ages into a MISSING-RUN alarm that is FALSE (temperloop#2220)"
+      fail=1
+      return
+    fi
+  fi
+  if ! grep -Fq '(the telemetry ledger open) never stops a run' "$file"; then
+    echo "FAIL  $label ($file) opens the run ledger but does not carry the shared carve-out sentence '<item> (the telemetry ledger open) never stops a run' — the best-effort status of this step must read the same in every caller doc, or an executor will treat one doc's open call as a blocking Step-0 check (temperloop#2220)"
+    fail=1
+    return
+  fi
+  echo "ok    $label declares the open call's ordering dependency and the shared never-stops-a-run carve-out"
+}
+
 check_wiring "sweep.md"  "$SWEEP_MD"  "sweep"
 check_wiring "triage.md" "$TRIAGE_MD" "triage"
 check_wiring "fix.md"    "$FIX_MD"    "fix"
+
+check_open_ledger "sweep.md"  "$SWEEP_MD"  "sweep"
+check_open_ledger "triage.md" "$TRIAGE_MD" "triage"
+check_open_ledger "fix.md"    "$FIX_MD"    "fix"
+
+check_open_ordering "sweep.md"  "$SWEEP_MD"  "sweep"
+check_open_ordering "triage.md" "$TRIAGE_MD" "triage"
+check_open_ordering "fix.md"    "$FIX_MD"    "fix"
 
 check_resolved "sweep.md"  "$SWEEP_MD"
 check_resolved "triage.md" "$TRIAGE_MD"
