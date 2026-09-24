@@ -112,9 +112,15 @@ append-only and is **never** backfilled), so the reconciliation happens at READ
 time:
 
 ```sh
-# the canonical reduction — exactly one record per run, last write wins
-jq -s -c 'group_by(.run_id // "legacy:\(input_line_number)")
-          | map(sort_by(.ts) | last)' meta/data/raw/command-runs-*.jsonl
+# the canonical reduction — exactly one record per run, last write wins.
+# A run_id-less (pre-#2220) record keys on its own position, so it reduces as
+# its OWN singleton run rather than collapsing with every other legacy line.
+# (`input_line_number` does NOT work here: under -s it is the last line read,
+# so every legacy record would share one key and silently merge.)
+jq -s -c 'to_entries
+          | map(.value + {_k: (.value.run_id // "legacy:\(.key)")})
+          | group_by(._k)
+          | map(sort_by(.ts) | last | del(._k))' meta/data/raw/command-runs-*.jsonl
 ```
 
 `workflows/scripts/validate-command-run-reconcile.sh` is both the reference

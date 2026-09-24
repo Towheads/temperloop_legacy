@@ -102,6 +102,32 @@ else
   bad "FIXED: the superseded park line is preserved verbatim" "the park record was rewritten"
 fi
 
+# 1c. The README's OWN documented reduction snippet is executed, not trusted.
+#     A consumer copies that jq one-liner; if it does not reduce the way the
+#     prose claims, the documentation is the defect. (The first cut of it used
+#     `input_line_number` under `-s`, which is the LAST line read — every
+#     legacy record would have shared one key and silently merged.)
+snippet="$(awk '
+  /^```sh$/ { inb = 1; buf = ""; next }
+  inb && /^```$/ { if (buf ~ /canonical reduction/) { printf "%s", buf; exit } inb = 0; next }
+  inb { buf = buf $0 "\n" }' "$README")"
+if [ -z "$snippet" ]; then
+  bad "the README's canonical reduction snippet is extractable" "no fenced sh block mentioning 'canonical reduction'"
+else
+  ok "the README's canonical reduction snippet is extractable"
+  run_snippet() { # <lake-file> → the snippet's output
+    printf '%s' "$snippet" \
+      | sed "s#meta/data/raw/command-runs-\\*\\.jsonl#$1#" \
+      | bash 2>&1
+  }
+  check_eq "the README snippet reduces the FIXED pair to one run (as the prose claims)" \
+    "1" "$(run_snippet "$L2/command-runs-2026-09.jsonl" | jq -r 'length')"
+  check_eq "the README snippet keeps each legacy record its OWN singleton run" \
+    "2" "$(run_snippet "$L1/command-runs-2026-09.jsonl" | jq -r 'length')"
+  check_eq "and agrees with the guard's own --reduce on the same lake" \
+    "1" "$(run_snippet "$L2/command-runs-2026-09.jsonl" | jq -r '.[0].merged')"
+fi
+
 echo "── 2. end-to-end: --open → park emit → merge emit, through the real script ──"
 E2E="$TMP/e2e"; mkdir -p "$E2E"
 RID="$(CMD_RUN_RAW_DIR="$E2E" CLAUDE_CODE_SESSION_ID=sess-e2e bash "$EMIT" --open --command fix --board 7 2>/dev/null)"
