@@ -147,7 +147,7 @@ fresh_cache() { export CACHE_STORE_ROOT="$TMP/cache-$1"; }
 BOARD=4          # Towheads/foundation, per board.sh's built-in map
 REPO="Towheads/foundation"
 
-declare -F _sg_reconcile >/dev/null || fail "_sg_reconcile seam missing — soak has no independent reconcile.sh invocation point"
+command -v _sg_reconcile >/dev/null || fail "_sg_reconcile seam missing — soak has no independent reconcile.sh invocation point"
 echo "PASS: state-graph.sh defines the _sg_reconcile seam (mirrors _sg_git/_sg_tmux)"
 
 # A small accessor: read one class's field out of a soak run record.

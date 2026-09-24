@@ -157,7 +157,7 @@ testbed_source__fn() {
 # unknown-backend guard).
 testbed_source__require() {
   local fn="$1" kind="$2" op="$3"
-  if ! declare -F "$fn" >/dev/null 2>&1; then
+  if ! command -v "$fn" >/dev/null 2>&1; then
     printf 'testbed-source: provider "%s" does not implement "%s" (no %s defined)\n' \
       "$kind" "$op" "$fn" >&2
     return 2

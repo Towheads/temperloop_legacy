@@ -375,7 +375,7 @@ RETRO_JUDGE_SPAWN="$HERE/pipeline-retro-judge-spawn.sh"
 # better, never to make the missing-adapter case strictly WORSE (whole-tick abort).
 # Fix, two parts: (1) attribute the true cause LOUDLY, here, at the source, instead of
 # leaving it to surface as a 127 with no context; (2) each call site below is guarded
-# with `declare -F` (exactly PIPELINE_UNCLAIM_BIN's existing "if the optional binary
+# with `command -v` (exactly PIPELINE_UNCLAIM_BIN's existing "if the optional binary
 # resolved, use it" idiom, ~line 884) so a missing adapter degrades to the PRE-#795
 # behavior (the label add may still swallow a "no such label" error, but the TICK
 # ITSELF keeps running) rather than crashing every item in the tick.
@@ -789,9 +789,9 @@ _route_refused() {  # $1 = merge_result blob
     # makes the add below a swallowed no-op (see the point-of-use comment above
     # PIPELINE_MERGE_PENDING_LABEL's default). color/desc match the onboarding
     # prose this call replaces (formerly build.config.sh's manual `gh label create`).
-    # `declare -F` guard (#801): a missing board.sh (see the top-of-file WARNING)
+    # `command -v` guard (#801): a missing board.sh (see the top-of-file WARNING)
     # leaves this function undefined — degrade to pre-#795 behavior, never a 127.
-    declare -F _board_issues_ensure_label >/dev/null 2>&1 && _board_issues_ensure_label \
+    command -v _board_issues_ensure_label >/dev/null 2>&1 && _board_issues_ensure_label \
       "$repo" "$PIPELINE_ESCALATED_LABEL" "fbca04" \
       "Pipeline 5c: stuck code item (route-refused / red CI) — needs your manual merge or close"
     _gh_sideeffect route "$issue" "$repo" issue edit "$issue" -R "$repo" \
@@ -905,9 +905,9 @@ _escalate_stuck_pr() {  # $1=repo  $2=issue  $3=pr
   # point-of-use comment above PIPELINE_MERGE_PENDING_LABEL's default). No
   # matching ensure for the --remove-label below — removing an absent/missing
   # label is a harmless no-op, unlike a swallowed add.
-  # `declare -F` guard (#801): degrade to pre-#795 behavior if board.sh is missing,
+  # `command -v` guard (#801): degrade to pre-#795 behavior if board.sh is missing,
   # never a 127 (see the top-of-file WARNING).
-  declare -F _board_issues_ensure_label >/dev/null 2>&1 && _board_issues_ensure_label \
+  command -v _board_issues_ensure_label >/dev/null 2>&1 && _board_issues_ensure_label \
     "$repo" "$PIPELINE_ESCALATED_LABEL" "fbca04" \
     "Pipeline 5c: stuck code item (route-refused / red CI) — needs your manual merge or close"
   _gh_sideeffect escalate "$issue" "$repo" issue edit "$issue" -R "$repo" \
@@ -964,9 +964,9 @@ _record_handoff() {  # $1 = merge_result blob
     # belt-and-suspenders that prevents the duplicate even when this label is lost.
     # temperloop#795: ensure the label EXISTS first — a missing label is exactly the
     # "FAILED hand-off label" case the comment above just named, silently.
-    # `declare -F` guard (#801): degrade to pre-#795 behavior if board.sh is missing,
+    # `command -v` guard (#801): degrade to pre-#795 behavior if board.sh is missing,
     # never a 127 (see the top-of-file WARNING).
-    declare -F _board_issues_ensure_label >/dev/null 2>&1 && _board_issues_ensure_label \
+    command -v _board_issues_ensure_label >/dev/null 2>&1 && _board_issues_ensure_label \
       "$repo" "$PIPELINE_MERGE_PENDING_LABEL" "fbca04" \
       "Pipeline 5c: PR open, session ended pre-merge — resume next tick"
     _gh_sideeffect handoff "$issue" "$repo" issue edit "$issue" -R "$repo" \

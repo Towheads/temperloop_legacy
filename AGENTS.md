@@ -77,6 +77,25 @@ to move a noisy caller onto: a drain has to be fixed at its source. See
 `docs/failure-modes/02-rest-budget-exhaustion.md` for the worked example of
 exactly that trap.
 
+### Shell-dialect rules
+
+These libs are **sourced into the agent's shell**, not just executed, and on
+macOS that shell is **zsh** — a `#!/usr/bin/env bash` shebang does not protect
+a sourced file. So a capability probe must be POSIX:
+
+```sh
+command -v some_fn >/dev/null 2>&1     # correct in bash AND zsh
+declare -F some_fn >/dev/null 2>&1     # WRONG — always true under zsh
+```
+
+zsh implements `declare` as `typeset`, whose `-F` means "float with N digits",
+so `declare -F <absent-name>` **exits 0** and the fallback written beneath the
+guard becomes unreachable. `type -t` is bash-only in the same way. That defect
+killed the first board call of a `/triage` run twice (#1776). Need strictly
+"is a function"? `typeset -f <name>` is portable. `scripts/lint-shell-dialect-probe.sh`
+(a `checks` gate) fails on a re-introduction; a line that must carry the shape
+as data opts out with a `shell-dialect-probe:exempt — <why>` pragma.
+
 ### Quality gates
 
 `scripts/quality-gates.sh` is the single source of truth for this repo's

@@ -55,7 +55,7 @@ if board_repo 9 >/dev/null 2>&1; then fail "board_repo 9 should fail (unmapped, 
 # board_project_number was REMOVED with the Projects-v2 arm (ADR 0004). Assert
 # it is genuinely gone rather than merely unused, so it cannot silently
 # reappear as a vestigial resolver nothing calls.
-if declare -F board_project_number >/dev/null 2>&1; then
+if command -v board_project_number >/dev/null 2>&1; then
   fail "board_project_number must NOT exist — it was removed with the Projects-v2 arm (ADR 0004)"
 fi
 

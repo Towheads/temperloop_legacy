@@ -115,7 +115,7 @@ eval_guard_exit_if_eval
 
 # Fail open when the seam never got sourced (a hooks-only vendor drop with no
 # workflows/scripts/lib/ two directories up). Stubs are left in place.
-if ! declare -F ks_write >/dev/null 2>&1; then
+if ! command -v ks_write >/dev/null 2>&1; then
   log "knowledge_store seam unavailable (KS_LIB_DIR='$KS_LIB_DIR') — skipping drain"
   exit 0
 fi
@@ -151,7 +151,7 @@ _add_store_root() {
   STORE_ROOTS+=("$root")
 }
 
-if declare -F ks_root >/dev/null 2>&1; then
+if command -v ks_root >/dev/null 2>&1; then
   _add_store_root "$(ks_root 2>/dev/null || true)"
 fi
 

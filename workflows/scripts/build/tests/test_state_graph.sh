@@ -90,7 +90,7 @@ BOARD=4          # Towheads/foundation, per board.sh's built-in map
 REPO="Towheads/foundation"
 
 # Confirm the shared fixture system is live.
-declare -F _board_gh >/dev/null || fail "board.sh not sourced — shared fixture system missing"
+command -v _board_gh >/dev/null || fail "board.sh not sourced — shared fixture system missing"
 echo "PASS: state-graph.sh sources board.sh — one shared fixture system (_board_gh in scope)"
 
 # =============================================================================

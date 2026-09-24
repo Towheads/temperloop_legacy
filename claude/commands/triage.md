@@ -247,7 +247,7 @@ All board bash blocks below `source "$BOARD_LIB"` first (Step 0.3); let `repo="$
    **8b — Apply the write, for `CULL` candidates only.**
    ```bash
    gh issue comment <n> -R "$repo" --body "<reason>"
-   if declare -F board_close_done >/dev/null 2>&1; then
+   if command -v board_close_done >/dev/null 2>&1; then
      board_close_done "$BOARD" <n>
    else
      board_resolve_item "$BOARD" <n> >/dev/null && board_set_status "$(board_item_id <n>)" "$BOARD_OPT_DONE"
@@ -267,7 +267,7 @@ All board bash blocks below `source "$BOARD_LIB"` first (Step 0.3); let `repo="$
 
    **9b — Guard the writer itself, not only the cycle check — and never fall back to raw REST.** `board_blocked_by_add` (foundation#1221) is a newer adapter helper than the `board_blocked_by_open` reader every board vendors, so a checkout whose `board.sh` predates it has the reader but not the writer:
    ```bash
-   if ! declare -F board_blocked_by_add >/dev/null 2>&1; then
+   if ! command -v board_blocked_by_add >/dev/null 2>&1; then
      echo "edge-stamping skipped — board_blocked_by_add unavailable (stale vendored board.sh; sync the toolkit to pick up foundation#1221) — no edges written this run, no edges-considered marker posted"
      exit 0
    elif [ ! -x "$CYCLE_CHECK" ]; then
@@ -505,7 +505,7 @@ Offer, per item:
 - **Close it** → the escalation is obsolete/abandoned. **Close the PR too, not just the issue:** `gh pr close <pr> -R "$repo" --comment "<reason>"` *then*, comment-first, land the issue Done:
   ```bash
   gh issue comment <n> -R "$repo" --body "<reason>"
-  if declare -F board_close_done >/dev/null 2>&1; then
+  if command -v board_close_done >/dev/null 2>&1; then
     board_close_done "$BOARD" <n>
   else
     board_resolve_item "$BOARD" <n> >/dev/null && board_set_status "$(board_item_id <n>)" "$BOARD_OPT_DONE"

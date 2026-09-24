@@ -822,7 +822,7 @@ echo "=== Lens 3: the live-read guarantee (reconcile.sh must never read a cache)
 # so there is no longer a TTL to pin — but the GUARANTEE still matters, and it is
 # now STRUCTURAL: the only cache that can sit in front of a board read is the
 # issue-corpus store in lib/cache.sh, and board.sh consults it ONLY when the
-# calling process has itself sourced that file (the `declare -F cache_read`
+# calling process has itself sourced that file (the `command -v cache_read`
 # probe in _board_issues_item_list). reconcile.sh never sources it, so the read
 # is live no matter what a shared boards.conf says.
 #
@@ -834,7 +834,7 @@ echo "=== Lens 3: the live-read guarantee (reconcile.sh must never read a cache)
 # (a) STRUCTURAL: cache_read must not be in scope after sourcing reconcile.sh.
 # If a future change makes reconcile.sh source lib/cache.sh, this fails — which
 # is exactly the review moment the guarantee needs.
-if declare -F cache_read >/dev/null 2>&1; then
+if command -v cache_read >/dev/null 2>&1; then
   fail "live-read: reconcile.sh must NOT bring cache_read into scope — a drift detector must never read a cache (see reconcile.sh's live-read comment)"
 fi
 

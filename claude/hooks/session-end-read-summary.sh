@@ -71,7 +71,7 @@ if [ -n "$KS_LIB_DIR" ] && [ -f "$KS_LIB_DIR/knowledge_store.sh" ]; then
   # shellcheck source=/dev/null
   . "$KS_LIB_DIR/knowledge_store.sh"
 fi
-declare -F _ks_read_log_path >/dev/null 2>&1 || exit 0
+command -v _ks_read_log_path >/dev/null 2>&1 || exit 0
 
 LOG="$(_ks_read_log_path 2>/dev/null)"
 [ -n "$LOG" ] && [ -f "$LOG" ] && [ -r "$LOG" ] || exit 0

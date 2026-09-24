@@ -1151,7 +1151,7 @@ N_CREATES="$(grep -cx 'label create funnel-escalated -R Towheads/stageFind --col
 # │ never become STRICTLY WORSE (whole-tick abort) just because the adapter       │
 # │ itself is unavailable. Fixed: (1) PIPELINE_BOARD_LIB (the test-double seam,   │
 # │ mirrors PIPELINE_UNCLAIM_BIN) WARNS loudly and attributes the true cause      │
-# │ when board.sh is missing; (2) each of the three call sites is `declare -F`-   │
+# │ when board.sh is missing; (2) each of the three call sites is `command -v`-   │
 # │ guarded (PIPELINE_UNCLAIM_BIN's own "if the optional dependency resolved"     │
 # │ idiom) to degrade to the pre-#795 behavior instead of crashing.               │
 # ╰──────────────────────────────────────────────────────────────────────────╯
@@ -1174,7 +1174,7 @@ grep -qF 'WARNING: pipeline-drive.sh: board adapter not found' "$C42F/stderr.txt
   || bad "t42f.warning" "got $(cat "$C42F/stderr.txt" 2>/dev/null || echo none)"
 grep -qiF 'command not found' "$C42F/stderr.txt" \
   && bad "t42f.no127" "a 'command not found' 127 leaked to stderr — the guard did not hold" \
-  || ok "no 'command not found' 127 on stderr (the declare -F guard held)"
+  || ok "no 'command not found' 127 on stderr (the command -v guard held)"
 # Pre-#795 behavior restored: NO label-create call was made (adapter unavailable),
 # but the add-label edit still fires exactly as it did before #795 existed.
 grep -qx 'label create funnel-merge-pending -R Towheads/stageFind --color fbca04 --description Pipeline 5c: PR open, session ended pre-merge — resume next tick' "$C42F/gh-calls.txt" 2>/dev/null \

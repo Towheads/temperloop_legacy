@@ -668,7 +668,7 @@ check_bm_tool_install() {
     # A kernel checkout older than #1113 has no install seam to drive. Report
     # that plainly rather than failing — this file is also read by vendored
     # trees that pull the kernel forward at their own pace.
-    if ! declare -F _ks_bm_ensure_tool >/dev/null 2>&1; then
+    if ! command -v _ks_bm_ensure_tool >/dev/null 2>&1; then
       printf '  SKIPPED (this knowledge_search.sh predates the uv-tool install seam)\n'
       exit 0
     fi

@@ -245,7 +245,7 @@ if [ -f "$SPEC" ]; then
     fail "case 12: claude/commands/triage.md carries no board_blocked_by_add call — the edge-stamping sub-step is missing"
   # Guarded-helper degradation: a stale adapter must be a documented no-op
   # that posts NO edges-considered marker — not a raw-REST fallback.
-  grep -F 'declare -F board_blocked_by_add' "$SPEC" >/dev/null ||
+  grep -F 'command -v board_blocked_by_add' "$SPEC" >/dev/null ||
     fail "case 12: the edge-stamping sub-step doesn't guard on board_blocked_by_add's presence — it would crash 'command not found' on a stale adapter instead of degrading"
   grep -F 'no edges-considered marker posted' "$SPEC" >/dev/null ||
     fail "case 12: the stale-adapter degradation doesn't say the marker is withheld — a false all-clear could reach sweep's admission gate"

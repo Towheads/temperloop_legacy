@@ -14,7 +14,7 @@
 # file is only useful where an adopter has stood up the daemon.
 #
 # ── Registration (extends via the dispatch seam — no core edit) ────────────
-# knowledge_search.sh dispatches backends by `declare -F` on
+# knowledge_search.sh dispatches backends by `command -v` on
 # `_ks_search_backend_<name>_<op>`. This file registers a NEW backend named
 # "basic-memory-mcp" purely by DEFINING those functions, so it extends the
 # adapter without modifying knowledge_search.sh. It MUST be sourced AFTER

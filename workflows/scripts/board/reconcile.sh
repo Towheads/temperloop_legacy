@@ -450,7 +450,7 @@ source "$SCRIPT_DIR/lib/claim_marker.sh"
 # board.sh's issues-only whole-board read is a live `gh issue list` unless a
 # caller has BOTH set `board.<N>.cache=on` AND sourced `lib/cache.sh` in the
 # same process — and this script never sources cache.sh, so the
-# `declare -F cache_read` probe in `_board_issues_item_list` always fails here
+# `command -v cache_read` probe in `_board_issues_item_list` always fails here
 # and the read stays live no matter what a shared `boards.conf` says.
 #
 # THAT IS THE CONTRACT, AND IT IS LOAD-BEARING: reconcile.sh must never source
@@ -1233,7 +1233,7 @@ _reconcile_pending_decisions_doc() {
     echo "reconcile.sh: $what — failed to source knowledge_store.sh; skipping pending-decision append" >&2
     return 1
   }
-  if ! declare -F ks_append >/dev/null 2>&1; then
+  if ! command -v ks_append >/dev/null 2>&1; then
     echo "reconcile.sh: $what — ks_append unavailable after sourcing knowledge_store.sh; skipping pending-decision append" >&2
     return 1
   fi

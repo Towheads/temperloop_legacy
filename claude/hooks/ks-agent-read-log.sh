@@ -110,7 +110,7 @@ ks_lib="$repo_root/workflows/scripts/lib/knowledge_store.sh"
 [ -f "$ks_lib" ] || exit 0
 # shellcheck source=/dev/null
 . "$ks_lib" || exit 0
-declare -F ks__read_log_emit >/dev/null 2>&1 || exit 0
+command -v ks__read_log_emit >/dev/null 2>&1 || exit 0
 
 # ── Transport matcher check (the config seam) ──────────────────────────
 matched=0

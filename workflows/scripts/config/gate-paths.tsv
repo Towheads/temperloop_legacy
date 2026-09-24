@@ -525,6 +525,15 @@ bash scripts/tests/test_lint_bash32_ctlesc_ifs.sh	scripts/lint-bash32-ctlesc-ifs
 bash scripts/lint-argloop-shift2.sh	*.sh bin/** .temperloop/** workflows/scripts/report-producers/**
 bash scripts/tests/test_lint_argloop_shift2.sh	scripts/lint-argloop-shift2.sh scripts/tests/test_lint_argloop_shift2.sh
 bash workflows/scripts/tests/test_argloop_trailing_flag.sh	*.sh bin/** .temperloop/** workflows/scripts/report-producers/**
+# The shell-dialect capability-probe lint (temperloop#1776) reads the same WHOLE
+# tracked shell set as its siblings, PLUS claude/commands/*.md: a command spec's
+# fenced snippets are pasted verbatim into the agent's (zsh) Bash tool, so a spec
+# is an execution surface for this bug, not just prose about it. The board suite
+# is the behavioral half — it sources board.sh under bash AND zsh, so board.sh,
+# lib/cache.sh and boards.conf all select it.
+bash scripts/lint-shell-dialect-probe.sh	*.sh bin/** .temperloop/** workflows/scripts/report-producers/** claude/commands/*.md
+bash scripts/tests/test_lint_shell_dialect_probe.sh	scripts/lint-shell-dialect-probe.sh scripts/tests/test_lint_shell_dialect_probe.sh scripts/quality-gates.sh workflows/scripts/board/lib/board.sh
+bash workflows/scripts/board/tests/test_capability_probe_shell_dialect.sh	workflows/scripts/board/lib/board.sh workflows/scripts/board/lib/cache.sh workflows/scripts/board/boards.conf.example workflows/scripts/board/tests/test_capability_probe_shell_dialect.sh
 # `make shellcheck` is scripts/shellcheck-tree.sh since temperloop#2164 (the
 # bounded fan-out that replaced the serial `xargs` pass), so a change to the
 # runner itself must select the gate as well as a change to any linted *.sh.

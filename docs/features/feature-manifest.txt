@@ -537,6 +537,16 @@ quality-gates scripts/tests/test_lint_bash32_ctlesc_ifs.sh
 quality-gates scripts/lint-argloop-shift2.sh
 quality-gates scripts/tests/test_lint_argloop_shift2.sh
 quality-gates workflows/scripts/tests/test_argloop_trailing_flag.sh
+# Shell-dialect capability-probe lint + its suite (temperloop#1776) — fifth
+# member of the same family, textual for the same reason: `declare -F <name>`
+# is valid bash that shellcheck and `bash -n` both accept and that WORKS on the
+# ubuntu bash pre-merge leg, while under zsh `declare` is `typeset` and `-F`
+# means "float with N digits", so the probe always succeeds and the fallback
+# beneath it is unreachable. The command specs mandate sourcing these libs into
+# the agent's shell, which is zsh on macOS, so the guard is inverted on the
+# primary path — it killed the first board call of a /triage run twice.
+quality-gates scripts/lint-shell-dialect-probe.sh
+quality-gates scripts/tests/test_lint_shell_dialect_probe.sh
 quality-gates scripts/ensure-shellcheck.sh
 quality-gates scripts/tests/test_ensure_shellcheck.sh
 # Whole-tree shell lint runner (temperloop#2164) — `make shellcheck` is a

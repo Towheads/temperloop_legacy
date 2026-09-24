@@ -38,7 +38,7 @@ SCRIPT_DIR="$(cd -P "$(dirname "$src")" && pwd)"
 source "$SCRIPT_DIR/lib/board.sh"
 
 # Issue-plane read cache (F#988). board.sh's cached read arms gate on
-# `declare -F cache_read` and board.sh NEVER sources cache.sh itself — a
+# `command -v cache_read` and board.sh NEVER sources cache.sh itself — a
 # deliberate one-way layering (board.sh:521-526) that keeps reconcile.sh
 # permanently on the live arm. So the CALLER must source it, or the axis
 # `board.<N>.cache=on` is inert here and every read takes the live path with a

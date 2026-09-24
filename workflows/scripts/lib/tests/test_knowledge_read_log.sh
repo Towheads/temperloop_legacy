@@ -424,7 +424,7 @@ echo "PASS: 15 a backend error still logs exactly one read-log line, with mode=e
 
 # --- 16. the WARM basic-memory-mcp backend logs outcome fields too -----------
 # ks_search is the ONE entrypoint both backends share (knowledge_search_mcp.sh
-# registers "basic-memory-mcp" purely via the declare -F dispatch seam, no
+# registers "basic-memory-mcp" purely via the command -v dispatch seam, no
 # separate read-log call site — see validate-knowledge-search-emit.sh). Point
 # the daemon URL at a closed port so the warm path fails fast into its
 # documented fail-open delegation to the cold CLI backend (the OUT_TMP fake

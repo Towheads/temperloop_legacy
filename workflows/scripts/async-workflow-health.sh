@@ -113,7 +113,10 @@ if [ -f "$here/lib/portable-timeout.sh" ]; then
   # shellcheck disable=SC1091
   . "$here/lib/portable-timeout.sh" || true
 fi
-if ! command -v run_with_timeout >/dev/null 2>&1 && ! declare -F run_with_timeout >/dev/null 2>&1; then
+# `command -v` alone: POSIX, and already true for a FUNCTION as well as a
+# binary. The `declare -F` half this used to carry was bash-only (temperloop#1776
+# — under zsh `declare -F` succeeds for an undefined name), and redundant besides.
+if ! command -v run_with_timeout >/dev/null 2>&1; then
   run_with_timeout() { shift; "$@"; }
 fi
 case "$ASYNC_WORKFLOW_GH_TIMEOUT" in

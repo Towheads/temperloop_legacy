@@ -553,7 +553,7 @@ FAKE_GH_EOF
   for kind in mirror-from-repo materialize-from-seed; do
     for op in describe preflight_checks produce_git produce_issues; do
       fn="$(testbed_source__fn "$kind" "$op")"
-      declare -F "$fn" >/dev/null 2>&1 || fail "G2: provider $kind does not implement $op (no $fn)"
+      command -v "$fn" >/dev/null 2>&1 || fail "G2: provider $kind does not implement $op (no $fn)"
     done
   done
   echo "PASS: G2 both providers implement all four seam ops and resolve through the same dispatch"

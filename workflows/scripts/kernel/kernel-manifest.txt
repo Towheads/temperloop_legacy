@@ -93,6 +93,7 @@ kernel scripts/lint-bash32-cmdsubst-comment.sh
 kernel scripts/lint-pipe-grep-q.sh
 kernel scripts/lint-bash32-ctlesc-ifs.sh
 kernel scripts/lint-argloop-shift2.sh
+kernel scripts/lint-shell-dialect-probe.sh
 kernel scripts/update-kernel.sh
 kernel scripts/assemble-changelog.sh
 kernel scripts/ensure-shellcheck.sh

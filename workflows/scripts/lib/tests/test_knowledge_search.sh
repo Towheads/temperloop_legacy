@@ -1245,10 +1245,10 @@ echo "PASS: 17g the backend rejects a scope flag it does not implement instead o
 # 17h. the capability probe exists, so a caller can tell a library that HONOURS
 # the scope from a pre-#418 one that would silently ignore it (the one skew the
 # adapter cannot close from inside).
-declare -F ks_search_partition_supported >/dev/null \
+command -v ks_search_partition_supported >/dev/null \
   || fail "17h: ks_search_partition_supported must be defined as the version-skew probe"
 ks_search_partition_supported || fail "17h: ks_search_partition_supported should exit 0 on this library"
-echo "PASS: 17h ks_search_partition_supported is the declare -F version-skew probe for scope support"
+echo "PASS: 17h ks_search_partition_supported is the command -v version-skew probe for scope support"
 
 # --- 17i. the filter itself fails CLOSED --------------------------------------
 # If the filter cannot run at all (no jq), it must yield NOTHING and a non-zero

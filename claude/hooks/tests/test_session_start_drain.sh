@@ -208,7 +208,7 @@ fi
 # ---------------------------------------------------------------------------
 # 8. Seam UNAVAILABLE — the hook FAILS OPEN (temperloop#1634; "Covers" item 6).
 #    Every case above hands the hook a fixture carrying both knowledge_store
-#    libs, so the `declare -F ks_write` guard could never be reached. Here the
+#    libs, so the `command -v ks_write` guard could never be reached. Here the
 #    fixture's whole workflows/ tree is removed after make_fixture, which is
 #    the shape a hooks-only vendor drop actually has: claude/hooks/ present,
 #    nothing two directories up. KS_LIB_DIR is already pinned EMPTY by
