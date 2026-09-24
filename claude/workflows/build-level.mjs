@@ -2595,6 +2595,76 @@ function escalate(slug, kind, payload) {
   };
 }
 
+// ── escalationResumableState / stampClaimDisposition — temperloop#2230 ───────
+// The board claim is the CROSS-SESSION LOCK, so it must never read `Ready`
+// while this run still holds the disk state a continuation would resume under:
+// a second session pulls the item, builds `build/<slug>` beside the held
+// `build/<slug>@baseline`/`@candidate` (DIFFERENT names, so git refuses
+// nothing) and two sessions drive one issue. CLAUDE.md § Task workflow's
+// `Claim held until Done` already governs that shape — an item still being
+// driven, waiting on one operator verdict, keeps its claim HELD.
+//
+// The distinction is a FACT read off the escalation's OWN payload, never its
+// KIND. Deciding on a kind-name is the error in both directions (the sibling
+// defect temperloop#2249 maps a ci-poll machinery ERROR onto `ci-failed`), and
+// a fact means a future held-state escalation inherits the hold by DECLARING
+// retention — nothing is added to a list. The three declarations, and the one
+// negative reading:
+//   (a) `worktrees_intact[]` — driveLevelPick names every held arm worktree.
+//   (b) `worktree_left_intact: true` — the quota-death record's own statement
+//       that the escalation cleaned up nothing.
+//   (c) `committed_work` — preserveOnEscalation's record (temperloop#2020). Its
+//       ONE reading that means nothing is held is the no-worktree skip; every
+//       other outcome means a worktree is still on disk, or that the reading
+//       could not be established — and an UNESTABLISHED reading holds, because
+//       holding a lock too long is recoverable and releasing it early is not.
+// An escalation that declares none of the three — an arm failure with nothing
+// held, a pre-3b claim conflict — releases exactly as before.
+const CLAIM_HOLD = 'hold';
+const CLAIM_RELEASE = 'release';
+
+function escalationResumableState(esc) {
+  const payload = (esc && esc.payload) || {};
+  const evidence = [];
+  const held = Array.isArray(payload.worktrees_intact) ? payload.worktrees_intact : [];
+  for (const w of held) {
+    const at = w && (w.worktree || w.path);
+    evidence.push({
+      fact: 'worktrees_intact',
+      at: at ? String(at) : null,
+      branch: w && w.branch ? String(w.branch) : null,
+    });
+  }
+  if (payload.worktree_left_intact === true) {
+    evidence.push({
+      fact: 'worktree_left_intact',
+      at: payload.worktree ? String(payload.worktree) : null,
+      branch: null,
+    });
+  }
+  const cw = payload.committed_work;
+  const noWorktree =
+    String(cw?.outcome ?? '') === 'WORK_PRESERVE_SKIP' && String(cw?.detail ?? '') === 'no worktree';
+  if (cw && typeof cw === 'object' && !noWorktree) {
+    evidence.push({
+      fact: `committed_work:${String(cw.outcome ?? 'ERROR')}`,
+      at: null,
+      branch: cw.branch ? String(cw.branch) : null,
+    });
+  }
+  return { retained: evidence.length > 0, evidence };
+}
+
+// The ONE choke point: every escalation this level returns, from every path
+// (single-arm, dual-build, level-pick), is stamped here before it leaves.
+function stampClaimDisposition(esc) {
+  if (!esc) return esc;
+  const state = escalationResumableState(esc);
+  esc.resumable_state = state;
+  esc.claim_disposition = state.retained ? CLAIM_HOLD : CLAIM_RELEASE;
+  return esc;
+}
+
 // The SIDELINE notice — the consumer half of worktree.sh's CREATED verdi — see build-level.design-notes-2.md#the-sideline-notice-the-consumer-half-of-worktree-sh-s-creat
 const SIDELINE_NOTICES = new Map(); // slug → { path, branch, recovery }
 
@@ -7836,7 +7906,24 @@ async function buildLevel() {
   for (const r of results) {
     if (!r) continue;
     if (r._kind === 'parked') parked.push(r.parked);
-    else if (r._kind === 'escalation') escalations.push(r.escalation);
+    // temperloop#2230 — stamp the CLAIM DISPOSITION on the way out, at the one
+    // point every path's escalations converge.
+    else if (r._kind === 'escalation') escalations.push(stampClaimDisposition(r.escalation));
+  }
+
+  // temperloop#2230 — name the disposition in the run log too, so an operator
+  // reading the transcript sees which items the board still owes a claim for.
+  if (escalations.length > 0) {
+    const bySlug = (d) => escalations.filter((e) => e.claim_disposition === d).map((e) => e.slug);
+    const holds = bySlug(CLAIM_HOLD);
+    const releases = bySlug(CLAIM_RELEASE);
+    log(
+      `level escalation CLAIM DISPOSITION — hold=${holds.length ? holds.join(',') : 'none'} ` +
+        `release=${releases.length ? releases.join(',') : 'none'}. ` +
+        'An escalation that RETAINS resumable state keeps its board claim HELD (CLAUDE.md § Task ' +
+        'workflow, `Claim held until Done`) — the board must not read Ready while a worktree here ' +
+        'holds unlanded work. Read `claim_disposition`/`resumable_state` on each escalation, never its kind.',
+    );
   }
 
   // temperloop#2006 — the LEVEL-SUMMARY half of the sideline notice. Each — see build-level.design-notes-6.md#temperloop-2006-the-level-summary-half-of-the-sideline-notic
