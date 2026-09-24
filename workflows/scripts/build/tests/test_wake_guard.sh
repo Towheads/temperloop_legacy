@@ -159,12 +159,20 @@ ok "bound: a hanging command is KILLED at its bound, reported TIMEOUT, tree reap
 
 # CONTROL: without the bound the same fixture runs on unbounded — this is what
 # makes the assertion above discriminating rather than vacuously true.
+# `set -m` so the control fixture is its own process-group leader: reaping it
+# by GROUP is the only thing that also takes its bare `sleep 600` children,
+# whose command lines a `pkill -f <fixture path>` can never match. Without it
+# this control leaked three detached sleeps on every run — the same orphan
+# this suite asserts against elsewhere.
+set -m
 "$TMP/hang.sh" >/dev/null 2>&1 &
 CTRL=$!
+set +m
 sleep 3
 kill -0 "$CTRL" 2>/dev/null || fail "control fixture died on its own — the hang assertion proves nothing"
 disown "$CTRL" 2>/dev/null || true
-kill -9 "$CTRL" 2>/dev/null; pkill -f "$TMP_RE/hang\.sh" >/dev/null 2>&1
+kill -9 -"$CTRL" 2>/dev/null || kill -9 "$CTRL" 2>/dev/null
+pkill -f "$TMP_RE/hang\.sh" >/dev/null 2>&1
 ok "bound: CONTROL — the same fixture runs on unbounded when nothing guards it"
 
 T0=$(date +%s)
@@ -307,7 +315,7 @@ ok "bound: HUP/INT/QUIT/TERM each REAP the watched group before exiting (each wi
 # have actually FORKED before the retire, or a race would make this assertion
 # pass vacuously.
 WD_BOUND=9173
-sleep_count() { ps -eo command 2>/dev/null | grep -c "^sleep $1\$" || true; }
+sleep_count() { pgrep -f "^sleep $1\$" 2>/dev/null | wc -l | tr -d ' '; }
 run bound --label orphan --timeout-secs "$WD_BOUND" -- bash -c 'sleep 1; exit 0'
 [ "$RC" -eq 0 ] || fail "bound orphan-probe exit $RC, want 0"
 sleep 1
@@ -322,7 +330,7 @@ ok "bound: retiring the watchdog on the fast path takes its sleep with it"
 bash -c '( sleep 9174 2>/dev/null; : ) </dev/null >/dev/null 2>&1 & __w=$!; sleep 0.5; kill "$__w" 2>/dev/null; wait "$__w" 2>/dev/null' >/dev/null 2>&1
 sleep 1
 CTRL_STRAY="$(sleep_count 9174)"
-pkill -f '^sleep 9174' >/dev/null 2>&1 || true
+pkill -f '^sleep 9174$' >/dev/null 2>&1 || true
 [ "$CTRL_STRAY" -ge 1 ] || fail "CONTROL: the pre-fix bare-kill retire did NOT orphan its sleep here — the orphan assertion above proves nothing"
 ok "bound: CONTROL — the pre-fix bare-kill retire orphans its sleep, which is what the group retire fixes"
 
