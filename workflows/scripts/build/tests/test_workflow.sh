@@ -208,6 +208,94 @@ wf_progress() {
   return 0
 }
 
+# ============================================================================
+# K2245 (temperloop#2245): a run_node_case BODY may carry no UNESCAPED backtick.
+#
+# Each test body is passed as a DOUBLE-QUOTED bash argument, so bash performs
+# command substitution on it while merely BUILDING that argument — before
+# run_node_case is even entered (which is why the hang left SUITE_PROGRESS_FILE
+# empty and looked like it came from the previously-passing case). A prose
+# comment inside the body that quotes a shell word in Markdown backticks is
+# therefore not documentation: it EXECUTES.
+#
+# Most such words fail harmlessly to stderr ("command not found"). One class
+# does not: a command that READS STDIN. The live defect was a JS comment
+# reading "A `cat` after the gate is the regression" — bash ran a bare `cat`,
+# which inherited the suite's stdin and blocked forever whenever that stdin was
+# not a terminal or /dev/null. Under an unattended runner (a Claude Code Bash
+# tool call, CI) stdin is a socket that never reaches EOF, so the suite hung
+# with NO verdict at all rather than failing: it burned 11 hours on one run and
+# left a peer checkout wedged for 5 days.
+#
+# This guard is STRUCTURAL rather than a note asking authors to escape them,
+# because the failure is invisible in review — a backtick in a comment reads as
+# ordinary Markdown, and the suite it breaks reports nothing when it breaks.
+# Escape them (\`cat\`) in a body; a bash `#` comment outside a body is fine.
+# ============================================================================
+K2245_OFFENDERS="$(python3 - "$0" <<'K2245_PY'
+import re, sys
+lines = open(sys.argv[1]).read().split("\n")
+inbody = False
+out = []
+for i, l in enumerate(lines, 1):
+    if not inbody:
+        if re.match(r'^\s*run_node_case\s+"', l) and l.rstrip().endswith('"') \
+           and l.rstrip().count('"') >= 3:
+            inbody, start = True, i
+    else:
+        if l.strip() == '"':
+            inbody = False
+            continue
+        if re.search(r'(?<!\\)`', l):
+            out.append("%d (body opened at %d): %s" % (i, start, l.strip()[:90]))
+print("\n".join(out))
+K2245_PY
+)" || K2245_OFFENDERS="PROBE_FAILED"
+
+if [ "$K2245_OFFENDERS" = "PROBE_FAILED" ]; then
+  fail "#2245: the unescaped-backtick probe could not run"
+elif [ -n "$K2245_OFFENDERS" ]; then
+  fail "#2245: a run_node_case body carries an UNESCAPED backtick, which bash
+runs as a command while expanding the body argument. If the word reads stdin
+(\`cat\`) the whole suite hangs with no verdict. Escape it as \\\`word\\\`:
+$K2245_OFFENDERS"
+fi
+echo "PASS: #2245 no run_node_case body carries an unescaped backtick (bash would execute it during argument expansion)"
+
+# SELF-CHECK — the assertion above is worthless if the probe cannot SEE an
+# offender (#1706: an assertion that cannot fail is a defect). Feed it a
+# synthetic body carrying the exact shape that caused the live hang and require
+# it to be reported. A probe that comes back clean here is broken, not healthy.
+K2245_FIXTURE="$WF_TEST_TMPDIR/k2245-fixture.sh"
+{
+  printf '%s\n' 'run_node_case "synthetic" "'
+  printf '%s\n' '// prose mentioning `cat` the way the live defect did'
+  printf '%s\n' '"'
+} > "$K2245_FIXTURE"
+K2245_SELF="$(python3 - "$K2245_FIXTURE" <<'K2245_PY'
+import re, sys
+lines = open(sys.argv[1]).read().split("\n")
+inbody = False
+out = []
+for i, l in enumerate(lines, 1):
+    if not inbody:
+        if re.match(r'^\s*run_node_case\s+"', l) and l.rstrip().endswith('"') \
+           and l.rstrip().count('"') >= 3:
+            inbody, start = True, i
+    else:
+        if l.strip() == '"':
+            inbody = False
+            continue
+        if re.search(r'(?<!\\)`', l):
+            out.append("%d" % i)
+print("\n".join(out))
+K2245_PY
+)"
+[ -n "$K2245_SELF" ] \
+  || fail "#2245 self-check: the probe did NOT flag a synthetic body containing an unescaped backtick, so the clean result above proves nothing"
+rm -f "$K2245_FIXTURE"
+echo "PASS: #2245 self-check — the probe demonstrably flags the offending shape"
+
 run_node_case() {
   local desc="$1"
   wf_progress "$desc"
@@ -2653,7 +2741,7 @@ if (gatePrompts[1].includes(': >' + QGLOG + ';'))
   { console.log(JSON.stringify({ ok: false, reason: 'slice 2 must NOT truncate the gate log: ' + gatePrompts[1] })); process.exit(0); }
 // STREAMING, not a post-hoc copy: the gate's output must reach BOTH the
 // per-slice file (which the trailers are parsed from) and the cumulative
-// operator log WHILE the gate runs. A `cat` after the gate is the regression.
+// operator log WHILE the gate runs. A \`cat\` after the gate is the regression.
 for (const i of [0, 1]) {
   if (!gatePrompts[i].includes('| tee ' + QGSLICE + ' >>' + QGLOG))
     { console.log(JSON.stringify({ ok: false, reason: 'slice ' + (i + 1) + ' must STREAM into the cumulative log through tee, not copy into it after the gate: ' + gatePrompts[i] })); process.exit(0); }
@@ -3331,7 +3419,7 @@ script({ rc: 0, failed: 0, out: 'STREAMED-BEFORE-THE-KILL', sleep: 6 });
 writeFileSync(GATELOG, 'STALE-FROM-A-PREVIOUS-RUN\n');
 await new Promise((resolve) => {
   // detached + a NEGATIVE pid kills the whole process GROUP, so the composed
-  // command's own inline wall-clock watchdog (a backgrounded `sleep`) dies with
+  // command's own inline wall-clock watchdog (a backgrounded \`sleep\`) dies with
   // it instead of being orphaned for its full ceiling. That is also the truer
   // simulation: the executor's timeout takes down the command, not one pid.
   const child = spawn('bash', ['-c', cmdSlice0], { stdio: ['ignore', 'ignore', 'ignore'], detached: true });
