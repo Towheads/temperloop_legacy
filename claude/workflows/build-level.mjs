@@ -939,6 +939,12 @@ const STEP_SLOW_SECS = Math.min(
     : STEP_SLOW_SECS_DEFAULT,
 );
 
+// --- Worker scoped-gate LIVENESS BOUND (temperloop#2210) ---------------------
+// THE FAILURE THIS BOUNDS — `Bash timeout:` DETACHES rather than kills, so a
+// wedged worker gate ran 12.5h. The bound is the #1071 step ceiling, not a new
+// setting — see build-level.design-notes-7.md#the-failure-this-bounds-workergatecmd-hands-the-worker-one-gate
+const WORKER_GATE_CEILING_SECS = STEP_CEILING_SECS;
+
 // GATE_MAX_SLICES — a bound, not a target: a suite that cannot finish in — see build-level.design-notes.md#gate-max-slices-a-bound-not-a-target-a-suite-that-canno
 const GATE_MAX_SLICES = 8;
 // GATE_RESUME_EXTENSIONS (temperloop#2135, split from #2130) — how many — see build-level.design-notes.md#gate-resume-extensions-temperloop-2135-split-from-2130-how-m
@@ -1109,6 +1115,20 @@ function sq(value) {
 }
 
 // -----------------------------------------------------------------------------
+// killNotDetachWatchdog — the ONE in-shell watchdog line every compiled bound
+// in this file arms (temperloop#2210).
+// -----------------------------------------------------------------------------
+// WHY IT IS ONE FUNCTION AND NOT TWO COPIES, why the guard cannot depend on
+// what it watches, and what `opts.group` is for — see build-level.design-notes-7.md#why-it-is-one-function-and-not-two-copies-bash-timeout-detach
+function killNotDetachWatchdog(ceilVar, pidVar, kidVar, opts) {
+  const groupKill = opts && opts.group ? `kill -9 -"${pidVar}" 2>/dev/null; ` : '';
+  return `( sleep "${ceilVar}" 2>/dev/null; ${kidVar}=$(pgrep -P "${pidVar}" 2>/dev/null); ` +
+    groupKill +
+    `kill -9 "${pidVar}" 2>/dev/null; [ -n "$${kidVar}" ] && kill -9 $${kidVar} 2>/dev/null ) ` +
+    `</dev/null >/dev/null 2>&1 &`;
+}
+
+// -----------------------------------------------------------------------------
 // The step LIVENESS BOUND, compiled into the command text (temperloop#1071).
 // -----------------------------------------------------------------------------
 // See the STEP_CEILING_SECS block above for WHY the bound lives in the e — see build-level.design-notes-3.md#see-the-step-ceiling-secs-block-above-for-why-the-bound-live
@@ -1121,7 +1141,7 @@ function stepBoundPreamble(slowSecs) {
     '  "$@" &',
     '  __lbp=$!',
     // Kill ORDER is load-bearing, and the obvious order is wrong. Killing th — see build-level.design-notes.md#kill-order-is-load-bearing-and-the-obvious-order-is-wrong-ki
-    '  ( sleep "$__lb_ceil" 2>/dev/null; __lbc=$(pgrep -P "$__lbp" 2>/dev/null); kill -9 "$__lbp" 2>/dev/null; [ -n "$__lbc" ] && kill -9 $__lbc 2>/dev/null ) </dev/null >/dev/null 2>&1 &',
+    '  ' + killNotDetachWatchdog('$__lb_ceil', '$__lbp', '__lbc'),
     '  __lbw=$!',
     '  wait "$__lbp" 2>/dev/null; __lbr=$?',
     '  kill "$__lbw" 2>/dev/null; wait "$__lbw" 2>/dev/null',
@@ -1756,14 +1776,38 @@ function workerGateState(out) {
 function workerGateCmd(slug, worktreePath) {
   const sent = sq(workerGateSentinel(slug));
   const glog = sq(workerGateLog(slug));
+  const ceil = WORKER_GATE_CEILING_SECS;
   return (
     `set -o pipefail || exit 1; ` +
     `cd ${sq(worktreePath)} || exit 1; ` +
     `[ -x ./scripts/quality-gates.sh ] || { echo 'no executable ./scripts/quality-gates.sh in this repo — no gate to run' >&2; exit 127; }; ` +
-    `__t0=$(date +%s) || exit 1; ` +
-    `printf '{"state":"running","startedAt":%s}\\n' "$__t0" > ${sent} || exit 1; ` +
-    `./scripts/quality-gates.sh --scoped 2>&1 | tee ${glog}; __rc=$?; ` +
-    `printf '{"state":"finished","rc":%s,"elapsedSecs":%s}\\n' "$__rc" "$(( $(date +%s) - __t0 ))" > ${sent}; ` +
+    `__t0=$(date +%s) || exit 1; __wgb=${ceil}; ` +
+    // The bound is on the sentinel from the FIRST write, not only in the
+    // timeout report: a reader that finds a stale `running` sentinel can then
+    // tell "still inside its bound" from "outlived a bound nobody enforced".
+    `printf '{"state":"running","startedAt":%s,"boundSecs":%s}\\n' "$__t0" "$__wgb" > ${sent} || exit 1; ` +
+    // temperloop#2210 — the suite runs BACKGROUNDED under `set -m` (so it gets
+    // its own process group) with the shared kill-not-detach watchdog armed
+    // over it. `set +m` immediately after, so nothing else in the command text
+    // inherits job control. stdout is untouched: `tee` still writes to this
+    // command's stdout, so the worker sees the suite's output live exactly as
+    // before, and `pipefail` (set above, inherited by the subshell) still makes
+    // $__rc the SUITE's status rather than tee's.
+    `set -m; { ./scripts/quality-gates.sh --scoped 2>&1 | tee ${glog}; } & __wgp=$!; set +m; ` +
+    `${killNotDetachWatchdog('$__wgb', '$__wgp', '__wgc', { group: true })} __wgw=$!; ` +
+    `wait "$__wgp" 2>/dev/null; __rc=$?; ` +
+    `kill "$__wgw" 2>/dev/null; wait "$__wgw" 2>/dev/null; ` +
+    `__we=$(( $(date +%s) - __t0 )); ` +
+    // Timed out iff BOTH the suite died by SIGNAL and the wall clock actually
+    // reached the bound — the same two-part test the #1071 step bound uses, so
+    // a suite that exits >=128 on its own is never mislabelled as a timeout.
+    // The sentinel says `finished`, because the gate IS finished: it was killed.
+    // A TIMEOUT that left the sentinel at `running` would be the very ambiguity
+    // this bound exists to remove.
+    `if [ "$__rc" -ge 128 ] && [ "$__we" -ge "$__wgb" ]; then ` +
+    `printf '{"state":"finished","rc":137,"outcome":"TIMEOUT","timedOut":true,"boundSecs":%s,"elapsedSecs":%s}\\n' "$__wgb" "$__we" > ${sent}; ` +
+    `cat ${sent}; exit 137; fi; ` +
+    `printf '{"state":"finished","rc":%s,"elapsedSecs":%s}\\n' "$__rc" "$__we" > ${sent}; ` +
     `cat ${sent}; exit $__rc`
   );
 }
@@ -1771,6 +1815,7 @@ function workerGateCmd(slug, worktreePath) {
 // workerGateSection — the prompt half, a SELF-CONTAINED section spliced — see build-level.design-notes-2.md#workergatesection-the-prompt-half-a-self-contained-section-s
 function workerGateSection(slug, worktreePath) {
   const sent = workerGateSentinel(slug);
+  const ceil = WORKER_GATE_CEILING_SECS;
   return [
     '',
     '## Your scoped gate — run THIS EXACT command (temperloop#865)',
@@ -1812,6 +1857,21 @@ function workerGateSection(slug, worktreePath) {
     '      some wrapper hands it to a plain `sh`, it aborts on that first line. Report it as',
     '      blocked.',
     '  In all three, never infer a green gate from the missing sentinel.',
+    // temperloop#2210. The worker cannot act on this — the bound fires with or
+    // without its cooperation — but it MUST be able to READ the result, because
+    // a killed gate and a failing gate are different verdicts and only one of
+    // them is evidence about the code.
+    `- **The command carries its own ${ceil}s KILL bound — it is not advisory.** The Bash tool's`,
+    '  `timeout` parameter DETACHES a command at its bound rather than killing it, so a wedged',
+    '  suite used to keep running with nobody waiting on it (12.5h, measured). This invocation',
+    '  therefore arms an in-shell watchdog over the suite BEFORE it starts, which rides along',
+    '  into the detached process and kills the whole suite process group there. You do not need',
+    '  to do anything for this, and nothing you do can disable it.',
+    `- **\`rc:137\` + \`"timedOut":true\` is a TIMEOUT, not a gate failure.** The sentinel reads`,
+    `  \`{"state":"finished","rc":137,"outcome":"TIMEOUT","timedOut":true,"boundSecs":${ceil},…}\`.`,
+    '  The suite ran out of wall clock and was killed — it reached NO verdict about your code.',
+    '  Report it as `blocked` and quote the sentinel; never report it as a gate failure, and',
+    '  never re-run it hoping for a different answer.',
   ];
 }
 
