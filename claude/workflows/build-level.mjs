@@ -675,8 +675,25 @@ const STEP_OUTCOME_SCHEMA = {
 // re-derives it from worktree.sh / pr.sh / ci-poll.sh on every run and fails if
 // a script emits a key this set omits — so a new machinery field can never
 // become a false relay-integrity refusal.
+//
+// That promise holds only while the harvest is MULTI-LINE AWARE (temperloop#2236).
+// These emitters build their JSON as multi-line jq object literals, and the
+// original line-oriented harvest — which kept only lines carrying `outcome` —
+// skipped every continuation line, hiding three real fields and clearing its own
+// size floor while doing so. A key that is invisible to the harvest is an armed
+// false refusal, so the harvest carries an explicit blind-spot assertion naming
+// continuation-line witnesses. Never narrow it back to per-line scanning.
 const BATCH_RESULT_EXTRA_KEYS = [
-  'already', 'arm', 'arms', 'base_resolved', 'branch_deleted', 'gate', 'records',
+  // temperloop#2236: `basis`, `body_truncated_bytes` and `supersede_basis` sit
+  // on CONTINUATION lines of multi-line jq object literals in worktree.sh /
+  // pr.sh. The lockstep harvest below used to read line-by-line and skip any
+  // line without `outcome` on it, so all three were invisible to it and each
+  // was an armed false relay-integrity refusal; body_truncated_bytes detonated
+  // on a live drive. The harvest is now multi-line aware, which is what keeps
+  // this list honest — these three are not a special case, they are the first
+  // fields it can finally see.
+  'already', 'arm', 'arms', 'base_resolved', 'basis', 'body_truncated_bytes',
+  'branch_deleted', 'gate', 'records', 'supersede_basis',
   'review_head_sha', 'rounds', 'selection', 'worktree_removed',
   'conflicts', 'criterion', 'deferred_host_config', 'deterministic_failure',
   'discrimination_evidence', 'evidence', 'forced', 'guard', 'guard_detail', 'issue',

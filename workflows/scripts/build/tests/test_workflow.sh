@@ -17740,12 +17740,27 @@ if (known.size < 40) die("extracted only " + known.size + " known keys — the e
 // Quoted `"key":` anywhere in a helper script, plus jq`s unquoted `key:` form
 // restricted to lines that also carry `outcome` (jq object literals), plus
 // build-level.mjs`s own inline `{"outcome":"X","key":...}` emissions.
+// The jq half is MULTI-LINE AWARE (temperloop#2236). It used to read
+// line-by-line and skip any line without `outcome` on it, which made every key
+// on a CONTINUATION line of a multi-line jq object literal invisible — three
+// real emitted fields (basis, body_truncated_bytes, supersede_basis) hid there,
+// and one became a live false relay-integrity refusal on a healthy PR-open.
+// So: take the whole single-quoted jq program as one unit, keep it only if it
+// carries `outcome:` anywhere, and harvest across its newlines.
+//
+// Two constraints the widening must respect, or it trades a blind spot for a
+// junk-filled closed set (which would silently stop refusing real corruption):
+//   - strip `#` comment tails first — jq blocks carry English prose, and
+//     `above:` / `in:` / `read:` are not fields (~28 false keys without this);
+//   - anchor each key to a `{` or `,` delimiter, never bare whitespace, so
+//     prose `word:` inside a block cannot register as a key.
 const emitted = new Set();
 const harvest = (txt) => {
   for (const m of txt.matchAll(/\\*"([A-Za-z_][A-Za-z0-9_]*)\\*"\s*:/g)) emitted.add(m[1]);
-  for (const line of txt.split("\n")) {
-    if (!/outcome/.test(line)) continue;
-    for (const m of line.matchAll(/[{,]\s*([a-z_][a-z0-9_]*)\s*:/g)) emitted.add(m[1]);
+  for (const blk of txt.matchAll(/\x27\{[\s\S]*?\}\x27/g)) {
+    const body = blk[0].split("\n").map((l) => l.replace(/#.*$/, "")).join("\n");
+    if (!/outcome\s*:/.test(body)) continue;
+    for (const m of body.matchAll(/[{,]\s*([a-z_][a-z0-9_]*)\s*:/g)) emitted.add(m[1]);
   }
 };
 for (const f of ["worktree.sh", "pr.sh", "ci-poll.sh"]) {
@@ -17757,6 +17772,24 @@ for (const line of src.split("\n")) {
 }
 const floor = Number(process.env.EMITTED_KEY_FLOOR);
 if (emitted.size < floor) die("harvested only " + emitted.size + " distinct emitted field names (floor " + floor + ") — the harvest regex has gone stale and this guard would pass vacuously");
+
+// BLIND-SPOT ASSERTION (temperloop#2236). The size floor above cannot catch a
+// harvest that misses a whole CLASS of key: the pre-#2236 line-oriented harvest
+// cleared the floor at 99 while silently skipping every continuation line of a
+// multi-line jq literal. These three keys each live on such a line in a
+// shipping emitter, so they are the load-bearing witnesses that the harvest is
+// still multi-line aware. This is deliberately NOT a check against the closed
+// set — it asserts the HARVEST sees them, so reverting the regex goes red here
+// immediately even if the closed set still happens to list them.
+const K2236_WITNESSES = {
+  body_truncated_bytes: "pr.sh:1645 (BODY_UPDATED)",
+  supersede_basis: "pr.sh:743 (force-push)",
+  basis: "worktree.sh:1947 (recover-probe)",
+};
+const blind = Object.keys(K2236_WITNESSES).filter((k) => !emitted.has(k));
+if (blind.length) die("the harvest did not see " + blind.length + " known CONTINUATION-LINE field(s): "
+  + blind.map((k) => k + " [" + K2236_WITNESSES[k] + "]").join(", ")
+  + ". A key on a later line of a multi-line jq object literal is invisible to a line-oriented harvest, and every such key is an armed FALSE relay-integrity refusal (temperloop#2236). Keep the harvest multi-line aware.");
 
 const missing = [...emitted].filter((k) => !known.has(k)).sort();
 if (missing.length) die("the batch-step emitters print " + missing.length + " field(s) BATCH_RESULT_KNOWN_KEYS omits: " + missing.join(", ") + ". A healthy machinery field outside the closed set is a FALSE relay-integrity refusal — add them to BATCH_RESULT_EXTRA_KEYS (or declare them in the schema), never widen the check itself.");
