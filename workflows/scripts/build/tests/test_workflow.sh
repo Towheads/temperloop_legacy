@@ -18331,8 +18331,8 @@ if (MJS_SRC.indexOf(ANCHOR) === -1)
 globalThis.args = { ...baseArgs, items: [] };
 delete globalThis.__k2224r3;
 await new AsyncFunction(MJS_SRC.replace(ANCHOR, 'globalThis.__k2224r3 = { reviewBodySuffix, scopeReviewSection, reviewOutOfScopePreamble, reviewRenderNormalize }; return;'))();
-const api = globalThis.__k2224r3;
-if (!api || typeof api.reviewRenderNormalize !== 'function')
+const guard = globalThis.__k2224r3;
+if (!guard || typeof guard.reviewRenderNormalize !== 'function')
   emit('reviewRenderNormalize is not defined — the single normalization seam the two halves share is missing');
 
 // The capture half's own arithmetic, reproduced exactly as runReviewers() does
@@ -18354,9 +18354,9 @@ let reason = null;
 // --- ARM A: model mark + chatter above the anchor -------------------------
 // Raw reading: 3 lines. Normalized reading: 1. The body can only ever show
 // the normalized number, so the log half must show it too.
-const bodyA = api.reviewBodySuffix([roundOf(MARK)]);
-const logA = lines(api.reviewOutOfScopePreamble(api.reviewRenderNormalize(MARK)));
-const rawA = lines(api.reviewOutOfScopePreamble(MARK));
+const bodyA = guard.reviewBodySuffix([roundOf(MARK)]);
+const logA = lines(guard.reviewOutOfScopePreamble(guard.reviewRenderNormalize(MARK)));
+const rawA = lines(guard.reviewOutOfScopePreamble(MARK));
 if (rawA === logA)
   reason = 'arm A: the raw and normalized readings agree (' + rawA + '), so this fixture cannot discriminate the divergence it exists to pin';
 else if (markerCount(bodyA) !== logA)
@@ -18376,9 +18376,9 @@ else if (bodyA.indexOf(MARK.slice(MARK.indexOf('## Summary'))) === -1)
 // and the log must therefore announce nothing either.
 const MARKONLY = '<!-- 3e-model: a-test-model-id -->\\n\\n' + CLEAN;
 if (!reason) {
-  const bodyB = api.reviewBodySuffix([roundOf(MARKONLY)]);
-  const logB = lines(api.reviewOutOfScopePreamble(api.reviewRenderNormalize(MARKONLY)));
-  const rawB = lines(api.reviewOutOfScopePreamble(MARKONLY));
+  const bodyB = guard.reviewBodySuffix([roundOf(MARKONLY)]);
+  const logB = lines(guard.reviewOutOfScopePreamble(guard.reviewRenderNormalize(MARKONLY)));
+  const rawB = lines(guard.reviewOutOfScopePreamble(MARKONLY));
   if (rawB !== 1)
     reason = 'arm B: the RAW reading must see the lone mark as 1 withheld line (got ' + rawB + '), or this arm cannot discriminate the bug';
   else if (logB !== 0)
@@ -18526,8 +18526,8 @@ if (MJS_SRC.indexOf(ANCHOR) === -1)
 globalThis.args = { ...baseArgs, items: [] };
 delete globalThis.__k2224r3c;
 await new AsyncFunction(MJS_SRC.replace(ANCHOR, 'globalThis.__k2224r3c = { scopeReviewSection, reviewOutOfScopePreamble }; return;'))();
-const api = globalThis.__k2224r3c;
-if (!api || typeof api.scopeReviewSection !== 'function')
+const guard = globalThis.__k2224r3c;
+if (!guard || typeof guard.scopeReviewSection !== 'function')
   emit('scopeReviewSection was not exposed by the unit seam');
 
 const TAIL = '\\n\\n## Summary\\nthe seat review proper\\n';
@@ -18545,9 +18545,9 @@ let reason = null;
 for (const arm of arms) {
   if (reason) break;
   const text = arm[1] + TAIL;
-  if (api.reviewOutOfScopePreamble(text) !== '')
+  if (guard.reviewOutOfScopePreamble(text) !== '')
     reason = 'concession-2 arm ' + arm[0] + ': review content above the anchor must establish NO boundary — over-filtering the PR body is the failure this concession exists to prevent';
-  else if (api.scopeReviewSection(text) !== text)
+  else if (guard.scopeReviewSection(text) !== text)
     reason = 'concession-2 arm ' + arm[0] + ': the block must be returned byte-identical';
 }
 // NEGATIVE CONTROL — a severity word the alternation does NOT list is not
@@ -18555,9 +18555,9 @@ for (const arm of arms) {
 // arms above would pass against an alternation that matched anything.
 if (!reason) {
   const outside = '### [CRITICAL] not a severity this grammar declares\\ndetail' + TAIL;
-  if (api.reviewOutOfScopePreamble(outside) === '')
+  if (guard.reviewOutOfScopePreamble(outside) === '')
     reason = 'the negative control was preserved too, so the alternation is matching more than HIGH, MEDIUM and LOW and the arms above prove nothing';
-  if (!reason && api.scopeReviewSection(outside) === outside)
+  if (!reason && guard.scopeReviewSection(outside) === outside)
     reason = 'the negative control was returned unchanged, so this case cannot discriminate';
 }
 emit(reason);
