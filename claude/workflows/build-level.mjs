@@ -3478,6 +3478,76 @@ function stripReviewModelMark(text) {
   return String(text ?? '').replace(new RegExp(REVIEW_MODEL_MARK_RE.source, 'gim'), '').replace(/\n{3,}$/, '\n');
 }
 
+// --- §3e REVIEW-BLOCK SCOPE GUARD (temperloop#2224) --------------------------
+// THE LEAK: PR #2223's `## Review notes` carries, inside the
+// `typescript-reviewer` block and ABOVE that seat's own `## Summary`, reviewer
+// chatter plus a whole `## Answer to the relayed question` section answering
+// "did this stall?" — a question the operator had asked the ORCHESTRATOR about
+// the run, not a review question about the diff.
+//
+// ARTIFACT-SIDE, NOT PROMPT-SIDE, and that is forced. The probe on #2224
+// established that nothing in this tree can carry orchestrator conversation
+// into a reviewer prompt: reviewPrompt() interpolates exactly ONE `item` field
+// (`item.slug`), priorContext carries only `{round, sha, findings}` from a
+// prior REVIEW, and the §3e spawn is a plain `agent(prompt, {label, phase,
+// agentType})` with no context-inheriting mode. The cause is upstream and out
+// of this repo's control, so a reviewer EMITTING preamble cannot be prevented
+// here — the durable artifact is the only place it can be stopped. Hence the
+// same seam #2131's model-mark stripper uses, for the same reason: the STORED
+// section text stays the reviewer's verbatim return (what reviewSeverityCounts
+// and reviewHasBlockingFinding parse) while the PR body carries only review.
+//
+// THE ANCHOR IS THE SEATS' OWN DECLARED FORMAT — every reviewer seat under
+// claude/agents/ declares an `## Output` block whose first heading is
+// `## Summary`, so text above the first `## Summary` is outside that format by
+// construction.
+//
+// OVER-FILTERING IS WORSE THAN THE LEAK, so this fails toward PRESERVING:
+// truncating a real HIGH would turn a VISIBLE noise problem into an INVISIBLE
+// correctness one on the PR's durable verification surface (kernel principle 5,
+// § PR verification surface). Three structural concessions:
+//   1. NO ANCHOR -> UNCHANGED. No `## Summary` means no established boundary,
+//      so nothing is withheld — the guard no-ops rather than guessing.
+//   2. REVIEW CONTENT ABOVE THE ANCHOR -> UNCHANGED. A `### [HIGH|MEDIUM|LOW]`,
+//      `## Findings` or `## What's solid` in the preamble means review content
+//      in an odd order, not chatter. This is what makes "a finding can never be
+//      dropped" structural rather than hoped-for.
+//   3. WITHHOLDING IS MARKED, NEVER SILENT — a one-line marker replaces the
+//      preamble in the body, and runReviewers() logs the withheld text at
+//      capture time.
+// A well-formed block (output starting at `## Summary` — the other two seats on
+// PR #2223) renders byte-identically to the pre-#2224 path.
+const REVIEW_SECTION_ANCHOR_RE = /^[ \t]*##[ \t]+Summary[ \t]*$/im;
+const REVIEW_FORMAT_HEADING_RE =
+  /^[ \t]*(?:###[ \t]*\[[ \t]*(?:HIGH|MEDIUM|LOW)\b|##[ \t]+(?:Findings|What's solid)\b)/im;
+
+// reviewOutOfScopePreamble — the EXACT prefix scopeReviewSection() would
+// withhold, or '' when nothing would be. Split out from the rewriter so the
+// capture site can log the withheld text without re-deriving the rule.
+function reviewOutOfScopePreamble(text) {
+  const s = String(text ?? '');
+  const m = REVIEW_SECTION_ANCHOR_RE.exec(s);
+  if (!m) return ''; // concession 1
+  const preamble = s.slice(0, m.index);
+  if (!preamble.trim()) return ''; // the normal shape — nothing above the anchor
+  if (REVIEW_FORMAT_HEADING_RE.test(preamble)) return ''; // concession 2
+  return preamble;
+}
+
+// scopeReviewSection — the rewriter, applied at the ONE render seam
+// (reviewBodySuffix) and never to the stored section text.
+function scopeReviewSection(text) {
+  const s = String(text ?? '');
+  const preamble = reviewOutOfScopePreamble(s);
+  if (!preamble) return s;
+  const lines = preamble.trim().split('\n').length;
+  return (
+    `_[§3e scope guard (temperloop#2224): ${lines} line(s) of out-of-scope preamble above this seat's ` +
+    "`## Summary` were withheld from this PR body; the withheld text is named in the /build run log.]_\n\n" +
+    s.slice(preamble.length)
+  );
+}
+
 // reviewSeverityCounts — per-reviewer HIGH/MEDIUM/LOW tallies, read off the
 // SAME heading grammar reviewHasBlockingFinding() already keys on
 // (`### [HIGH] …`), so "this round had a blocking finding" and "this round had
@@ -3842,6 +3912,18 @@ async function runReviewers(item, wt, priorFindingsText) {
     log(`[${item.slug}] §3e review — ${route.reviewer} ran (${route.reasons.join('; ')})`);
     // temperloop#1450 — keep the FULL text, not just the name: a MEDIUM/LOW- — see build-level.design-notes-4.md#temperloop-1450-keep-the-full-text-not-just-the-name-a-
     sections.push({ reviewer: route.reviewer, text: textStr });
+    // temperloop#2224 — the run-log half of the scope guard. The PR body's
+    // marker says HOW MUCH was withheld; this says WHAT, so nothing is lost,
+    // only relocated off the durable artifact. Capture-time on purpose: the
+    // render seam runs twice per item (3f and 3g.5) and would double-report.
+    const outOfScope = reviewOutOfScopePreamble(textStr);
+    if (outOfScope) {
+      log(
+        `[${item.slug}] §3e review — ${route.reviewer}: withholding ` +
+          `${outOfScope.trim().split('\n').length} line(s) of out-of-scope preamble from the PR body ` +
+          `(temperloop#2224). Withheld text: ${JSON.stringify(outOfScope.trim())}`,
+      );
+    }
     if (reviewHasBlockingFinding(textStr)) {
       blocking.push({ reviewer: route.reviewer, findings: textStr });
     }
@@ -4124,7 +4206,11 @@ function reviewBodySuffix(rounds) {
         // the reviewer's verbatim return (what reviewTally parses the model
         // out of) while the PR body is byte-identical to a reviewer that never
         // emitted the line.
-        `${reviewBlockMarker(sec.reviewer, i)}\n### ${heading}\n${neutralizeReviewBlockMark(stripReviewModelMark(sec.text))}`,
+        // temperloop#2224 — and scope the block to THIS SEAT'S REVIEW at the
+        // same seam: out-of-scope preamble above the seat's own `## Summary`
+        // is withheld (marked, never silently) so orchestrator-conversation
+        // residue a reviewer emitted cannot reach the durable artifact.
+        `${reviewBlockMarker(sec.reviewer, i)}\n### ${heading}\n${neutralizeReviewBlockMark(scopeReviewSection(stripReviewModelMark(sec.text)))}`,
       );
     }
   });

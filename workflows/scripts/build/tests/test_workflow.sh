@@ -64,6 +64,15 @@
 #     carry an arm for it; the three CONTROLS — an empty level, an onlySlugs
 #     filter matching nothing, and a spike-only verdict-park level — stay
 #     silent and byte-identical to the pre-#2004 return
+#   - 3e review-block scope guard (temperloop#2224): a reviewer return whose
+#     out-of-scope preamble sits above its own "## Summary" — PR #2223's real
+#     leaked typescript-reviewer block, used verbatim as the fixture — has that
+#     preamble withheld behind a counted marker before the PR body is rendered,
+#     while everything from "## Summary" on stays byte-identical; a well-formed
+#     block (the same PR's docs-reviewer block) renders byte-identically end to
+#     end; the three preserve-verbatim concessions hand their input back
+#     untouched; an UNFIXED render seam leaks, so the assertion discriminates;
+#     and the leak reaches no part of the real pr-batch PR-open command
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd ../../../.. && pwd)"
@@ -17990,6 +17999,220 @@ case "$K2208_OUT" in
 esac
 echo "PASS: #2208 object-payload<->schema lockstep — $K2208_OUT"
 unset K2208_OUT
+
+# ============================================================================
+# K2224 — §3e REVIEW-BLOCK SCOPE GUARD
+#
+# THE LEAK, with the real artifact as the fixture. PR #2223's "## Review notes"
+# carried, inside the typescript-reviewer block and ABOVE that seat's own
+# "## Summary", a line of reviewer chatter plus a whole
+# "## Answer to the relayed question" section answering a question the operator
+# had asked the ORCHESTRATOR about the run. Both fixtures below are that PR's
+# own blocks, extracted verbatim:
+#   fixtures/review-block-preamble-leak-2224.md   the typescript-reviewer block
+#   fixtures/review-block-wellformed-2224.md      the docs-reviewer block (clean)
+# An invented fixture would be weaker evidence, and a clean CONTROL drawn from
+# the same PR proves the guard discriminates between the two shapes rather than
+# rewriting everything it is handed.
+#
+# THREE CASES, because the dangerous failure here is OVER-filtering, not under:
+#   1. unit — the leak's preamble is withheld behind a marker while everything
+#      from "## Summary" on is byte-identical; the well-formed block is
+#      byte-identical END TO END; and the three preserve-verbatim concessions
+#      (no anchor / a finding above the anchor / a Findings heading above the
+#      anchor) each return their input unchanged.
+#   2. discrimination — the SAME assertions run against an UNFIXED render seam
+#      (scopeReviewSection spliced back out of reviewBodySuffix) must FAIL, i.e.
+#      the leak text must reach the body there. An assertion that passes both
+#      ways proves nothing (temperloop#1706).
+#   3. end-to-end — a real level drive with the leaked reviewer return: the
+#      out-of-scope text must not appear anywhere in the pr-batch command that
+#      opens the PR, and both items' actual reviews must still be in it.
+# ============================================================================
+export K2224_LEAK="$REPO_ROOT/workflows/scripts/build/tests/fixtures/review-block-preamble-leak-2224.md"
+export K2224_CLEAN="$REPO_ROOT/workflows/scripts/build/tests/fixtures/review-block-wellformed-2224.md"
+[ -f "$K2224_LEAK" ] || fail "#2224: the leaked-block fixture is missing at $K2224_LEAK"
+[ -f "$K2224_CLEAN" ] || fail "#2224: the well-formed control fixture is missing at $K2224_CLEAN"
+grep -q 'Answer to the relayed question' "$K2224_LEAK" \
+  || fail "#2224: the leak fixture no longer carries the out-of-scope section it exists to reproduce — this suite would pass vacuously"
+grep -q '^## Summary' "$K2224_CLEAN" \
+  || fail "#2224: the control fixture must be a WELL-FORMED block starting at ## Summary"
+
+run_node_case "K2224 scope guard (unit): the PR body drops a leaked preamble behind a marker, keeps every byte from ## Summary on, and leaves a well-formed block byte-identical" "
+$PREAMBLE
+const LEAK = readFileSync(process.env.K2224_LEAK, 'utf8');
+const CLEAN = readFileSync(process.env.K2224_CLEAN, 'utf8');
+const ANCHOR = 'return await buildLevel();';
+const emit = (reason) => { console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true })); process.exit(0); };
+if (MJS_SRC.indexOf(ANCHOR) === -1)
+  emit('the module tail anchor moved — this unit seam is inert and would pass vacuously');
+globalThis.args = { ...baseArgs, items: [] };
+const load = async (src) => {
+  delete globalThis.__k2224;
+  await new AsyncFunction(src.replace(ANCHOR, 'globalThis.__k2224 = { reviewBodySuffix, scopeReviewSection, reviewOutOfScopePreamble }; return;'))();
+  return globalThis.__k2224;
+};
+const roundOf = (text) => ({
+  ran: [{ reviewer: 'typescript-reviewer', mandatory: false }],
+  skipped: [],
+  sections: [{ reviewer: 'typescript-reviewer', text }],
+  round: 1,
+  round_kind: 'review',
+});
+
+const api = await load(MJS_SRC);
+if (!api || typeof api.reviewBodySuffix !== 'function')
+  emit('reviewBodySuffix was not exposed by the unit seam');
+
+// --- the LEAK -------------------------------------------------------------
+const leaked = api.reviewBodySuffix([roundOf(LEAK)]);
+let reason = null;
+if (leaked.indexOf('Answer to the relayed question') !== -1)
+  reason = 'the out-of-scope section reached the rendered PR body';
+else if (leaked.indexOf('Already have this from the earlier diff view') !== -1)
+  reason = 'the reviewer chatter line reached the rendered PR body';
+else if (leaked.indexOf('Did this stall') !== -1)
+  reason = 'the answer to the relayed question reached the rendered PR body';
+else if (leaked.indexOf('scope guard (temperloop#2224)') === -1)
+  reason = 'withholding must be MARKED, never silent: no scope-guard marker in the body';
+// NOTHING past the anchor may move — the seat's own review is untouched.
+const kept = LEAK.slice(LEAK.indexOf('## Summary'));
+if (!reason && leaked.indexOf(kept) === -1)
+  reason = 'the seat review from ## Summary on must survive byte-identically: ' + JSON.stringify(leaked.slice(0, 400));
+// The marker counts what it withheld, so a reader knows the SIZE of what was
+// removed rather than only that something was.
+if (!reason && !/scope guard \(temperloop#2224\): [1-9][0-9]* line\(s\)/.test(leaked))
+  reason = 'the marker must name how many lines it withheld: ' + JSON.stringify(leaked.slice(0, 400));
+
+// --- the CONTROL: a well-formed block is untouched, BYTE FOR BYTE ----------
+const clean = api.reviewBodySuffix([roundOf(CLEAN)]);
+if (!reason && clean.indexOf(CLEAN) === -1)
+  reason = 'a well-formed review block must render byte-identically — over-filtering the PR body is worse than the leak: ' + JSON.stringify(clean.slice(0, 400));
+if (!reason && clean.indexOf('scope guard (temperloop#2224)') !== -1)
+  reason = 'a well-formed block must carry NO scope-guard marker';
+
+// --- the three PRESERVE-VERBATIM concessions ------------------------------
+// A finding can never be dropped: these are the shapes where the guard refuses
+// to establish a boundary and hands its input back untouched.
+const noAnchor = 'Some reviewer output with no Summary heading at all.\\nJust prose.\\n';
+const findingAbove = '### [HIGH] a finding emitted before the summary\\ndetail\\n\\n## Summary\\nclean\\n';
+const findingsAbove = '## Findings\\n### [MEDIUM] one\\ntext\\n\\n## Summary\\nclean\\n';
+const concessions = [['no-anchor', noAnchor], ['finding-above-anchor', findingAbove], ['findings-heading-above-anchor', findingsAbove]];
+for (const pair of concessions) {
+  if (reason) break;
+  if (api.reviewOutOfScopePreamble(pair[1]) !== '')
+    reason = 'concession ' + pair[0] + ': the guard must establish no boundary here';
+  else if (api.scopeReviewSection(pair[1]) !== pair[1])
+    reason = 'concession ' + pair[0] + ': the text must be returned byte-identical';
+}
+// And the ordinary shape: output that STARTS at the anchor is a pure no-op.
+if (!reason && api.scopeReviewSection(CLEAN) !== CLEAN)
+  reason = 'a block starting at ## Summary must be a pure no-op';
+emit(reason);
+"
+
+run_node_case "K2224 scope guard (discrimination): with scopeReviewSection spliced OUT of the render seam, the leak reaches the body and the same assertions fail" "
+$PREAMBLE
+const LEAK = readFileSync(process.env.K2224_LEAK, 'utf8');
+const ANCHOR = 'return await buildLevel();';
+const SEAM = 'neutralizeReviewBlockMark(scopeReviewSection(stripReviewModelMark(sec.text)))';
+const UNFIXED = 'neutralizeReviewBlockMark(stripReviewModelMark(sec.text))';
+const emit = (reason) => { console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true })); process.exit(0); };
+if (MJS_SRC.indexOf(SEAM) === -1)
+  emit('reviewBodySuffix no longer composes scopeReviewSection at its render seam — the scope guard was removed or reshaped, and this control can no longer show what it discriminates against');
+globalThis.args = { ...baseArgs, items: [] };
+const load = async (src) => {
+  delete globalThis.__k2224;
+  await new AsyncFunction(src.replace(ANCHOR, 'globalThis.__k2224 = { reviewBodySuffix }; return;'))();
+  return globalThis.__k2224;
+};
+const round = {
+  ran: [{ reviewer: 'typescript-reviewer', mandatory: false }],
+  skipped: [],
+  sections: [{ reviewer: 'typescript-reviewer', text: LEAK }],
+  round: 1,
+  round_kind: 'review',
+};
+const unfixed = await load(MJS_SRC.replace(SEAM, UNFIXED));
+const body = unfixed.reviewBodySuffix([round]);
+let reason = null;
+if (body.indexOf('Answer to the relayed question') === -1)
+  reason = 'the UNFIXED render seam did not leak the out-of-scope section, so the fixed-path assertion proves nothing';
+else if (body.indexOf('Already have this from the earlier diff view') === -1)
+  reason = 'the UNFIXED render seam did not leak the reviewer chatter line, so the fixed-path assertion proves nothing';
+else if (body.indexOf('scope guard (temperloop#2224)') !== -1)
+  reason = 'the UNFIXED build still emitted a scope-guard marker — the splice did not actually disarm the guard';
+emit(reason);
+"
+
+run_node_case "K2224 scope guard (end-to-end): a leaked reviewer return never reaches the pr-batch command that opens the PR, and both items' reviews still do" "
+$PREAMBLE
+const TAB = String.fromCharCode(9);
+const tsv = '.ts' + TAB + 'typescript-reviewer' + TAB + 'claude/agents/reviewers/typescript-reviewer.md\\n';
+const LEAK = readFileSync(process.env.K2224_LEAK, 'utf8');
+const CLEAN = readFileSync(process.env.K2224_CLEAN, 'utf8');
+
+setMachinery('scope-leak',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/scope-leak' },
+  { outcome: 'REVIEW_DIFF', files: ['src/a.ts'], tsv, tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv),
+    review_rounds: 0, review_prior_sha: '', review_head_sha: 'abcdef1234567' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'a5c' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'a5c', branch: 'build/scope-leak' },
+  { outcome: 'PR_OPENED', pr_number: 2224 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('scope-leak');
+setReview('scope-leak', LEAK);
+
+setMachinery('scope-clean',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/scope-clean' },
+  { outcome: 'REVIEW_DIFF', files: ['src/b.ts'], tsv, tsv_rows: tsvRows(tsv), tsv_checksum: tsvChecksum(tsv),
+    review_rounds: 0, review_prior_sha: '', review_head_sha: 'abcdef7654321' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'b6d' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'b6d', branch: 'build/scope-clean' },
+  { outcome: 'PR_OPENED', pr_number: 2226 },
+  { outcome: 'CI_GREEN' },
+);
+happyWorker('scope-clean');
+setReview('scope-clean', CLEAN);
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'scope-leak', branch: 'build/scope-leak', title: 'Leaked preamble', kind: 'impl', acceptance: ['c'] },
+  { slug: 'scope-clean', branch: 'build/scope-clean', title: 'Well-formed review', kind: 'impl', acceptance: ['c'] },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+let reason = null;
+if ((result.parked ?? []).length !== 2) reason = 'expected 2 parked: ' + JSON.stringify(result);
+const leakPr = callLog.find(c => (c.opts.label||'').startsWith('pr-batch:scope-leak'));
+const cleanPr = callLog.find(c => (c.opts.label||'').startsWith('pr-batch:scope-clean'));
+if (!reason && !leakPr) reason = 'no pr-batch call for scope-leak';
+if (!reason && !cleanPr) reason = 'no pr-batch call for scope-clean';
+// The whole point: the command that OPENS the PR carries none of the preamble.
+if (!reason && leakPr.promptFull.indexOf('Answer to the relayed question') !== -1)
+  reason = 'the out-of-scope section reached the PR-open command';
+if (!reason && leakPr.promptFull.indexOf('Already have this from the earlier diff view') !== -1)
+  reason = 'the reviewer chatter line reached the PR-open command';
+if (!reason && leakPr.promptFull.indexOf('Did this stall') !== -1)
+  reason = 'the answer to the relayed question reached the PR-open command';
+if (!reason && leakPr.promptFull.indexOf('scope guard (temperloop#2224)') === -1)
+  reason = 'the PR-open command carries no scope-guard marker — the withholding would be silent';
+// ...while the seat's ACTUAL review still ships. Plain-ASCII fragments, chosen
+// so they survive JSON.stringify plus shell quoting into the command text.
+if (!reason && leakPr.promptFull.indexOf('Type-safety, null-safety, and async correctness all hold') === -1)
+  reason = 'the seat review itself must still reach the PR body: ' + leakPr.promptFull.slice(0, 400);
+// CONTROL — same pipeline, well-formed block, no marker, review intact.
+if (!reason && cleanPr.promptFull.indexOf('scope guard (temperloop#2224)') !== -1)
+  reason = 'a well-formed review block must not be marked as filtered';
+if (!reason && cleanPr.promptFull.indexOf('Clarity/conciseness are strong') === -1)
+  reason = 'the control review must reach the PR body untouched: ' + cleanPr.promptFull.slice(0, 400);
+console.log(JSON.stringify(reason ? { ok: false, reason } : { ok: true }));
+"
 
 echo ""
 echo "All test_workflow.sh cases passed."
