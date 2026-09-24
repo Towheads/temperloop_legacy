@@ -6401,8 +6401,34 @@ grep -q 'function stepBoundPreamble(' "$MJS" \
 # exits at the first match and SIGPIPEs the upstream grep, which under pipefail
 # reports 141 as a race. Draining to EOF gives the identical exit status with no
 # signal. Don't "simplify" it back to `-qF`; the lint will catch it.
-grep -F '( sleep "$__lb_ceil"' "$MJS" | grep -F ') </dev/null >/dev/null 2>&1 &' >/dev/null \
-  || fail "#1071/#861: the emitted watchdog subshell is no longer redirected at the subshell boundary — its sleep grandchild will hold every caller's capture open for the full ceiling"
+# temperloop#2210 — that emitted line is now BUILT by ONE shared function,
+# killNotDetachWatchdog(), which the worker's own scoped-gate bound arms too. So
+# grepping the SOURCE for a literal line no longer reaches it. Assert on the
+# GENERATED text instead, which is strictly stronger than the source grep it
+# replaces: it is the exact string that ships into the command, a comment can
+# never satisfy it (the hole the source-grep version was written to avoid), and
+# it survives any further refactor of how the line is spelled. The select-then-
+# require shape is preserved — one line, carrying BOTH the subshell opener and
+# the boundary redirect — because the redirect at the boundary is what #861 is
+# about: without it the watchdog's `sleep` grandchild inherits the write end of
+# every caller's command substitution and holds it open for the full ceiling.
+_wd_line="$(node -e '
+  const fs = require("fs");
+  const src = fs.readFileSync(process.argv[1], "utf8");
+  const m = src.match(/\nfunction killNotDetachWatchdog\([\s\S]*?\n}\n/);
+  if (!m) process.exit(3);
+  const fn = new Function(m[0] + "\nreturn killNotDetachWatchdog;")();
+  process.stdout.write(fn("$__lb_ceil", "$__lbp", "__lbc"));
+' "$MJS")" \
+  || fail "#1071/#861/#2210: killNotDetachWatchdog() is gone — the one shared builder every compiled bound in the module arms"
+case "$_wd_line" in
+  '( sleep "$__lb_ceil"'*') </dev/null >/dev/null 2>&1 &') ;;
+  *) fail "#1071/#861: the emitted watchdog subshell is no longer redirected at the subshell boundary — its sleep grandchild will hold every caller's capture open for the full ceiling (emitted: $_wd_line)" ;;
+esac
+# ...and the #1071 machinery-step preamble must still ARM it. A correct builder
+# nothing calls bounds nothing.
+grep -F "killNotDetachWatchdog('\$__lb_ceil'" "$MJS" >/dev/null \
+  || fail "#1071: the machinery-step bound no longer arms the shared watchdog"
 grep -q 'async function disposeStepTimeout(' "$MJS" \
   || fail "#1071: disposeStepTimeout() missing — a bounded-out step has no disposal"
 grep -q "recover-probe \${sq(wt)}" "$MJS" \

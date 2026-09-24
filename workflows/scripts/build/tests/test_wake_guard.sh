@@ -178,8 +178,8 @@ ok "bound: a SIGTERM-ignoring process is still reaped — the guard needs no coo
 # Comments are stripped first: the header EXPLAINS the `pgrep -f` shape at
 # length, and a check that fired on its own rationale would be unfixable.
 CODE="$(sed 's/#.*//' "$SCRIPT")"
-printf '%s' "$CODE" | grep -q 'pgrep -f' && fail "wake-guard.sh greps for a command PATTERN — the watchdog must not depend on what it watches"
-printf '%s' "$CODE" | grep -qE 'until[[:space:]]+!' && fail "wake-guard.sh polls the watched process's liveness (until ! …)"
+printf '%s' "$CODE" | grep 'pgrep -f' >/dev/null && fail "wake-guard.sh greps for a command PATTERN — the watchdog must not depend on what it watches"
+printf '%s' "$CODE" | grep -E 'until[[:space:]]+!' >/dev/null && fail "wake-guard.sh polls the watched process's liveness (until ! …)"
 ok "bound: the guard carries no pattern-liveness check (the #2065 cause-3 shape)"
 
 # ============================================================================
@@ -325,7 +325,7 @@ SENT="$(cat "$(sentinel_of "$SLUG")" 2>/dev/null || echo '')"
 [ "$(jqf "$SENT" .state)" = "finished" ] || fail "worker gate green state: $SENT"
 [ "$(jqf "$SENT" .rc)" = "0" ] || fail "worker gate green rc: $SENT"
 [ "$(jqf "$SENT" .timedOut)" = "null" ] || fail "worker gate green must not claim a timeout: $SENT"
-printf '%s\n' "$OUT" | grep -q 'all gates passed in 2s' || fail "worker gate green lost the suite's stdout: $OUT"
+printf '%s\n' "$OUT" | grep 'all gates passed in 2s' >/dev/null || fail "worker gate green lost the suite's stdout: $OUT"
 ok "worker gate: CONTROL — a green suite still exits 0, keeps its stdout, writes no timeout"
 
 write_gate '#!/usr/bin/env bash' 'echo "1 gate FAILED"' 'exit 1'
@@ -347,16 +347,16 @@ ok "worker gate: CONTROL — the missing-worktree refusal still writes no sentin
 # STATIC GUARDS — the wiring itself, so removing it goes red
 # ============================================================================
 GEN="$(gate_cmd 900 "${SLUG_BASE}-static" /tmp/x)"
-printf '%s' "$GEN" | grep -q 'set -m;' \
+printf '%s' "$GEN" | grep 'set -m;' >/dev/null \
   || fail "the generated worker-gate command no longer starts the suite in its own process group"
 # shellcheck disable=SC2016  # the shell VARIABLE NAMES are the literal text
 #   being searched for in the generated command — expansion would defeat the check.
-printf '%s' "$GEN" | grep -q 'sleep "\$__wgb"' \
+printf '%s' "$GEN" | grep 'sleep "\$__wgb"' >/dev/null \
   || fail "the generated worker-gate command no longer arms a wall-clock watchdog"
 # shellcheck disable=SC2016  # same: the literal variable name IS the pattern.
-printf '%s' "$GEN" | grep -q 'kill -9 -"\$__wgp"' \
+printf '%s' "$GEN" | grep 'kill -9 -"\$__wgp"' >/dev/null \
   || fail "the generated worker-gate command no longer group-kills the suite at its bound"
-printf '%s' "$GEN" | grep -q '"timedOut":true' \
+printf '%s' "$GEN" | grep '"timedOut":true' >/dev/null \
   || fail "the generated worker-gate command no longer reports a bound kill as TIMEOUT"
 ok "static: the generated worker-gate command carries its kill-not-detach bound"
 
