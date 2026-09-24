@@ -185,7 +185,17 @@ claim_main() {
   # 2) Flip In Progress — the claim-first lock; the atomic commit, done LAST.
   board_set_status "$item_id" "$BOARD_OPT_INPROGRESS"
 
-  echo "Claimed #$issue → In Progress  [$stamp]"
+  # STDERR, never stdout (temperloop#2232). This is a human progress line, and
+  # claim.sh is invoked INSIDE build-level.mjs's prelude batch, whose stdout is
+  # parsed as a stream of JSON result lines by the machinery-executor relay.
+  # Printed on stdout, this prose sat adjacent to the wrapper's
+  # {"outcome":"CLAIMED"} line and the relay parsed it INTO that object,
+  # inventing item/board/status/session_id fields and tripping the #2193
+  # relay-integrity refusal on a perfectly healthy claim. Every other batch-step
+  # emitter (worktree.sh / pr.sh / ci-poll.sh) already keeps stdout JSON-pure and
+  # sends advisories to stderr; this restores that convention here. A terminal
+  # still shows the line, so direct human use is unchanged.
+  echo "Claimed #$issue → In Progress  [$stamp]" >&2
 
   # 3) Append to the durable claims log (F#728) — AFTER the lock is committed, so
   #    a telemetry failure can never affect the stamp-then-flip ordering above.

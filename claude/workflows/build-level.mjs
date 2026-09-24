@@ -6205,7 +6205,29 @@ async function driveItemBuildPhase(item, arm, box) {
     addPrelude(
       'claim',
       // claim.sh exits 0 on success; we wrap a contention/no-op check into the — see build-level.design-notes-5.md#claim-sh-exits-0-on-success-we-wrap-a-contention-no-op-
-      `${sq(claimBin)} ${sq(item.ghIssue)} --board ${sq(board)} && ` +
+      // `>/dev/null` on the HELPER's stdout is load-bearing (temperloop#2232).
+      // This is the one prelude step that wraps a helper which does NOT itself
+      // emit JSON: claim.sh prints a human progress line and the `&& echo`
+      // below supplies the step's actual JSON result. Anything the helper
+      // writes to stdout therefore lands in the batch stream the relay parses
+      // as JSON lines, adjacent to that result — and on the first live drive
+      // after #2193 the executor parsed claim.sh's prose INTO the result
+      // object, inventing item/board/status/session_id and tripping a
+      // relay-integrity refusal on a healthy claim.
+      //
+      // This is deliberately STRUCTURAL rather than another line of prompt.
+      // claude/agents/machinery-executor.md already says "ignore non-JSON
+      // output" and "never merge ... or invent entries"; the executor was told
+      // exactly that and did it anyway, so the countermeasure cannot be the
+      // same instruction repeated louder (engineering principle 5 — counter AI
+      // failure modes structurally). Suppressed here, the prose physically
+      // cannot reach the relay. stderr is untouched, so the line still reaches
+      // the transcript for diagnosis, and claim.sh's own exit status — the only
+      // thing the `&&`/`||` branch reads — is unaffected.
+      //
+      // Any future prelude step that wraps a non-JSON-emitting helper in this
+      // `helper && echo '{...}'` shape owes the same redirect.
+      `${sq(claimBin)} ${sq(item.ghIssue)} --board ${sq(board)} >/dev/null && ` +
         `echo '{"outcome":"CLAIMED"}' || echo '{"outcome":"CLAIM_CONFLICT"}'`,
       ['CLAIMED'],
     );
