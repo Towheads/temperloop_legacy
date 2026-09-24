@@ -52,7 +52,23 @@
 # exits non-zero — it never prints OK over an input it never read (the
 # temperloop#1409 class). So: no jq, an explicitly-targeted stream that is
 # absent / unreadable / empty, an unparseable stream, an unreadable marker,
-# or a non-numeric $CMD_RUN_OPEN_GRACE_SECS are all exit 1.
+# or a non-numeric $CMD_RUN_OPEN_GRACE_SECS are all exit 1; a set-but-EMPTY
+# $CMD_RUN_RAW_DIR is exit 1 for the same reason. "Explicitly targeted"
+# includes a flag whose operand is EMPTY (`--open-dir ""`, the shape a
+# composed `--open-dir "$LEDGER"` produces when $LEDGER is unset): that is a
+# USAGE error, exit 2, refused in the parser before any gate is reached — so
+# no target can be both asserted and blank, and no check below can be skipped
+# by emptiness.
+#
+# EVERY FLAG'S OPERAND IS VALIDATED AT PARSE TIME, AND EVERY GATE KEYS ON
+# EXPLICITNESS. The two are one property: a flag recorded as "given" while
+# carrying an empty path used to leave every later `[ -n "$path" ]` gate
+# false, so the surface it named was never classified and its check never ran
+# (`--open-dir ""` silently disabled the MISSING-RUN check while this guard
+# still exited 0 — the fail-open class again, one level up from any single
+# surface). Operands are therefore refused once, centrally, in the argument
+# loop, and each gate below asks `*_explicit` / `*_set` — never `-n` on a
+# path. A flag added later inherits both halves.
 #
 # EVERY DIRECTORY SURFACE GOES THROUGH ONE SHARED CLASSIFIER, `classify_dir`.
 # This guard has two of them — the LAKE (`--raw-dir`, $CMD_RUN_RAW_DIR, or the
@@ -79,11 +95,13 @@
 # per-host and gitignored, so "this host has not emitted yet" is a real,
 # expected state and not a broken property.
 #
-# FOUR WAYS THIS GUARD ONCE FAILED **OPEN** — all four closed, all four
+# FIVE WAYS THIS GUARD ONCE FAILED **OPEN** — all five closed, all five
 # regression-tested, because a reconciliation guard that cannot fail closed is
 # strictly worse than no guard at all: it manufactures confidence. Three of
-# the four are ONE CLASS on three different surfaces, which is why the fourth
-# fix was a shared classifier rather than a third bespoke patch.
+# the five are ONE CLASS on three different surfaces, which is why the fourth
+# fix was a shared classifier rather than a third bespoke patch — and the
+# fifth is that same class one level ABOVE every surface, which is why its fix
+# is in the parser rather than on a surface at all.
 #   * A SPACED LAKE PATH. The file list was accumulated as a space-joined
 #     string and expanded unquoted into `cat $stream_files`. A path containing
 #     a space split into non-existent fragments, `cat`'s error went to
@@ -129,6 +147,23 @@
 #     scope was widened to cover after one session produced seven runs and
 #     zero records. Both surfaces now share `classify_dir`, and Check 1 runs
 #     only over a ledger that classifier confirmed listable.
+#   * AN EMPTY FLAG OPERAND — the same class ABOVE every surface, and the
+#     reason the fix is in the parser. `--open-dir` recorded that the ledger
+#     had been named EXPLICITLY but stored an empty path, while the gate that
+#     decided whether to classify it asked `[ -n "$open_dir" ]` —
+#     NON-EMPTINESS, not explicitness. So `--open-dir ""` skipped
+#     `classify_dir` altogether: the strictest surface in this guard became
+#     unreachable, Check 1 never ran, and an aged `emitted=0` MISSING-RUN
+#     alarm went unread while the clean reduction verdict printed over it —
+#     byte-identical to the bug above, on a path that never touches a
+#     directory surface at all. `--raw-dir ""` was the same defect the other
+#     way: an emptied operand silently re-targeted this host's DEFAULT lake
+#     instead of failing closed, so a mistargeted probe reported on a lake the
+#     caller never asked about. The trigger is not a typo but a composed
+#     invocation — `--open-dir "$LEDGER"` with $LEDGER unset, the shape CI
+#     wiring and `/tidy` produce. Fixed once, at the decision point: every
+#     flag's operand must be present and non-empty (exit 2, a USAGE error),
+#     and every gate keys on `*_explicit` / `*_set`.
 #
 # SETTINGS (named, never valued here — the kernel's § Named-setting
 # convention; `workflows/scripts/config/setting-registry.tsv` records the
@@ -143,7 +178,9 @@
 #   validate-command-run-reconcile.sh --raw-dir <dir>  # a whole lake elsewhere
 #
 # Exit codes: 0 = property holds (or nothing emitted yet); 1 = property broken
-#             or input could not be evaluated.
+#             or input could not be evaluated; 2 = USAGE — an unknown flag, or
+#             a flag whose operand is missing or empty (refused in the parser,
+#             before any input is read).
 #
 # Kept POSIX-bash-3.2-friendly (no mapfile/associative arrays) to match the
 # rest of workflows/scripts/ (macOS dev shell + Linux CI).
@@ -165,9 +202,12 @@ repo_root="$(cd -P "$here/../.." 2>/dev/null && pwd || echo "$HOME/dev/foundatio
 : "${CMD_RUN_OPEN_GRACE_SECS:=21600}"
 
 streams=""          # newline-separated; explicit --stream targets
+streams_explicit=0
 raw_dir=""
+raw_dir_explicit=0
 open_dir=""
-open_dir_explicit=0
+open_dir_explicit=0  # --open-dir was given
+open_dir_set=0       # …or the default <lake>/command-run-open was resolved
 reduce_only=0
 
 usage() {
@@ -176,17 +216,41 @@ usage() {
   awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
 }
 
+# THE ONE PLACE AN OPERAND IS VALIDATED (the header's fifth "failed OPEN").
+# Every value-taking flag routes through this, so a flag added later inherits
+# the check instead of re-opening the class on a sixth surface. An operand
+# that is MISSING (`--open-dir` at end of argv) and one that is EMPTY
+# (`--open-dir ""`, what a composed `--open-dir "$LEDGER"` produces when
+# $LEDGER is unset) are the SAME mistake and get the same refusal: the caller
+# asserted a target and named none. Refusing here — before any input is read
+# — is what lets every gate below key on explicitness rather than on a path
+# being non-empty, which is how `--open-dir ""` once skipped the whole
+# MISSING-RUN check while this guard still exited 0.
+need_operand() {  # <flag> <operand-or-empty>
+  if [ -z "${2:-}" ]; then
+    printf '%s: FAIL USAGE — %s needs a non-empty operand (it was given none, or an empty string). A flag that NAMES a target asserts it exists, so an empty operand is a mistargeted probe, never a default: it would leave this run gated on a path that is both explicitly named and blank, silently skipping the check that path selects. Pass a real path, or drop the flag to take the default.\n' \
+      "$self" "$1" >&2
+    exit 2
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --stream)   streams="$streams${2:-}
-"; shift; if [ $# -gt 0 ]; then shift; fi ;;
-    --raw-dir)  raw_dir="${2:-}"; shift; if [ $# -gt 0 ]; then shift; fi ;;
-    --open-dir) open_dir="${2:-}"; open_dir_explicit=1; shift; if [ $# -gt 0 ]; then shift; fi ;;
+    --stream)
+      need_operand "$1" "${2:-}"
+      streams="$streams$2
+"; streams_explicit=1; shift 2 ;;
+    --raw-dir)
+      need_operand "$1" "${2:-}"
+      raw_dir="$2"; raw_dir_explicit=1; shift 2 ;;
+    --open-dir)
+      need_operand "$1" "${2:-}"
+      open_dir="$2"; open_dir_explicit=1; open_dir_set=1; shift 2 ;;
     --reduce)   reduce_only=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     *)
-      printf '%s: FAIL unknown argument %s\n' "$self" "$1" >&2
-      exit 1 ;;
+      printf '%s: FAIL USAGE — unknown argument %s.\n' "$self" "$1" >&2
+      exit 2 ;;
   esac
 done
 
@@ -233,6 +297,9 @@ esac
 #             meaning differs per surface. Every other state fails on every
 #             surface, so no caller can get it wrong.
 classify_dir() {
+  # `local` so a shared helper cannot leak its parameters into the caller's
+  # scope and collide with a variable added later (bash 3.2 supports it).
+  local cd_path cd_explicit cd_what
   cd_path="$1"; cd_explicit="$2"; cd_what="$3"
   if [ -e "$cd_path" ] && [ ! -d "$cd_path" ]; then
     printf '%s: FAIL CANNOT EVALUATE — %s is not a directory, so the %s it names can never be listed. An unlistable directory is an unread input, never an empty one.\n' \
@@ -256,17 +323,27 @@ classify_dir() {
 }
 
 # ── Resolve the inputs ───────────────────────────────────────────────────
-explicit_streams=0
-[ -n "$streams" ] && explicit_streams=1
-
-if [ "$explicit_streams" -eq 0 ]; then
+# EXPLICITNESS IS A PARSE-TIME FACT, never re-derived from a path being
+# non-empty. `$streams_explicit` / `$raw_dir_explicit` / `$open_dir_explicit`
+# are set where the flag was READ; every gate below reads those flags. The
+# superseded `[ -n "$path" ]` form conflated "not given" with "given empty",
+# which is exactly how an empty operand disabled a whole check.
+if [ "$streams_explicit" -eq 0 ]; then
   # Was the lake NAMED, or defaulted? The distinction is the whole basis of
   # the fail-closed asymmetry below: a caller who names a lake has asserted it
   # exists, exactly as `--stream` and `--open-dir` already treat their targets.
-  raw_dir_explicit=0
-  if [ -n "$raw_dir" ]; then
-    raw_dir_explicit=1                       # --raw-dir <dir>
-  elif [ -n "${CMD_RUN_RAW_DIR:-}" ]; then
+  if [ "$raw_dir_explicit" -eq 1 ]; then
+    :                                        # --raw-dir <dir>, validated at parse time
+  elif [ "${CMD_RUN_RAW_DIR+set}" = set ]; then
+    # A SET-BUT-EMPTY setting is the env-var twin of an empty flag operand —
+    # `CMD_RUN_RAW_DIR="$LAKE"` with $LAKE unset — and silently falling back
+    # to this host's default lake would report on a lake the caller never
+    # asked about. It is a setting, not a flag, so it fails as CANNOT
+    # EVALUATE (exit 1) rather than as a usage error.
+    if [ -z "$CMD_RUN_RAW_DIR" ]; then
+      printf '%s: FAIL CANNOT EVALUATE — CMD_RUN_RAW_DIR is set but EMPTY, so the lake it selects is named and blank at once. Falling back to this host'"'"'s default lake here would report a clean verdict over a lake the caller never asked about. Set it to a real path, or unset it to take the default.\n' "$self" >&2
+      exit 1
+    fi
     raw_dir="$CMD_RUN_RAW_DIR"               # $CMD_RUN_RAW_DIR
     raw_dir_explicit=1
   else
@@ -282,9 +359,17 @@ if [ "$explicit_streams" -eq 0 ]; then
   # emitted nothing: a conclusion fabricated from a read that failed. Only
   # rc=2 (absent, and NOT explicitly named) comes back for this surface to
   # judge, and its judgement is the documented exit-0 case below.
+  # ONE $?-READING IDIOM, used identically at BOTH call sites: capture the
+  # status into `classify_rc` on the line straight after the call, then branch
+  # on the VARIABLE. `$?` is whatever ran last, so reading it inline is
+  # position-fragile — inserting one line between the call and the test (a
+  # `printf`, a debug `echo`) silently re-points it at that line's status.
   classify_dir "$raw_dir" "$raw_dir_explicit" \
     "command-run lake (--raw-dir, the CMD_RUN_RAW_DIR setting, or this host's default)"
-  [ "$?" -ne 1 ] || exit 1
+  classify_rc=$?
+  case "$classify_rc" in
+    1) exit 1 ;;
+  esac
 
   for f in "$raw_dir"/command-runs-*.jsonl; do
     [ -f "$f" ] || continue
@@ -299,7 +384,10 @@ if [ "$explicit_streams" -eq 0 ]; then
     printf '%s: ok — no command-runs-*.jsonl under %s; this host has emitted no command-run telemetry yet, so there is no reconciliation property to break.\n' "$self" "$raw_dir"
     exit 0
   fi
-  [ "$open_dir_explicit" -eq 1 ] || open_dir="$raw_dir/command-run-open"
+  if [ "$open_dir_explicit" -eq 0 ]; then
+    open_dir="$raw_dir/command-run-open"     # the default ledger beside the lake
+  fi
+  open_dir_set=1
 else
   # An explicitly-named stream MUST be readable and non-empty: the caller
   # asserted it exists, so an absent/empty one is an evaluation failure, not
@@ -330,11 +418,19 @@ fi
 # The classifier's verdict is also what gates Check 1 below: the loop runs
 # ONLY over a ledger this process confirmed it can list, never over a bare
 # `[ -d ]` that a chmod-000 directory satisfies.
+#
+# THE GATE KEYS ON `$open_dir_set`, NOT ON `[ -n "$open_dir" ]` (the header's
+# fifth "failed OPEN"). `--open-dir ""` set the explicit flag and left the
+# path blank, so the old non-emptiness gate was false, this classifier never
+# ran, and Check 1 was skipped over a ledger the caller had explicitly named.
+# The parser now refuses an empty operand outright, and this gate asks the
+# parse-time fact instead of re-deriving it from the path.
 open_dir_listable=0
-if [ -n "$open_dir" ]; then
+if [ "$open_dir_set" -eq 1 ]; then
   classify_dir "$open_dir" "$open_dir_explicit" \
     "open ledger (--open-dir, or the default <lake>/command-run-open)"
-  case "$?" in
+  classify_rc=$?
+  case "$classify_rc" in
     0) open_dir_listable=1 ;;
     1) exit 1 ;;
   esac

@@ -788,31 +788,189 @@ mkdir -p "$TMP/empty-ledger"
 recon --stream "$OL/command-runs-2026-09.jsonl" --open-dir "$TMP/empty-ledger"
 check_eq "an EMPTY but readable --open-dir stays GREEN: no open marker is a real, expected state" "0" "$RECON_RC"
 
-# ONE classifier, not three. The lake surface and the ledger surface must
-# reach the SAME helper — that is what makes a fourth surface inherit the
-# guard instead of repeating the bug a fourth time.
+# ONE classifier, not three — asserted BEHAVIOURALLY, from the OUTPUT.
+#
+# The round-4 form of this assertion counted `classify_dir "` call sites and
+# passed at >= 2. That assertion could not fail through the drift it names: it
+# reads SOURCE TEXT, so a call site that is present but never REACHED still
+# satisfies it — which is exactly what round 5 then found (`--open-dir ""`
+# skipped the ledger call site entirely and this check stayed green). A test
+# that survives its own regression is the silent-green class, so it is
+# replaced rather than kept beside the new one.
+#
+# What actually pins "one shared classifier" is that BOTH surfaces produce the
+# SAME sentence for the SAME pathological input, and that the sentence has
+# exactly ONE site in the source. A surface re-bespoked with a copy of the
+# message makes the source count 2; one re-bespoked with different wording
+# fails the output match; one that stops classifying at all prints neither.
+SHARED_MSG='is not a directory, so the'
+NOTDIR="$TMP/classifier-not-a-dir"; : > "$NOTDIR"
+recon --raw-dir "$NOTDIR"
+LAKE_RC="$RECON_RC"; LAKE_OUT="$RECON_OUT"
+recon --stream "$OL/command-runs-2026-09.jsonl" --open-dir "$NOTDIR"
+check_eq "both directory surfaces refuse the SAME not-a-directory target, both exit 1" \
+  "1 1" "$LAKE_RC $RECON_RC"
+case "$LAKE_OUT" in *"$SHARED_MSG"*)
+  case "$RECON_OUT" in *"$SHARED_MSG"*)
+      ok "…and both print the SAME shared-classifier sentence, so neither surface is bespoke" ;;
+    *) bad "both print the SAME shared-classifier sentence" "the LEDGER surface printed something else: [$RECON_OUT]" ;;
+  esac ;;
+  *) bad "both print the SAME shared-classifier sentence" "the LAKE surface printed something else: [$LAKE_OUT]" ;;
+esac
 # `grep -c` exits 1 on zero matches, so the count is taken from the STATUS,
 # never from an `|| echo 0` that would concatenate two lines into "0\n0".
-CLASSIFY_CALLS="$(grep -c 'classify_dir "' "$RECON" 2>/dev/null)" || CLASSIFY_CALLS=0
-case "$CLASSIFY_CALLS" in ''|*[!0-9]*) CLASSIFY_CALLS=0 ;; esac
-if [ "$CLASSIFY_CALLS" -ge 2 ]; then
-  ok "one SHARED classify_dir is called by both directory surfaces ($CLASSIFY_CALLS call sites)"
+MSG_SITES="$(grep -c "$SHARED_MSG" "$RECON" 2>/dev/null)" || MSG_SITES=0
+case "$MSG_SITES" in ''|*[!0-9]*) MSG_SITES=0 ;; esac
+check_eq "and that sentence has exactly ONE site in the guard (a copy would mean a second classifier)" \
+  "1" "$MSG_SITES"
+
+echo "── 19. the header's completeness claims are TRUE at this HEAD (round 5) ──"
+# In a guard whose entire job is honest reporting, a completeness claim the
+# code contradicts IS a defect. Round 4 was the fourth time this item shipped
+# one, so it is asserted mechanically from here on — and round 5 shipped a
+# fifth way, so the count moves with the code or this goes red.
+grep_ok "the header counts FIVE ways it once failed open" "FIVE WAYS" "$RECON"
+for superseded in 'THREE WAYS THIS GUARD ONCE FAILED' 'FOUR WAYS THIS GUARD ONCE FAILED'; do
+  if grep -Fq "$superseded" "$RECON"; then
+    bad "the superseded claim '$superseded' is gone" "the header still carries it"
+  else
+    ok "the superseded claim '$superseded' is gone"
+  fi
+done
+grep_ok "the header names the shared classifier by name" "classify_dir" "$RECON"
+# Lines 53-55 and 57 of the header (the FAIL CLOSED paragraph and the shared-
+# classifier claim) must both be true for an EMPTY operand too — section 20
+# is the behavioural half; these are the claims themselves.
+grep_ok "the FAIL CLOSED paragraph covers an empty flag operand" \
+  "includes a flag whose operand is EMPTY" "$RECON"
+grep_ok "the header states the parse-time operand rule" \
+  "EVERY FLAG'S OPERAND IS VALIDATED AT PARSE TIME" "$RECON"
+
+echo "── 20. an EMPTY or MISSING flag operand is a USAGE error (round 5, HIGH) ──"
+# THE SAME fail-open class as sections 11, 14 and 18 — one level ABOVE every
+# surface, in the argument parser, and pre-existing since this guard's first
+# commit. `--open-dir ""` recorded the ledger as EXPLICITLY named while
+# storing an empty path, and the gate that decided whether to classify it
+# asked `[ -n "$open_dir" ]` — NON-EMPTINESS, not explicitness. So the
+# classifier never ran, Check 1 never ran, and the clean reduction verdict
+# printed straight over the aged emitted=0 alarm section 18 uses. `--raw-dir
+# ""` was the mirror image: an emptied operand silently re-targeted this
+# host's DEFAULT lake instead of failing closed. The trigger is not a typo
+# but a composed invocation — `--open-dir "$LEDGER"` with $LEDGER unset.
+#
+# $OL (section 18) is the discriminating fixture: a lake holding one record
+# plus an aged emitted=0 MISSING-RUN alarm. The GREEN control is right here.
+recon --raw-dir "$OL"
+check_eq "control: with the ledger reached normally, the aged alarm is READ (exit 1)" "1" "$RECON_RC"
+case "$RECON_OUT" in *"MISSING-RUN  run_id=run-ALARM"*) ok "control: and the alarm is named" ;;
+  *) bad "control: and the alarm is named" "got [$RECON_OUT]" ;; esac
+
+recon --raw-dir "$OL" --open-dir ""
+check_eq "an EMPTY --open-dir operand is a USAGE error (exit 2), never a silent skip" "2" "$RECON_RC"
+case "$RECON_OUT" in *"record(s) reduce to"*)
+    bad "an empty --open-dir never prints the clean reduction verdict" \
+      "it printed exactly that over the hidden alarm: [$RECON_OUT]" ;;
+  *) ok "an empty --open-dir never prints the clean reduction verdict" ;; esac
+case "$RECON_OUT" in *"FAIL USAGE"*"--open-dir"*) ok "and it says which flag was given no operand" ;;
+  *) bad "and it says which flag was given no operand" "got [$RECON_OUT]" ;; esac
+
+# The MISSING-operand twin: the flag as the LAST argument, no operand at all.
+recon --raw-dir "$OL" --open-dir
+check_eq "a MISSING --open-dir operand fails identically (exit 2)" "2" "$RECON_RC"
+
+# The --raw-dir half of the same bug: an empty operand must NOT fall back to
+# this host's default lake, which would report a clean verdict over a lake the
+# caller never named.
+recon --raw-dir ""
+check_eq "an EMPTY --raw-dir operand is a USAGE error, not a silent re-target of the default lake" "2" "$RECON_RC"
+case "$RECON_OUT" in *"ok —"*) bad "an empty --raw-dir never reports on the default lake" "got [$RECON_OUT]" ;;
+  *) ok "an empty --raw-dir never reports on the default lake" ;; esac
+
+recon --stream "" --open-dir "$OL/command-run-open"
+check_eq "an EMPTY --stream operand is a USAGE error too — every flag, one rule" "2" "$RECON_RC"
+
+# The SETTING twin of an empty operand: CMD_RUN_RAW_DIR set but blank — the
+# shape `CMD_RUN_RAW_DIR="$LAKE"` produces when $LAKE is unset. It is a
+# setting, not a flag, so it fails as CANNOT EVALUATE (1), not USAGE (2).
+RECON_OUT="$(CMD_RUN_RAW_DIR="" bash "$RECON" 2>&1)"; RECON_RC=$?
+check_eq "a set-but-EMPTY \$CMD_RUN_RAW_DIR fails closed (exit 1), never falls back to the default lake" "1" "$RECON_RC"
+case "$RECON_OUT" in *"set but EMPTY"*) ok "and it names the setting as the cause" ;;
+  *) bad "and it names the setting as the cause" "got [$RECON_OUT]" ;; esac
+
+# A VALID operand still works — the green twin that proves the parser refuses
+# emptiness, not the flag.
+recon --raw-dir "$OL" --open-dir "$OL/command-run-open"
+check_eq "GREEN twin: the SAME flags with REAL operands still read the alarm (exit 1)" "1" "$RECON_RC"
+case "$RECON_OUT" in *"MISSING-RUN  run_id=run-ALARM"*) ok "GREEN twin: and the alarm is named" ;;
+  *) bad "GREEN twin: and the alarm is named" "got [$RECON_OUT]" ;; esac
+
+# And the STATIC half: no gate may re-derive explicitness from a path being
+# non-empty. This is what stops the class returning on a flag added later.
+# shellcheck disable=SC2016  # the single quotes are deliberate: this is the
+# literal SOURCE TEXT being searched for, not an expansion.
+if grep -Eq 'if \[ -n "\$(open_dir|raw_dir)" \]' "$RECON"; then
+  bad "no gate keys on a path being non-empty" \
+    "a \`[ -n \"\$open_dir\" ]\`/\`[ -n \"\$raw_dir\" ]\` gate is back — explicitness is a parse-time fact"
 else
-  bad "one SHARED classify_dir is called by both directory surfaces" \
-    "found $CLASSIFY_CALLS call site(s) — a third bespoke block is how this class survived three rounds"
+  ok "no gate keys on a path being non-empty (every gate reads a parse-time *_explicit/*_set flag)"
+fi
+grep_ok "every value-taking flag routes through one operand validator" "need_operand \"\$1\"" "$RECON"
+
+echo "── 21. the SPEC side of the same class: the --open call's ordering (round 5, HIGH) ──"
+# The script half above stops a check being SKIPPED. The spec half stops a
+# FALSE alarm being manufactured, which is worse: sweep.md item 8 / triage.md
+# item 7 / fix.md item 7 sit in the same "Run in parallel:" list as the item
+# that computes $BOARD, and each numbered item is typically its own Bash call
+# with no persisted shell state. An open call that runs with $BOARD empty
+# writes the marker under the target-LESS key; the terminal emit, by then
+# holding a resolved board, computes the target-BEARING key, adopts nothing,
+# and mints a second id — leaving an orphan at emitted=0 that prune never
+# removes and that ages into a MISSING-RUN alarm that is FALSE.
+#
+# validate-command-run-emit.sh owns the mechanical check; this asserts it is
+# armed AND that it discriminates, by running it over the PRE-fix doc shape.
+if [ ! -f "$LINT" ]; then
+  bad "the emit lint is present" "missing at $LINT"
+else
+  LINT_OUT="$(bash "$LINT" 2>&1)"; LINT_RC=$?
+  check_eq "the emit lint is GREEN on the real specs" "0" "$LINT_RC"
+  case "$LINT_OUT" in *"declares the open call's ordering dependency"*)
+      ok "and it reports the ordering check ran on all three caller docs" ;;
+    *) bad "and it reports the ordering check ran" "got [$LINT_OUT]" ;; esac
+
+  # RED twin: the same lint over a doc whose open call carries no ordering
+  # call-out — a hermetic copy, so nothing outside $TMP is touched.
+  ORD="$TMP/ordering-red"; mkdir -p "$ORD/workflows/scripts" "$ORD/claude/commands"
+  cp "$LINT" "$ORD/workflows/scripts/" && cp "$EMIT" "$ORD/workflows/scripts/"
+  chmod +x "$ORD/workflows/scripts/emit-command-run.sh"
+  for d in sweep triage fix; do cp "$REPO/claude/commands/$d.md" "$ORD/claude/commands/$d.md"; done
+  # Strip ONLY the ordering call-out from sweep.md — every other line stands,
+  # so a red here can be nothing else.
+  sed 's/\*\*Runs after item [0-9]\*\*//' \
+    "$REPO/claude/commands/sweep.md" > "$ORD/claude/commands/sweep.md"
+  ORD_OUT="$(bash "$ORD/workflows/scripts/validate-command-run-emit.sh" 2>&1)"; ORD_RC=$?
+  check_eq "RED twin: the lint FAILS a doc whose open call lost its ordering call-out" "1" "$ORD_RC"
+  case "$ORD_OUT" in *"no ordering call-out"*) ok "RED twin: and it names the missing call-out" ;;
+    *) bad "RED twin: and it names the missing call-out" "got [$ORD_OUT]" ;; esac
 fi
 
-echo "── 19. the header's completeness claims are TRUE at this HEAD (round 4) ──"
-# In a guard whose entire job is honest reporting, a completeness claim the
-# code contradicts IS a defect. Round 4 is the fourth time this item shipped
-# one, so it is asserted mechanically from here on.
-grep_ok "the header no longer claims only THREE ways it failed open" "FOUR WAYS" "$RECON"
-if grep -Fq 'THREE WAYS THIS GUARD ONCE FAILED' "$RECON"; then
-  bad "the superseded THREE-WAYS claim is gone" "the header still says THREE"
-else
-  ok "the superseded THREE-WAYS claim is gone"
-fi
-grep_ok "the header names the shared classifier by name" "classify_dir" "$RECON"
+# The carve-out sentence must read the SAME in all three specs — a
+# best-effort step stated three ways invites an executor to treat one as
+# blocking. (The lint asserts it too; this pins the exact shared wording.)
+for d in "$SWEEP_MD" "$TRIAGE_MD" "$FIX_MD"; do
+  grep_ok "$(basename "$d") carries the shared never-stops-a-run carve-out" \
+    "(the telemetry ledger open) never stops a run" "$d"
+done
+
+# And the docs MEDIUM: the first mention of #2220 in each caller spec carries
+# a title hook, per claude/message-schema.md's reference-token rule.
+for d in "$SWEEP_MD" "$TRIAGE_MD" "$FIX_MD"; do
+  first="$(grep -n 'temperloop#2220' "$d" | head -1)"
+  case "$first" in *"temperloop#2220 — stable command-run id"*)
+      ok "$(basename "$d") gives #2220 a first-mention title hook" ;;
+    *) bad "$(basename "$d") gives #2220 a first-mention title hook" "first mention was: [$first]" ;;
+  esac
+done
 
 printf '\n'
 if [ "$fail" -gt 0 ]; then

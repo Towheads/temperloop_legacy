@@ -54,6 +54,16 @@
 #      3.6A epic-closing gate (matched on BOTH the `epics_reviewed` field name
 #      and the `Step 3.6A` anchor) must pass `--epics-reviewed` on its emit
 #      call, so the signal is unconditional on the DOC side.
+#   6. (temperloop#2220 — stable command-run id) a caller doc no longer OPENS
+#      the run ledger at the run's start (`--open --command <cmd>`). Without
+#      it a park-then-merge run's two records share no run_id and the item is
+#      counted twice, and a run that emits nothing leaves no marker at all.
+#   7. (temperloop#2220 round 5) a doc's `--open` call interpolates a shell
+#      variable (`--board "$BOARD"` / `--target "$BOARD"`) without declaring
+#      the ORDERING dependency that makes it non-empty, or states the
+#      never-stops-a-run carve-out in wording the other docs do not share.
+#      See check_open_ordering below for why an empty `--target` is worse
+#      than a skipped check: it manufactures a FALSE MISSING-RUN alarm.
 #
 # This mirrors the validate-capture-backstop.sh shape (same script style, same
 # hard-fail-on-half-present contract, wired into scripts/quality-gates.sh
@@ -215,6 +225,51 @@ check_open_ledger() {  # $1=label $2=path $3=expected --command value
   echo "ok    $label opens the run ledger (--open --command $cmdval)"
 }
 
+# --- 7. an --open call that INTERPOLATES a variable must declare its ordering
+# Content-derived, the same shape as the checks above: the trigger is the open
+# call passing a shell variable (`--board "$BOARD"` / `--target "$BOARD"`), not
+# this script knowing which docs do.
+#
+# WHY A LINT AND NOT A REVIEW NOTE (temperloop#2220). Each Step-0 item is
+# typically its own Bash call with no persisted shell state, and every one of
+# these docs computes `$BOARD` in an EARLIER numbered item of the SAME "Run in
+# parallel:" list. Under a literal reading, an open call with no ordering
+# call-out can therefore run with `$BOARD` still empty — and `--target` is the
+# load-bearing half of the ledger marker key. An empty one writes the marker
+# under the target-LESS key; the terminal emit, by then holding a resolved
+# board, computes the target-BEARING key, adopts nothing, and mints a second
+# id. The orphan is never pruned (`prune_spent_markers()` leaves `emitted=0`
+# alone, deliberately) and ages into a MISSING-RUN alarm that is FALSE. This
+# does not merely disable the guard: it manufactures a wrong alarm, which is
+# the worst failure available to a reconciliation signal — it teaches the
+# reader to ignore it. The convention already exists in these same files
+# ("Runs **after** item 3 (it needs `ownerRepo`)"); this makes it mechanical.
+#
+# Also asserts the CARVE-OUT WORDING is the same sentence in all three docs: a
+# best-effort step stated three different ways invites an executor to treat
+# one of them as blocking.
+check_open_ordering() {  # $1=label $2=path $3=expected --command value
+  local label="$1" file="$2" cmdval="$3" line
+  [ -f "$file" ] || return 0   # missing-doc case already reported by check_wiring
+  line="$(grep -E -- "--open[[:space:]]+--command[[:space:]]+${cmdval}([[:space:]]|$)" "$file" | head -1)"
+  if [ -z "$line" ]; then
+    return 0                   # absent open call already reported by check_open_ledger
+  fi
+  if printf '%s' "$line" | grep -E -q -- '--(board|target)[[:space:]]+"\$'; then
+    if ! printf '%s' "$line" | grep -E -q 'Runs[[:space:]]+\*{0,2}after\*{0,2}[[:space:]]+item[[:space:]]+[0-9]'; then
+      echo "FAIL  $label ($file) opens the run ledger with a shell variable (--board/--target \"\$…\") but the item carries no ordering call-out. Add the convention this repo already uses for a cross-item data dependency inside a 'Run in parallel:' list — \"Runs after item N — it needs \\\`\$BOARD\\\`\". Without it the open call can run before the board is inferred, keying the marker WITHOUT a target while the terminal emit keys it WITH one: the emit adopts nothing, mints a second run id, and the orphaned emitted=0 marker ages into a MISSING-RUN alarm that is FALSE (temperloop#2220)"
+      fail=1
+      return
+    fi
+  fi
+  if ! grep -Fq '(the telemetry ledger open) never stops a run' "$file"; then
+    echo "FAIL  $label ($file) opens the run ledger but does not carry the shared carve-out sentence '<item> (the telemetry ledger open) never stops a run' — the best-effort status of this step must read the same in every caller doc, or an executor will treat one doc's open call as a blocking Step-0 check (temperloop#2220)"
+    fail=1
+    return
+  fi
+  echo "ok    $label declares the open call's ordering dependency and the shared never-stops-a-run carve-out"
+}
+
 check_wiring "sweep.md"  "$SWEEP_MD"  "sweep"
 check_wiring "triage.md" "$TRIAGE_MD" "triage"
 check_wiring "fix.md"    "$FIX_MD"    "fix"
@@ -222,6 +277,10 @@ check_wiring "fix.md"    "$FIX_MD"    "fix"
 check_open_ledger "sweep.md"  "$SWEEP_MD"  "sweep"
 check_open_ledger "triage.md" "$TRIAGE_MD" "triage"
 check_open_ledger "fix.md"    "$FIX_MD"    "fix"
+
+check_open_ordering "sweep.md"  "$SWEEP_MD"  "sweep"
+check_open_ordering "triage.md" "$TRIAGE_MD" "triage"
+check_open_ordering "fix.md"    "$FIX_MD"    "fix"
 
 check_resolved "sweep.md"  "$SWEEP_MD"
 check_resolved "triage.md" "$TRIAGE_MD"

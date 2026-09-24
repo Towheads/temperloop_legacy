@@ -92,3 +92,27 @@
   the ledger exists to record — would have turned the gate red for every later
   merge on that host. `/tidy`'s environment-hygiene step runs it and reports
   stale markers, which is where a stale-marker report belongs.
+- **Every flag operand of `validate-command-run-reconcile.sh` is validated at
+  parse time, and every gate keys on explicitness** (#2220). `--open-dir ""`
+  recorded the ledger as explicitly named while storing an empty path, and the
+  gate that decided whether to classify it asked `[ -n "$open_dir" ]` —
+  non-emptiness, not explicitness — so the shared directory classifier never
+  ran, the MISSING-RUN check was skipped, and the clean reduction verdict
+  printed over an aged `emitted=0` alarm. `--raw-dir ""` was the mirror image:
+  an emptied operand silently re-targeted this host's default lake. The trigger
+  is a composed invocation (`--open-dir "$LEDGER"` with `$LEDGER` unset), not a
+  typo. A missing or empty operand on any flag is now a usage error (**new exit
+  code 2**), a set-but-empty `$CMD_RUN_RAW_DIR` fails closed as CANNOT
+  EVALUATE, and each gate reads the parse-time `*_explicit` / `*_set` fact — so
+  a flag added later inherits both halves.
+- **The three caller specs declare the ordering their `--open` call depends on**
+  (#2220). `sweep.md` item 8, `triage.md` item 7 and `fix.md` item 7 sit in the
+  same "Run in parallel:" list as the item that computes `$BOARD`, with no
+  ordering call-out. An open call running with `$BOARD` empty keys the marker
+  without a target while the terminal emit keys it with one: the emit adopts
+  nothing, mints a second id, and the orphan ages into a MISSING-RUN alarm that
+  is **false** — worse than a missed one, because it teaches the reader to
+  ignore the guard. Each item now carries the repo's existing "Runs after item
+  N — it needs `$BOARD`" convention, the never-stops-a-run carve-out reads the
+  same in all three, and `validate-command-run-emit.sh` fails a caller doc whose
+  variable-interpolating `--open` call drops either.
