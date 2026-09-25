@@ -89,6 +89,12 @@
 #     "## Output" block, which is the invariant the anchor rests on; and each
 #     arm of the preserve-verbatim severity alternation is exercised against a
 #     negative control
+#   - ci-unknown (temperloop#2249): a ci-poll ERROR and an empty-batch poll
+#     escalate ci-unknown with a facts-only payload (sha, poll_state, and
+#     ciOut/reason — never a disposition string) and a HELD board claim read off
+#     committed_work rather than the kind name; a real CI_FAILED past budget
+#     still escalates ci-failed (collapse guard); static guard pins BOTH raise
+#     sites to CI_UNKNOWN_KIND and build.md's documentation of the kind
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd ../../../.. && pwd)"
