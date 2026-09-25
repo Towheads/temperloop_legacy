@@ -1868,6 +1868,39 @@ fi
 ok "S4b the same all-zero class, with the arms on two vendors, is named in the withheld reason instead — S4 is a rule, not a blanket permission"
 
 count
+# SAME PROVIDER, WITHHELD ANYWAY — the case that caught the round-2 reason
+# wording. A same-provider run CAN be withheld: by an unmapped class. Gating
+# the all-zero sentences on comparability rather than on the STATE sent this
+# run down the cross-vendor branch, where it asserted two things that are
+# false of it — that the arms were not on one provider, and that the axis was
+# withheld on the provider verdict (review round 3 [MEDIUM]).
+MW="$WORK/mixed-withheld"
+mkrepo "$MW"
+jq -c '.candidate.tokens.cache_creation = null' "$WORK/xv-base.jsonl" \
+  >"$MW/.temperloop/model-comparison/baseline.jsonl"
+jq -c '.candidate.tokens.cache_creation = 0' "$WORK/xv-cand.jsonl" \
+  >"$MW/.temperloop/model-comparison/candidate.jsonl"
+lake "$MW" pipeline-drive-safe retro-judge
+run "$MW"; cp "$RUN_OUT" "$WORK/mixed-withheld.json"
+[ "$(jqf "$WORK/mixed-withheld.json" '.cost_basis.cross_vendor.state')" = "same-provider" ] \
+  || fail "S4c: fixture precondition — both arms must be on one provider, got $(jqf "$WORK/mixed-withheld.json" '.cost_basis.cross_vendor.state')"
+[ "$(jqf "$WORK/mixed-withheld.json" '.cost_basis.cross_vendor.comparable')" = "false" ] \
+  || fail "S4c: the unmapped class must withhold the axis even under one provider"
+jq -e '.cost_basis.cross_vendor.reason | test("UNMAPPED")' "$WORK/mixed-withheld.json" >/dev/null 2>&1 \
+  || fail "S4c: the reason must name the unmapped class as the thing withholding"
+# THE REGRESSION ITSELF: no sentence may claim this run spans two providers,
+# nor that the provider verdict is what withheld it.
+if jq -e '.cost_basis.cross_vendor.reason | test("NOT on one provider")' "$WORK/mixed-withheld.json" >/dev/null 2>&1; then
+  fail "S4c: a same-provider run must never be told it is not on one provider: $(jqf "$WORK/mixed-withheld.json" '.cost_basis.cross_vendor.reason')"
+fi
+if jq -e '.cost_basis.cross_vendor.reason | test("already withheld on the provider verdict")' "$WORK/mixed-withheld.json" >/dev/null 2>&1; then
+  fail "S4c: this run is withheld on the unmapped class, not on the provider verdict"
+fi
+jq -e '.cost_basis.cross_vendor.reason | test("NOT on this")' "$WORK/mixed-withheld.json" >/dev/null 2>&1 \
+  || fail "S4c: the all-zero class must be disclosed as a measured zero and explicitly NOT credited with the refusal"
+ok "S4c same provider, withheld on an unmapped class: the all-zero class is still disclosed as a measured zero and the reason asserts nothing false about the provider"
+
+count
 # The post-#2275 shape: an explicit null is the arm saying it never had the
 # class at all. Reported APART from the all-zero case, so the distinction
 # survives in the output the moment the records can carry it.

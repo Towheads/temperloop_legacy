@@ -327,9 +327,13 @@ if [ -n "$summary_out" ]; then
      cost_verdict: (.comparison.verdict // null),
      cost_paired_n: (.comparison.paired_outcomes_n // null),
      # cost_verdict above is arithmetic over whatever the two arms cost.
-     # These two say whether that arithmetic is a COMPARISON at all,
-     # so a machine consumer cannot lift an incomparable figure the rendered
-     # page withholds. Same fail-closed predicate the page uses: anything that
+     # These two say whether that arithmetic is a COMPARISON at all, so a
+     # machine consumer can REFUSE to lift a figure the rendered page
+     # withholds. Note cost_verdict itself still rides, deliberately: nulling
+     # an existing sidecar key would change its semantics for readers that
+     # already consume it. The figure is FLAGGED here, not withheld — acting
+     # on the flag is the consumer job. Same fail-closed predicate the page
+     # uses: anything that
      # is not an explicit true carries a reason. ADDITIVE under the unchanged
      # model-comparison-summary-v1 schema id — two new keys, none removed,
      # none re-typed (temperloop#1742 review round 1).

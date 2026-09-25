@@ -7,8 +7,8 @@
   comparable at all, a named reason when it is not, and per-arm tariff facts
   naming each arm's observed vendor and models. The rendered page prints that
   reason where the cost delta would have gone, and the machine-readable
-  summary sidecar carries the same flag so an automated consumer cannot lift
-  a figure the page withheld.
+  summary sidecar carries the same flag so an automated consumer can refuse
+  to lift a figure the page withheld.
 
   A token class the records never priced is no longer silently costed at
   zero, and the two ways that happens are now kept apart. A class carrying no

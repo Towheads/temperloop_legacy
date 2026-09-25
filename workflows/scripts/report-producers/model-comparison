@@ -751,26 +751,32 @@ jq -n \
   #                            for the class (key absent, or present as null).
   #   ZERO ON EVERY RECORD     every record carries 0.
   #
+  # THE TWO SHAPES ARE TEXTUALLY INDISTINGUISHABLE HERE. The only writer of
+  # `candidate.tokens` in this pipeline — workflows/scripts/model-comparison/
+  # replay.sh — builds the block with `<envelopeField> // 0` for ALL FOUR
+  # classes, so a class the vendor envelope never carried is written as 0
+  # rather than as null. Nothing in these records separates "the vendor
+  # billed zero" from "the vendor has no such class". Root cause, out of
+  # scope here and filed separately: temperloop#2275 (emit null for a class
+  # the envelope never carried). Both shapes are reported APART all the same,
+  # so the distinction survives in the output the moment the records carry it.
+  #
   # THEY DO NOT WITHHOLD ALIKE (review round 2). UNMAPPED refuses in EVERY
   # state — a delta that prices a gap at zero is not a measurement. ZERO ON
   # EVERY RECORD refuses only when the arms are NOT on one provider, because
-  # the ambiguity below can only bite when the two arms envelopes can differ;
+  # the ambiguity above can only bite when the two arms envelopes can differ;
   # under one provider both arms share one envelope shape, an all-zero class
   # is a real cost fact the delta carries, and withholding there would defeat
   # the same-vendor comparison this axis exists for. It is DISCLOSED instead.
   #
-  # The second is NOT a measurement, however much it looks like one. The only
-  # writer of `candidate.tokens` in this pipeline —
-  # workflows/scripts/model-comparison/replay.sh — builds the block with
-  # `<envelopeField> // 0` for ALL FOUR classes, so a class the vendor
-  # envelope never carried is written as 0 rather than as null. On these
-  # records "the vendor billed zero" and "the vendor has no such class" are
-  # therefore INDISTINGUISHABLE, and calling the all-zero case measured would
-  # be a false statement about measurement — exactly the silent zero this
-  # block exists to stop. Both are reported (apart, so the distinction
-  # survives once the records can carry it) and BOTH withhold the axis.
-  # Root cause, out of scope here and filed separately: temperloop#2275
-  # (emit null for a class the envelope never carried).
+  # KNOWN GAP, DELIBERATELY NOT CLOSED (review round 3). The zero bucket
+  # requires at least one non-null value, so an arm whose class is null on
+  # SOME records and 0 on others lands in the zero bucket rather than the
+  # unmapped one, and reads as a measured zero under same-provider. That
+  # mixed shape is unreachable today (replay.sh never writes null) and
+  # becomes reachable only during a post-temperloop#2275 transition, where a
+  # corpus can span records written by both versions. Left as-is rather than
+  # guessed at: the right disposition depends on how #2275 lands.
   | (["input", "cache_read", "cache_creation", "output"]) as $tok_classes
   | ($base | map(select(((.candidate // {}).tokens | type) == "object")
                  | .candidate.tokens))                                  as $btok
@@ -849,8 +855,16 @@ jq -n \
       (if ($cv_unmapped | length) > 0 then
          "token class(es) carrying NO VALUE on any record in \($cv_unmapped_where) — key absent, or present and null. The SPEND_WEIGHT_* multiply-add reads such a class as 0, so it is UNMAPPED: never measured. A delta computed with an unmapped class priced at zero is not a cost comparison"
        else empty end),
-      (if ($cv_zero | length) > 0 and $cv_comparable then
+      # GATED ON THE STATE, never on comparability (review round 3). A
+      # same-provider run can still be withheld — by an UNMAPPED class — and
+      # gating these sentences on $cv_comparable sent that run down the
+      # cross-vendor branch, where it asserted two things that were false of
+      # it: that the arms were not on one provider, and that the axis was
+      # withheld on the provider verdict.
+      (if ($cv_zero | length) > 0 and $cv_state == "same-provider" and $cv_comparable then
          "DISCLOSURE, not a refusal: token class(es) reading 0 on EVERY record in \($cv_zero_where). Both arms ran against ONE provider and therefore one vendor envelope shape, so this is read as a MEASURED zero — a real cost fact the delta carries, not a hole in it. It is disclosed here, and in zero_on_every_record_token_classes per arm, because on these records it is still not textually distinguishable from a class workflows/scripts/model-comparison/replay.sh defaulted to 0 (it builds candidate.tokens with `<envelopeField> // 0` for all four classes); temperloop#2275 is what will let this producer tell the two apart"
+       elif ($cv_zero | length) > 0 and $cv_state == "same-provider" then
+         "token class(es) reading 0 on EVERY record in \($cv_zero_where), disclosed as a measured zero: both arms ran against one provider. The axis is withheld on the unmapped class named above, NOT on this"
        elif ($cv_zero | length) > 0 then
          "token class(es) reading 0 on EVERY record in \($cv_zero_where). With the arms NOT on one provider their vendor envelopes can differ, so an all-zero class here is not readable as a measured zero at all: replay.sh builds candidate.tokens with `<envelopeField> // 0` for all four classes, so a class the envelope never carried is written as 0 rather than as null (root cause filed as temperloop#2275; this producer does not edit replay.sh). The axis is already withheld on the provider verdict above; this names the classes a reader would otherwise take for measurements"
        else empty end)
