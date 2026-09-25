@@ -12849,10 +12849,15 @@ if (!/invalid/.test(String(result.escalations[0].payload?.ciOut?.error)))
 console.log(JSON.stringify({ ok: true }));
 "
 
-# --- 4. the DISCRIMINATING control: a genuine ci-poll ERROR is STILL ci-failed -
-# If every ERROR were re-routed the new kind would classify nothing. An ERROR
-# that is not an argument refusal keeps its unchanged `ci-failed` path.
-run_node_case "#2014 control: a NON-argument ci-poll ERROR still escalates ci-failed (the new kind discriminates)" "
+# --- 4. the DISCRIMINATING control: a NON-argument ci-poll ERROR gets its OWN
+# kind, never ci-poll-bad-argument. If every ERROR were re-routed to the
+# argument-refusal kind that kind would classify nothing.
+# temperloop#2249 RE-POINTED this control's expected kind: the non-argument
+# ERROR arm used to fall through to `ci-failed`, which asserted a red CI verdict
+# the poll never obtained. It is now `ci-unknown` — see the #2249 block below
+# for that split's own cases. What this control still proves is unchanged: the
+# argument-refusal kind does not swallow every ERROR.
+run_node_case "#2014 control: a NON-argument ci-poll ERROR is NOT ci-poll-bad-argument (the argument kind discriminates)" "
 $PREAMBLE
 
 setMachinery('item-realerr',
@@ -12876,8 +12881,10 @@ const result = await mod.default();
 
 if ((result.escalations ?? []).length !== 1)
   { console.log(JSON.stringify({ ok: false, reason: 'expected 1 escalation: ' + JSON.stringify(result) })); process.exit(0); }
-if (result.escalations[0].kind !== 'ci-failed')
-  { console.log(JSON.stringify({ ok: false, reason: 'a non-argument ERROR was re-routed away from ci-failed: ' + result.escalations[0].kind })); process.exit(0); }
+if (result.escalations[0].kind === 'ci-poll-bad-argument')
+  { console.log(JSON.stringify({ ok: false, reason: 'a non-argument ERROR was swallowed by the argument-refusal kind' })); process.exit(0); }
+if (result.escalations[0].kind !== 'ci-unknown')
+  { console.log(JSON.stringify({ ok: false, reason: 'a non-argument ERROR must classify as ci-unknown (temperloop#2249): ' + result.escalations[0].kind })); process.exit(0); }
 
 console.log(JSON.stringify({ ok: true }));
 "
@@ -12947,6 +12954,151 @@ case "$K2014_MJS" in
   *) fail "#2014: ci-poll.sh argument refusals are no longer split out of the ci-failed catch-all" ;;
 esac
 echo "PASS: #2014 static guard — both pushedSha pre-flights and the bad-argument split are wired in build-level.mjs"
+
+# ============================================================================
+# temperloop#2249: ci-poll ERROR is an UNKNOWN, never a red CI verdict
+# ============================================================================
+# ci-poll.sh's outcome vocabulary already separates 'CI ran and said no'
+# (CI_FAILED) from 'the poll never produced a result' (ERROR). The driver used
+# to flatten the second onto `ci-failed`, discarding the distinction at the very
+# moment a kind-name is chosen. The reproduction (run wf_096db800-733, PR #2248)
+# escalated `ci-failed` for a PR whose `checks` were already SUCCESS and which
+# then enqueued and merged with zero further changes — a driver trusting the
+# kind would have parked a ready-to-merge PR as red.
+#
+# ONE case, three arms, so a COLLAPSE is caught directly rather than by two
+# independently-passing assertions: the two ERROR shapes that mean 'we never
+# heard back' and the genuine CI_FAILED that means 'CI said no'.
+run_node_case "#2249 classify: a ci-poll ERROR (and an empty-batch poll) escalates ci-unknown with facts-only payload and a HELD claim, while a real CI_FAILED still escalates ci-failed" "
+$PREAMBLE
+
+const bail = (r) => { console.log(JSON.stringify({ ok: false, reason: r })); process.exit(0); };
+
+// --- ARM 1: a transport/API ERROR from ci-poll.sh itself. CI state UNKNOWN.
+setMachinery('item-err',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/item-err' },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'aa01' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'c8dcd9d', branch: 'build/item-err' },
+  { outcome: 'PR_OPENED', pr_number: 2248 },
+  { outcome: 'ERROR', error: 'gh api failed after 3 attempts' },
+);
+happyWorker('item-err');
+
+// --- ARM 2: the REPRODUCTION. The ci-poll step RAN but its result line never
+// reached the driver, so batchStep() synthesizes the 'produced no result in its
+// batch' ERROR — the exact ciOut the live escalation carried.
+setMachinery('item-lost',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/item-lost' },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'aa02' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'bb02', branch: 'build/item-lost' },
+  { outcome: 'PR_OPENED', pr_number: 2248 },
+  { __lostReturn: true },
+);
+happyWorker('item-lost');
+
+// --- ARM 3: the DISCRIMINATING control. CI really ran and really said no, past
+// the retry budget (CI_FAIL_RETRY_BUDGET=1). This keeps kind 'ci-failed'.
+setMachinery('item-red',
+  { outcome: 'CREATED', path: '/tmp/repo.wt/item-red' },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'GATE_PASS' },
+  { outcome: 'REBASED', base: 'b', tip: 't', sha: 'aa03' },
+  { outcome: 'SCAN_CLEAN' },
+  { outcome: 'PUSHED', sha: 'bb03', branch: 'build/item-red' },
+  { outcome: 'PR_OPENED', pr_number: 2248 },
+  { outcome: 'CI_FAILED', failed_run_ids: [41] },
+  { outcome: 'REVIEW_DIFF' },
+  { outcome: 'PUSHED', sha: 'cc03', branch: 'build/item-red' },
+  { outcome: 'CI_FAILED', failed_run_ids: [42] },
+);
+setWorker('item-red',
+  { status: 'done', summary: 'initial', acceptance_results: [], commits: [] },
+  { status: 'done', summary: 'ci fix', acceptance_results: [], commits: [] },
+);
+
+globalThis.args = { ...baseArgs, items: [
+  { slug: 'item-err', branch: 'build/item-err', title: 'Poll Error Item', kind: 'impl' },
+  { slug: 'item-lost', branch: 'build/item-lost', title: 'Lost Result Item', kind: 'impl' },
+  { slug: 'item-red', branch: 'build/item-red', title: 'Really Red Item', kind: 'impl' },
+]};
+
+const mod = await loadLevel();
+const result = await mod.default();
+
+const escs = result.escalations ?? [];
+const byslug = (s) => escs.find(e => e.slug === s);
+const eErr = byslug('item-err');
+const eLost = byslug('item-lost');
+const eRed = byslug('item-red');
+if (!eErr || !eLost || !eRed)
+  bail('fixture: expected all three arms to escalate, got ' + JSON.stringify(escs.map(e => [e.slug, e.kind])));
+
+// --- the classification itself -------------------------------------------
+for (const [name, e] of [['transport ERROR', eErr], ['lost poll result', eLost]]) {
+  if (e.kind === 'ci-failed')
+    bail('the ' + name + ' arm reported a red CI verdict the poll never obtained (the #2249 regression)');
+  if (e.kind !== 'ci-unknown')
+    bail('the ' + name + ' arm must classify as ci-unknown, got ' + e.kind);
+  // round_kind still falls out of the existing 'ci-*' prefix rule — nothing was
+  // added to escalationRoundKind()'s list.
+  if (e.round_kind !== 'ci')
+    bail('ci-unknown must still bucket to round_kind ci via the ci-* prefix rule, got ' + e.round_kind);
+  // FACTS ONLY. Dispositions are owned by build.md's kind list, as for every
+  // other kind — a disposition string on the payload would fork that ownership.
+  if ('disposition' in e.payload)
+    bail('the ci-unknown payload must carry facts only, never a disposition string: ' + JSON.stringify(e.payload));
+  if (typeof e.payload.sha !== 'string' || e.payload.sha === '')
+    bail('the ci-unknown payload must name the sha the poll was pinned to: ' + JSON.stringify(e.payload));
+  if (!e.payload.poll_state || typeof e.payload.poll_state.slice !== 'number' || typeof e.payload.poll_state.max_slices !== 'number')
+    bail('the ci-unknown payload must carry the polls own state: ' + JSON.stringify(e.payload));
+  // The claim is a cross-session lock and the disposition is a RESUME, so it is
+  // HELD — read off the committed_work record, never off the kind name.
+  if (e.claim_disposition !== 'hold')
+    bail('a ci-unknown escalation keeps its worktree, so its board claim must be HELD, got ' + JSON.stringify(e.claim_disposition));
+  const facts = ((e.resumable_state || {}).evidence || []).map(x => x.fact);
+  if (facts.filter(f => f.indexOf('committed_work:') === 0).length !== 1)
+    bail('the hold must be justified by the committed_work FACT, not the kind: ' + JSON.stringify(facts));
+}
+
+// The reproduction's own ciOut survives into the payload verbatim.
+if (String(eLost.payload.ciOut && eLost.payload.ciOut.outcome) !== 'ERROR')
+  bail('the lost-result arm must relay ci-polls own ERROR object: ' + JSON.stringify(eLost.payload));
+if (!/produced no result/.test(String(eLost.payload.ciOut.error)))
+  bail('the lost-result arm must relay the synthesized no-result error verbatim: ' + JSON.stringify(eLost.payload.ciOut));
+if (String(eErr.payload.ciOut && eErr.payload.ciOut.error).indexOf('gh api failed') !== 0)
+  bail('the transport arm must relay ci-polls own error text: ' + JSON.stringify(eErr.payload));
+
+// --- the DISCRIMINATING control + collapse guard --------------------------
+if (eRed.kind !== 'ci-failed')
+  bail('a genuine CI_FAILED past the retry budget must still be ci-failed, got ' + eRed.kind);
+if (eRed.kind === eErr.kind)
+  bail('the two arms COLLAPSED into one kind: a real red verdict and an unknown both read ' + eRed.kind);
+
+console.log(JSON.stringify({ ok: true }));
+"
+
+# --- static guard: BOTH unknown sites stay routed away from ci-failed --------
+# Two returns in a 8000-line file. Without this, a future edit can re-flatten
+# either one onto ci-failed and every case above that exercises the OTHER site
+# still passes.
+K2249_MJS="$REPO_ROOT/claude/workflows/build-level.mjs"
+grep -q "const CI_UNKNOWN_KIND = 'ci-unknown'" "$K2249_MJS" \
+  || fail "#2249: build-level.mjs must define CI_UNKNOWN_KIND — the one name both ci-poll UNKNOWN sites raise"
+K2249_SITES="$(grep -c 'escalation: CI_UNKNOWN_KIND,' "$K2249_MJS" || true)"
+[ "$K2249_SITES" = "2" ] \
+  || fail "#2249: both ci-poll UNKNOWN sites (the ERROR/unexpected-outcome catch-all and the empty-batch arm) must raise CI_UNKNOWN_KIND; found $K2249_SITES"
+grep -q 'function ciUnknownPayload' "$K2249_MJS" \
+  || fail "#2249: the facts-only ci-unknown payload builder is gone — a per-site hand-rolled payload is how a disposition string creeps back in"
+K2249_BUILD_MD="$REPO_ROOT/claude/commands/build.md"
+grep -q '`ci-unknown`' "$K2249_BUILD_MD" \
+  || fail "#2249: build.md's escalation-kind list must document ci-unknown beside ci-failed — an undocumented kind falls to the generic catch-all with no disposition"
+echo "PASS: #2249 static guard — both ci-poll UNKNOWN sites raise CI_UNKNOWN_KIND through the facts-only payload builder, and build.md documents the kind"
 
 # ============================================================================
 # TEST (K2006-silent): a CLEAN create over an empty path stays SILENT.
