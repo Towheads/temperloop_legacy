@@ -128,7 +128,31 @@ fi
 # keeps its inline `${VAR:-default}` as a belt-and-suspenders fallback for callers
 # that did not source this file.
 : "${BUILD_MERGE_GATE_WINDOW:=300}"   # timed merge-gate window (s); 0 = always modal
-: "${BUILD_QUEUE_TIMEOUT:=1800}"      # per-PR native-merge-queue timeout (s)
+
+# Per-PR native-merge-queue timeout: the ceiling `gate.sh poll` puts on ONE
+# PR's time in the queue before it stops waiting and reports TIMEOUT.
+#
+# SIZING RULE (temperloop#2055): this value must exceed TWICE the slowest
+# healthy `checks` run in the repo this kernel drives. A queue round trip runs
+# `checks` twice — once on the PR branch, once on the merge_group trial branch
+# — so a ceiling below that doubled time makes TIMEOUT structurally
+# unreachable as a signal: a perfectly healthy PR runs the clock out by
+# construction, and a verdict that fires on healthy and stuck alike is evidence
+# of neither. Sized against the slowest healthy `checks` run on record — ~21
+# min per run, so a ~42 min round trip, measured 2026-09-15. MEASURE YOUR OWN
+# and raise this if your `checks` job is slower than that; the per-repo
+# measurements behind the current value are on temperloop#2055.
+#
+# ACCEPTED TRADE: a wider ceiling reports a genuine stall LATER — up to the
+# full ceiling after enqueue, where the previous default allowed only half of
+# it. That is affordable because the clock is no longer the whole verdict: a
+# deadline TIMEOUT carries `gate.sh diagnose-queue`'s
+# classification as `reason` plus the full `diagnosis` (temperloop#1178), so a
+# slow-but-healthy QUEUED is distinguishable from a stall at the moment it
+# fires; and a zero-progress stall is NAMED at BUILD_QUEUE_STALL_AFTER below —
+# far under this ceiling — so the genuinely stuck case stops waiting early and
+# only the slow-but-healthy case ever pays the full window.
+: "${BUILD_QUEUE_TIMEOUT:=3600}"      # per-PR native-merge-queue timeout (s)
 
 # Queue-stall threshold (temperloop#1178): how long a PR may sit IN the native
 # merge queue with ZERO merge_group runs ever dispatched for it before
@@ -322,8 +346,9 @@ fi
 # cap, same sizing reason as BUILD_HEADLESS_POLL_TIMEOUT just above.
 #
 # THIS IS NOT THE QUEUE CEILING, deliberately. How long a PR may legitimately
-# sit in the merge queue is BUILD_QUEUE_TIMEOUT, whose sizing is a separate
-# open question (temperloop#2055) this setting does not pre-empt: a caller that
+# sit in the merge queue is BUILD_QUEUE_TIMEOUT, whose own sizing rule is
+# stated at its definition above (temperloop#2055) and is not what this
+# setting bounds: a caller that
 # wants the full queue ceiling CHAINS armed calls up to BUILD_QUEUE_TIMEOUT and
 # never widens one call past the foreground cap.
 : "${BUILD_WAKE_POLL_TIMEOUT:=540}"      # bound on ONE armed-wake call (s)
@@ -2043,7 +2068,7 @@ fi
 # tests/test_bounded_suite.sh), so 1800s leaves ~31x and ~6x headroom — wide
 # enough not to fire on a slow or loaded CI runner, and still three orders of
 # magnitude tighter than the incident. It mirrors the existing 1800s
-# convention BUILD_QUEUE_TIMEOUT and REPLAY_CANDIDATE_TIMEOUT_SECS already use
+# convention REPLAY_CANDIDATE_TIMEOUT_SECS already uses
 # for a generous outer bound. This is a LIVENESS ceiling, never a performance
 # budget: tightening it toward the measured runtime would turn an ordinary
 # slow machine into a red gate.

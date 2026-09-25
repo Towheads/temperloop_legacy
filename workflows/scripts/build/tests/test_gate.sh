@@ -54,6 +54,12 @@
 #     TIMEOUT carries the probe's verdict as `reason`/`diagnosis`, and falls back
 #     to the bare TIMEOUT shape when the probe itself errors. The clock is pinned
 #     through the `_gate_now` seam, so these are deterministic and network-free.
+#   - the TIMEOUT stamp (temperloop#2055, the sufficiency the raised
+#     BUILD_QUEUE_TIMEOUT ceiling leans on): a zero-progress stall stamps
+#     `reason:"QUEUE_STALLED"`, a live-entry healthy-but-slow PR stamps
+#     `reason:"QUEUED"` + the incident's `queueState`, and in BOTH cases
+#     `.diagnosis` is byte-equal to running diagnose-queue directly on the same
+#     fixture — so the stamp can never silently degrade to a bare waited count
 #
 # The seams are redefined mid-file per case (the library calls them
 # indirectly), so shellcheck's "never invoked"/"unreachable" checks are false
@@ -608,7 +614,43 @@ rc=0; out="$(cmd_poll Towheads/foundation 42 --interval 0.1 --timeout 0)" || rc=
 [ "$(jq -r .outcome <<<"$out")" = "TIMEOUT" ] || fail "poll TIMEOUT outcome (got: $out)"
 [ "$(jq -r .reason <<<"$out")" = "QUEUE_STALLED" ] || fail "poll TIMEOUT reason (got: $out)"
 [ "$(jq -r .diagnosis.enqueued_secs <<<"$out")" = "3600" ] || fail "poll TIMEOUT diagnosis payload (got: $out)"
-echo "PASS: poll → TIMEOUT carries the diagnose-queue reason (QUEUE_STALLED) instead of a bare waited count"
+# The stamp is the probe's WHOLE verdict, not just its outcome word: run the
+# same probe directly under the same fixture and require byte-equal JSON.
+probe=0; dq="$(cmd_diagnose_queue Towheads/foundation 42)" || probe=$?
+[ "$probe" -eq 10 ] || fail "stalled probe did not exit 10 (rc=$probe, out=$dq)"
+[ "$(jq -cS . <<<"$dq")" = "$(jq -cS .diagnosis <<<"$out")" ] \
+  || fail "poll TIMEOUT.diagnosis is not the full diagnose-queue verdict (probe: $dq, got: $out)"
+echo "PASS: poll → TIMEOUT carries the diagnose-queue reason (QUEUE_STALLED) and its whole verdict, not a bare waited count"
+
+# --- poll: a HEALTHY-but-SLOW PR's TIMEOUT names QUEUED (temperloop#2055) ----
+# The reproduction behind the raised BUILD_QUEUE_TIMEOUT ceiling
+# (foundation#1908, 2026-09-15): a CLEAN PR whose queue entry is live and whose
+# merge_group run IS building simply outran the clock, and merged moments
+# later. The deadline still fires — but the stamp says which case it is:
+# `reason: "QUEUED"` plus the FULL diagnosis object, including the
+# `queueState` the incident hand-probed. That stamp is what makes an hour-wide
+# ceiling safe to sit behind, so it is pinned here: a future change that
+# dropped it back to a bare `waited` count would turn every TIMEOUT back into
+# an unreadable verdict.
+_gate_gh() {
+  case "$*" in
+    *"pr view"*) echo '{"state":"OPEN","mergedAt":null,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN"}' ;;
+    *graphql*) echo '{"data":{"repository":{"pullRequest":{"state":"OPEN","merged":false,"mergedAt":null,"mergeQueueEntry":{"state":"AWAITING_CHECKS","position":1,"enqueuedAt":"2025-12-31T23:00:00Z"}}}}}' ;;
+    *actions/runs*) echo '{"workflow_runs":[{"head_branch":"gh-readonly-queue/main/pr-42-abc","conclusion":null,"status":"in_progress","id":9100,"created_at":"2025-12-31T23:01:00Z"}]}' ;;
+    *) echo '{}' ;;
+  esac
+}
+rc=0; out="$(cmd_poll Towheads/foundation 42 --interval 0.1 --timeout 0)" || rc=$?
+[ "$rc" -eq 4 ] || fail "QUEUED-reason TIMEOUT did not exit 4 (rc=$rc, out=$out)"
+[ "$(jq -r .outcome <<<"$out")" = "TIMEOUT" ] || fail "poll TIMEOUT outcome (got: $out)"
+[ "$(jq -r .reason <<<"$out")" = "QUEUED" ] || fail "poll TIMEOUT reason should name QUEUED (got: $out)"
+[ "$(jq -r .diagnosis.queueState <<<"$out")" = "AWAITING_CHECKS" ] \
+  || fail "poll TIMEOUT diagnosis lost the queueState the incident read (got: $out)"
+probe=0; dq="$(cmd_diagnose_queue Towheads/foundation 42)" || probe=$?
+[ "$probe" -eq 0 ] || fail "healthy-slow probe did not exit 0 (rc=$probe, out=$dq)"
+[ "$(jq -cS . <<<"$dq")" = "$(jq -cS .diagnosis <<<"$out")" ] \
+  || fail "poll TIMEOUT.diagnosis is not the full diagnose-queue verdict (probe: $dq, got: $out)"
+echo "PASS: poll → TIMEOUT on a healthy-but-slow PR names QUEUED and carries the whole diagnose-queue verdict"
 
 # Fail-open: when the diagnose probe itself errors, the TIMEOUT keeps its
 # pre-existing bare shape (outcome + waited, exit 4) and never leaks an ERROR.
