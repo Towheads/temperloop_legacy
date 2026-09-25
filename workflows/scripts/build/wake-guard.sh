@@ -78,9 +78,10 @@
 # process may block before handing control back — sized to sit under the
 # harness's ~590s foreground Bash ceiling. It is NOT the merge-queue ceiling:
 # how long a PR may legitimately sit in the queue is BUILD_QUEUE_TIMEOUT, whose
-# sizing is a separate open question (temperloop#2055) this script deliberately
-# does not pre-empt. A caller that wants the full queue ceiling chains armed
-# calls; it never widens this one past the foreground cap.
+# own sizing rule is stated at its definition in build.config.sh
+# (temperloop#2055) and is not what this script bounds. A caller that wants
+# the full queue ceiling chains armed calls; it never widens this one past the
+# foreground cap.
 #
 # IT IS A BUDGET FOR THE WHOLE PR SET, NOT A PER-PR ALLOWANCE. `arm` polls the
 # in-flight PRs sequentially, and a per-PR bound would let a routine multi-PR

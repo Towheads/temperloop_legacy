@@ -30,9 +30,10 @@
     `"running"` forever while the suite runs on unwatched.
   - Two new settings size the armed wake: `BUILD_WAKE_POLL_INTERVAL` (30 s)
     and `BUILD_WAKE_POLL_TIMEOUT` (540 s, one call's liveness bound — the
-    merge-queue ceiling stays `BUILD_QUEUE_TIMEOUT`, whose sizing is open at
-    #2055). That bound is a budget for the **whole PR set**, not a per-PR
-    allowance: a level routinely selects several PRs, and a per-PR bound
+    merge-queue ceiling stays `BUILD_QUEUE_TIMEOUT`, whose own sizing rule is
+    stated at its definition in `workflows/scripts/build/build.config.sh` and
+    was raised in #2055). That bound is a budget for the **whole PR set**,
+    not a per-PR allowance: a level routinely selects several PRs, and a per-PR bound
     would let ordinary queue waits sum past the harness's foreground ceiling
     and get the armed call itself auto-backgrounded — the same defect through
     the new mechanism. A set that spends its budget returns `TIMEOUT` naming

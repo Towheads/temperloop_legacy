@@ -160,8 +160,9 @@ than sitting at `"running"` while the suite runs on unwatched.
 Sizing is two named settings — `BUILD_WAKE_POLL_INTERVAL` and
 `BUILD_WAKE_POLL_TIMEOUT` (a bound on **one call**, kept under the harness's
 foreground `Bash` cap). Neither is the merge-queue ceiling: how long a PR may
-legitimately sit in the queue stays `BUILD_QUEUE_TIMEOUT`, sizing open at
-temperloop#2055.
+legitimately sit in the queue stays `BUILD_QUEUE_TIMEOUT`, whose own sizing
+rule is stated at its definition in `workflows/scripts/build/build.config.sh`
+(temperloop#2055).
 
 Covered by `workflows/scripts/build/tests/test_wake_guard.sh`.
 
