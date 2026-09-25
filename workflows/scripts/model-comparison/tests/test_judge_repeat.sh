@@ -140,6 +140,22 @@ STUBEOF
 chmod +x "$JSTUB"
 export JSTUB_COUNT_FILE="$WORK/stub-count"
 
+# ── EVERYTHING WRITEABLE POINTS INTO $WORK, never at the checkout ───────────
+# judge.sh attributes every call it makes into the model-usage lake. Left at
+# its default that lake is the REAL one in this checkout, so a fixture run
+# writes `stub-model` rows into it — which validate-model-usage-emit.sh then
+# correctly refuses as FIXTURE-RESIDUE, failing a gate this suite never
+# touched. Redirect it, exactly as test_judge_pairwise.sh does.
+LAKE="$WORK/lake"
+ALLOW="$WORK/allow.txt"
+NOLOCAL="$WORK/no-such-local-override.txt"
+mkdir -p "$LAKE"
+printf 'anthropic\n' >"$ALLOW"
+export MODEL_USAGE_RAW_DIR="$LAKE"
+export PROVIDER_ALLOWLIST_TEST_SEAM=1
+export PROVIDER_ALLOWLIST_COMMITTED_FILE="$ALLOW"
+export PROVIDER_ALLOWLIST_LOCAL_FILE="$NOLOCAL"
+
 jr() { bash "$JR" "$@" --dir "$LED" --repo "$REPO"; }
 
 # ── Section 1 — records reconstructs a usable pair ──────────────────────────
@@ -160,7 +176,7 @@ if R="$(jr records --slug "$SLUG" --item-file "$ITEM" --out-dir "$OUT" 2>&1)"; t
   { [ -n "$da" ] && [ -n "$db" ] && [ "$da" != "$db" ]; } \
     && pass "1 the two rebuilt diffs are non-empty and DISTINCT" \
     || fail "1 the rebuilt diffs are empty or identical — the judge would be comparing nothing"
-  printf '%s' "$da" | grep -q "CHANGED BY BASELINE" \
+  printf '%s' "$da" | grep -F "CHANGED BY BASELINE" >/dev/null \
     && pass "1 the baseline diff carries that arm's own content" \
     || fail "1 the baseline record does not carry the baseline arm's change"
   [ "$(jq -r '.candidate.model' "$OUT/a.json")" = "claude-sonnet-5" ] \
@@ -179,7 +195,7 @@ bash "$LEDGER" archive "$SLUG" candidate --dir "$LED2" --from "$WORK/b.patch" >/
 if R="$(bash "$JR" records --slug "$SLUG" --item-file "$ITEM" --out-dir "$WORK/rec2" --dir "$LED2" --repo "$REPO" 2>&1)"; then
   fail "2 an arm that gated 'fail' was accepted — that pair never had a judge verdict, so a repeat sweep over it measures nothing"
 else
-  printf '%s' "$R" | grep -q "gated" \
+  printf '%s' "$R" | grep -F "gated" >/dev/null \
     && pass "2 an arm that gated 'fail' is refused, by name" \
     || fail "2 refused the failed-gate pair but not legibly: $R"
 fi
@@ -191,7 +207,7 @@ bash "$LEDGER" archive "$SLUG" baseline --dir "$LED3" --from "$WORK/a.patch" >/d
 if R="$(bash "$JR" records --slug "$SLUG" --item-file "$ITEM" --out-dir "$WORK/rec3" --dir "$LED3" --repo "$REPO" 2>&1)"; then
   fail "2 a MISSING archive was accepted — the pair is not recoverable and the sweep would be measuring a fabrication"
 else
-  printf '%s' "$R" | grep -q "no archived patch" \
+  printf '%s' "$R" | grep -F "no archived patch" >/dev/null \
     && pass "2 a missing archive is refused, naming the absent path" \
     || fail "2 refused the missing archive but not legibly: $R"
 fi
@@ -204,7 +220,7 @@ bash "$LEDGER" archive "$SLUG" candidate --dir "$LED4" --from "$WORK/b.patch" >/
 if R="$(bash "$JR" records --slug "$SLUG" --item-file "$ITEM" --out-dir "$WORK/rec4" --dir "$LED4" --repo "$REPO" 2>&1)"; then
   fail "2 an 'unknown' base_sha was accepted — the diff would be rebuilt against a guess"
 else
-  printf '%s' "$R" | grep -q "base_sha" \
+  printf '%s' "$R" | grep -F "base_sha" >/dev/null \
     && pass "2 an unknown base_sha is refused and asks for --base" \
     || fail "2 refused the unknown base but not legibly: $R"
 fi
@@ -249,7 +265,7 @@ fi
 if R="$(jr sweep --slug "$SLUG" --item-file "$ITEM" --n 1 2>&1)"; then
   fail "4 sweep ran with NEITHER --judge-runner nor --live — there must be no implicit judge binary"
 else
-  printf '%s' "$R" | grep -q "CANNOT_EVALUATE" \
+  printf '%s' "$R" | grep -F "CANNOT_EVALUATE" >/dev/null \
     && pass "4 sweep with neither runner flag is CANNOT_EVALUATE" \
     || fail "4 refused, but not with the named CANNOT_EVALUATE refusal: $R"
 fi
@@ -339,6 +355,23 @@ fi
 [ ! -f "$JR_CANARY_TRIPPED" ] \
   && pass "canary: the suite issued NO live model call" \
   || fail "canary: a live claude was invoked — this suite is not hermetic"
+
+# The lake assertion is the SECOND half of hermetic, and the one that actually
+# bit: the canary only catches a live SPAWN, while attribution residue is
+# written by a perfectly well-behaved recorded run. A `stub-model` row reaching
+# the real lake fails validate-model-usage-emit.sh as FIXTURE-RESIDUE — a gate
+# this suite never touched, in a file it does not own.
+REAL_LAKE="$(cd -P "$MC/../../.." 2>/dev/null && pwd)/meta/data/raw"
+# Only LIVE lake files (*.jsonl). lake-sweep.sh leaves a `.pre-sweep-<n>.bak`
+# safety copy of whatever it removed, and that copy legitimately still holds the
+# residue it swept — reading it as a live record would make this assertion fire
+# forever after the very cleanup that fixed the problem.
+if [ -d "$REAL_LAKE" ] && ls "$REAL_LAKE"/*.jsonl >/dev/null 2>&1 \
+   && grep -lF 'stub-model' "$REAL_LAKE"/*.jsonl >/dev/null 2>&1; then
+  fail "lake: fixture residue ('stub-model') reached the REAL attribution lake at $REAL_LAKE — MODEL_USAGE_RAW_DIR is not redirected into \$WORK"
+else
+  pass "lake: no fixture residue reached the real attribution lake"
+fi
 
 echo ""
 if [ "$FAILED" -eq 0 ]; then
