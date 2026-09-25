@@ -245,6 +245,13 @@ PROGRESS="$TMPD/progress"
 : > "$LOG"
 : > "$PROGRESS"
 export SUITE_PROGRESS_FILE="$PROGRESS"
+# temperloop#2245 — tell the wrapped command it is ALREADY bounded. A suite
+# that self-binds (tests/test_workflow.sh's preamble re-execs itself under
+# this wrapper when run directly, so a bare `bash …/test_workflow.sh` gets the
+# same bound as `make`) keys on this variable to skip that re-exec, so the
+# make/gates path never wraps twice. Exported here rather than set by each
+# recipe so the Makefile and scripts/quality-gates.sh stay untouched.
+export WF_TEST_SELF_BOUND=1
 
 # ── stdout relay ────────────────────────────────────────────────────────────
 # The suite's stdout goes to $LOG (so the wrapper can read its PASS lines) and
