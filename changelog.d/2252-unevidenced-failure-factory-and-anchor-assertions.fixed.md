@@ -1,18 +1,17 @@
-- **A refused dual-build arm's `failure` record is built fresh per arm** (#2252).
-  `UNEVIDENCED_ACCEPTANCE_FAILURE` was one module-level object spread by
-  reference into every refused arm's record — both arms of a pair, and every
-  pair in a level, all aliasing one instance. Nothing mutated it, so the bug was
-  latent; the first edit to annotate a record in place (stamping a slug or arm
-  name onto `record.failure` before logging) would have silently rewritten every
-  other record in the level. It is now a factory, matching the fresh-object
-  convention every sibling `failure` value already followed.
-- **The #2229 static guards report an anchor that moved as an anchor that moved**
-  (#2252). Both guards capture a function body with an `awk` range and grep it
-  without checking the capture is non-empty, so renaming the anchored function
-  made them fail with the wrong reason — "driveArm never calls
-  unevidencedAcceptance" when the call site was intact and only the name had
-  changed. They now assert the capture first. The anchors were also tightened to
-  match the opening paren: `/^async function driveArm/` matched any function
-  whose name merely *starts* with `driveArm`, so a prefix-colliding rename
-  handed the guard a body it was never pointed at and did not trip it at all —
-  found by mutation-testing the new assertions rather than by reading them.
+- **A model-comparison arm that is refused for recording no acceptance evidence
+  now gets its own failure record** (#2252). All such refusals previously shared
+  one object — both arms of a pair, and every pair in a comparison run. Nothing
+  wrote to it, so no run was affected, but any later change that annotated a
+  record in place would have altered every other record at the same time. Each
+  record is now built separately. No output shape changes.
+- **Two self-checks in `workflows/scripts/build/tests/test_workflow.sh` now
+  report a moved code anchor as a moved anchor** (#2252). Each locates a
+  function in `claude/workflows/build-level.mjs` and inspects its body. If that
+  function is renamed, the lookup returns nothing and the check used to fail
+  claiming the code inside it had been deleted — sending the reader after a call
+  site that was never removed. The checks now verify they found the function
+  before inspecting it, and say so when they did not. They also match the
+  function name exactly: previously a name that merely *began* with the one
+  being looked for would satisfy the lookup and hand the check unrelated code,
+  which was found by testing the new behaviour rather than by reading it. Both
+  still fail the build on the condition they were written to catch.
