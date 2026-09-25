@@ -5106,13 +5106,24 @@ function unevidencedAcceptance(results) {
 }
 // The one failure record both refusal sites carry, so an arm refused for want
 // of evidence is greppable by a single `kind` and never reads as an infra loss.
-const UNEVIDENCED_ACCEPTANCE_FAILURE = {
+//
+// temperloop#2252: a FACTORY, not a shared singleton. This value is spread into
+// a per-arm record at two sites, for BOTH arms of a pair and for every pair in a
+// level — a single frozen-by-convention instance would have them all aliasing
+// one object. Nothing mutates it today, but every sibling `failure` value in
+// this file (`{ kind: 'arm-throw', detail }` and friends) is built fresh per
+// call, and the first edit to annotate a record in place — stamping a slug, an
+// arm name or a timestamp onto `record.failure` before logging — would silently
+// rewrite every other record in the level through the alias. Returning a new
+// object costs nothing on a path that runs at most twice per item and removes
+// the sharp edge rather than documenting it.
+const unevidencedAcceptanceFailure = () => ({
   kind: 'unevidenced-acceptance',
   detail:
     'the arm returned a done verdict with an EMPTY acceptance_results — it records no evidence that any ' +
     'criterion was checked, so it is not reportable as a pass (temperloop#2229). Its sibling arm records ' +
     'its criteria; an asymmetric pair like this is what made the un-evidenced arm invisible.',
-};
+});
 
 // driveArm — build ONE arm of ONE in-scope item through phase 1 only. — see build-level.design-notes-4.md#drivearm-build-one-arm-of-one-in-scope-item-through-phase-1-
 async function driveArm(item, dual, armName, order) {
@@ -5148,7 +5159,7 @@ async function driveArm(item, dual, armName, order) {
     // temperloop#2229 — the unevidenced-pass refusal, applied to the spik — see build-level.design-notes-7.md#temperloop-2229-a-gate-pass-that-records-no-acceptance-evide
     if (unevidencedAcceptance(spikeResults)) {
       log(`[${ai.slug}] dual-build spike arm returned a done verdict with ZERO acceptance results — refusing to record it as an evidenced pass (temperloop#2229): recorded as an incomplete loss`);
-      return { ...base, gate: 'fail', lossReason: 'incomplete', spike: true, failure: UNEVIDENCED_ACCEPTANCE_FAILURE };
+      return { ...base, gate: 'fail', lossReason: 'incomplete', spike: true, failure: unevidencedAcceptanceFailure() };
     }
     log(`[${ai.slug}] dual-build arm completed as a read-only spike verdict (no worktree, no gate) — a passing arm, not a loss`);
     return {
@@ -5191,7 +5202,7 @@ async function driveArm(item, dual, armName, order) {
       wtBase: ctx.wtBase || '',
       guardArmed: ctx.wtGuard || 'UNKNOWN',
       cost: armCost,
-      failure: UNEVIDENCED_ACCEPTANCE_FAILURE,
+      failure: unevidencedAcceptanceFailure(),
     };
   }
   return {
