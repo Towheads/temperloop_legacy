@@ -2678,7 +2678,8 @@ function escalate(slug, kind, payload) {
 //
 // The distinction is a FACT read off the escalation's OWN payload, never its
 // KIND. Deciding on a kind-name is the error in both directions (the sibling
-// defect temperloop#2249 maps a ci-poll machinery ERROR onto `ci-failed`), and
+// defect temperloop#2249 mapped a ci-poll machinery ERROR onto `ci-failed`,
+// since split out as its own `ci-unknown` kind), and
 // a fact means a future held-state escalation inherits the hold by DECLARING
 // retention — nothing is added to a list. The three declarations, and the one
 // negative reading:
@@ -7554,6 +7555,30 @@ function badShaEscalation(pr, seen, stage, detail) {
   };
 }
 
+// CI_UNKNOWN_KIND — temperloop#2249. `CI_FAILED` ("CI ran and said no") and
+// `ERROR` ("the poll never produced a result") are DIFFERENT facts with
+// different dispositions, and flattening the second onto `ci-failed` discards
+// the distinction at the exact moment a kind-name is chosen — a driver that
+// trusts the kind then parks a ready-to-merge PR as red, or sends a worker to
+// "fix" a CI failure that does not exist. `ci-*` keeps escalationRoundKind()'s
+// existing prefix rule working (round-kind `ci`) with nothing added to it.
+const CI_UNKNOWN_KIND = 'ci-unknown';
+
+// ciUnknownPayload — FACTS ONLY. No `disposition` string: dispositions for
+// every escalation kind are owned by build.md's kind list, exactly as for
+// `ci-failed` itself. What the driver gets is the poll's own object (`ciOut`,
+// when one exists), the SHA that was polled, and the poll's own state, so the
+// re-poll disposition can be carried out without re-deriving any of it.
+function ciUnknownPayload({ sha, out, reason, slice, maxSlices, retriesLeft }) {
+  const payload = {
+    sha,
+    poll_state: { slice: slice + 1, max_slices: maxSlices, retries_left: retriesLeft },
+  };
+  if (out != null) payload.ciOut = out;
+  if (reason != null) payload.reason = reason;
+  return payload;
+}
+
 // isBadArgumentError — true iff a ci-poll.sh ERROR is the script REFUSIN — see build-level.design-notes-6.md#isbadargumenterror-true-iff-a-ci-poll-sh-error-is-the-script
 function isBadArgumentError(out) {
   if (!out || out.outcome !== 'ERROR') return false;
@@ -7637,7 +7662,18 @@ async function ciPollLoop(item, ownerRepo, pr, initialSha, wt) {
       }
       if (buffer.length === 0) {
         // The executor came back with an empty results array — it ran nothing we — see build-level.design-notes-6.md#the-executor-came-back-with-an-empty-results-array-it-r
-        return { escalation: 'ci-failed', payload: { reason: 'ci poll batch returned no results', sha } };
+        // temperloop#2249: the batch ran nothing we can read, so CI's state was
+        // never reported — UNKNOWN, not red.
+        return {
+          escalation: CI_UNKNOWN_KIND,
+          payload: ciUnknownPayload({
+            sha,
+            reason: 'ci poll batch returned no results',
+            slice,
+            maxSlices,
+            retriesLeft,
+          }),
+        };
       }
     }
 
@@ -7811,7 +7847,14 @@ async function ciPollLoop(item, ownerRepo, pr, initialSha, wt) {
         payload: { ...badShaEscalation(pr, sha, 'ci-poll', 'ci-poll.sh rejected its own arguments'), ciOut: out },
       };
     }
-    return { escalation: 'ci-failed', payload: { ciOut: out, sha } };
+    // temperloop#2249: an ERROR (or any outcome outside ci-poll.sh's own
+    // vocabulary) means the poll never returned a verdict — the PR's checks may
+    // well be green. It is `ci-unknown`, never `ci-failed`; only the CI_FAILED
+    // arm above, which carries an actual red verdict, keeps that kind.
+    return {
+      escalation: CI_UNKNOWN_KIND,
+      payload: ciUnknownPayload({ sha, out, slice, maxSlices, retriesLeft }),
+    };
   }
 
   // Total budget exhausted without CI_GREEN/CI_FAILED resolution.
