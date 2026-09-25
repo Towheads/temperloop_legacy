@@ -1815,23 +1815,57 @@ lake "$NC" pipeline-drive-safe retro-judge
 run "$NC"; cp "$RUN_OUT" "$WORK/null-class.json"
 
 count
-# THE REAL SHAPE. 0 on every record is exactly what replay.sh writes for a
-# class the vendor never billed, so it must NOT be published as a measurement
-# of zero and must NOT leave the axis comparable.
+# THE REAL SHAPE, UNDER ONE PROVIDER. 0 on every record is what replay.sh
+# writes both for a class the vendor never billed AND for a class genuinely
+# billed at zero. Under same-provider both arms share ONE envelope shape, so
+# the ambiguity cannot bite: it is a measured zero, a real cost fact the delta
+# must carry, and withholding here would defeat the same-vendor comparison the
+# axis exists for (temperloop#2059 is Anthropic-only). DISCLOSED, not refused
+# — review round 2.
 [ "$(jqf "$WORK/zero-all.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.zero_on_every_record_token_classes | join(",")')" = "cache_creation" ] \
-  || fail "S4: a class reading 0 on every record must be reported in zero_on_every_record_token_classes, got $(jqf "$WORK/zero-all.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.zero_on_every_record_token_classes | tostring')"
-[ "$(jqf "$WORK/zero-all.json" '.cost_basis.cross_vendor.comparable')" = "false" ] \
-  || fail "S4: an all-zero class is INDISTINGUISHABLE from an unpriced one on these records — the axis must be withheld, not published"
+  || fail "S4: a class reading 0 on every record must still be DISCLOSED in zero_on_every_record_token_classes, got $(jqf "$WORK/zero-all.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.zero_on_every_record_token_classes | tostring')"
+[ "$(jqf "$WORK/zero-all.json" '.cost_basis.cross_vendor.comparable')" = "true" ] \
+  || fail "S4: under ONE provider an all-zero class is a measured zero and must NOT withhold the axis, got comparable=$(jqf "$WORK/zero-all.json" '.cost_basis.cross_vendor.comparable') reason=$(jqf "$WORK/zero-all.json" '.cost_basis.cross_vendor.reason')"
+jq -e '.cost_basis.cross_vendor.reason | test("DISCLOSURE, not a refusal")' "$WORK/zero-all.json" >/dev/null 2>&1 \
+  || fail "S4: the reason must say plainly that this is a disclosure rather than a refusal"
 jq -e '.cost_basis.cross_vendor.reason | test("temperloop#2275")' "$WORK/zero-all.json" >/dev/null 2>&1 \
-  || fail "S4: the reason must name the replay.sh root cause it is working around"
-if jq -e '.cost_basis.cross_vendor.unmapped_vs_zero_note | test("WAS measured")' "$WORK/zero-all.json" >/dev/null 2>&1; then
-  fail "S4: the note must NOT claim an all-zero class was measured — that is the false statement this round removes"
+  || fail "S4: the reason must still name the replay.sh ambiguity and its filed root cause"
+# The RULE itself is stated, not merely enacted — a reader of the block can
+# tell why the two unpriced shapes withhold differently.
+jq -e '.cost_basis.cross_vendor.unmapped_vs_zero_note | test("EVERY state") and test("one provider")' "$WORK/zero-all.json" >/dev/null 2>&1 \
+  || fail "S4: the note must state the rule: unmapped refuses in every state, all-zero only when the arms are not on one provider"
+if jq -e '.cost_basis.cross_vendor.unmapped_vs_zero_note | test("BOTH withhold")' "$WORK/zero-all.json" >/dev/null 2>&1; then
+  fail "S4: the note still carries the round-1 blanket claim that both shapes withhold"
 fi
 # …and a class carrying real non-zero values lands in NEITHER bucket, so the
-# assertion above is a discrimination rather than a blanket alarm.
+# bucket assertion above is a discrimination rather than a blanket alarm.
 [ "$(jqf "$WORK/zero-all.json" '[.cost_basis.cross_vendor.arm_tariffs.candidate | .unmapped_token_classes[], .zero_on_every_record_token_classes[]] | index("cache_read")')" = "null" ] \
   || fail "S4: cache_read carries real values here and must be in neither unpriced bucket"
-ok "S4 REAL SHAPE: a class reading 0 on every record (what replay.sh emits for a class the vendor never billed) withholds the axis and is never called measured"
+ok "S4 under ONE provider a class reading 0 on every record is DISCLOSED as a measured zero and does not withhold the axis"
+
+count
+# THE SAME CLASS, THE SAME ZEROS, ARMS ON TWO VENDORS. Now the two arms
+# envelopes can differ, the all-zero reading is not available, and the class is
+# named beside the provider verdict so a reader does not take it for a
+# measurement. This is the pair that makes S4 a RULE rather than a blanket
+# permission (review round 2).
+ZX="$WORK/zero-all-crossvendor"
+mkrepo "$ZX"
+cp "$WORK/xv-base.jsonl" "$ZX/.temperloop/model-comparison/baseline.jsonl"
+jq -c '.candidate.provider = "openai" | .candidate.tokens.cache_creation = 0' "$WORK/xv-cand.jsonl" \
+  >"$ZX/.temperloop/model-comparison/candidate.jsonl"
+lake "$ZX" pipeline-drive-safe retro-judge
+run "$ZX"; cp "$RUN_OUT" "$WORK/zero-all-crossvendor.json"
+[ "$(jqf "$WORK/zero-all-crossvendor.json" '.cost_basis.cross_vendor.comparable')" = "false" ] \
+  || fail "S4b: with the arms on two vendors the axis must be withheld"
+[ "$(jqf "$WORK/zero-all-crossvendor.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.zero_on_every_record_token_classes | join(",")')" = "cache_creation" ] \
+  || fail "S4b: the zero class must still be reported per arm"
+jq -e '.cost_basis.cross_vendor.reason | test("cache_creation")' "$WORK/zero-all-crossvendor.json" >/dev/null 2>&1 \
+  || fail "S4b: the withheld reason must NAME the zero class, not only the provider mismatch: $(jqf "$WORK/zero-all-crossvendor.json" '.cost_basis.cross_vendor.reason')"
+if jq -e '.cost_basis.cross_vendor.reason | test("DISCLOSURE, not a refusal")' "$WORK/zero-all-crossvendor.json" >/dev/null 2>&1; then
+  fail "S4b: the measured-zero disclosure wording must NOT appear when the arms are on two vendors"
+fi
+ok "S4b the same all-zero class, with the arms on two vendors, is named in the withheld reason instead — S4 is a rule, not a blanket permission"
 
 count
 # The post-#2275 shape: an explicit null is the arm saying it never had the
@@ -1845,7 +1879,21 @@ count
   || fail "S5: an unmapped class must withhold the axis"
 jq -e '.cost_basis.cross_vendor.reason | test("UNMAPPED")' "$WORK/null-class.json" >/dev/null 2>&1 \
   || fail "S5: the reason must name the class as unmapped"
-ok "S5 a null-valued class reads UNMAPPED, in its own bucket — 0-on-every-record and never-valued stay two separate facts"
+# …and it refuses under BOTH provider states. Unlike the all-zero case, a
+# class with NO VALUE is a gap rather than a measurement, so one provider does
+# not rescue it (review round 2 point 3).
+NX="$WORK/null-class-crossvendor"
+mkrepo "$NX"
+cp "$WORK/xv-base.jsonl" "$NX/.temperloop/model-comparison/baseline.jsonl"
+jq -c '.candidate.provider = "openai" | .candidate.tokens.cache_creation = null' "$WORK/xv-cand.jsonl" \
+  >"$NX/.temperloop/model-comparison/candidate.jsonl"
+lake "$NX" pipeline-drive-safe retro-judge
+run "$NX"; cp "$RUN_OUT" "$WORK/null-class-crossvendor.json"
+[ "$(jqf "$WORK/null-class-crossvendor.json" '.cost_basis.cross_vendor.comparable')" = "false" ] \
+  || fail "S5: a null class must withhold with the arms on two vendors too"
+[ "$(jqf "$WORK/null-class.json" '.cost_basis.cross_vendor.state')" = "same-provider" ] \
+  || fail "S5: the same-provider null fixture must actually be same-provider, or its refusal proves nothing"
+ok "S5 a null-valued class reads UNMAPPED and withholds under BOTH provider states — a gap is not rescued by one vendor, the way a measured zero is"
 
 count
 # MUTATION PROOF: empty the class roster the unmapped check walks, so an
@@ -1855,12 +1903,16 @@ MIRROR_CV="$(mkmirror "$WORK/mcv")"
 perl -pi -e 's/^(\s*)\| \(\["input", "cache_read", "cache_creation", "output"\]\) as \$tok_classes$/$1| ([]) as \$tok_classes/' "$MIRROR_CV"
 grep -F '| ([]) as $tok_classes' "$MIRROR_CV" >/dev/null \
   || fail "S6: the unmapped-detection mutation did not apply — the proof would be vacuous"
+# The REFUSING detection is now the UNMAPPED one (S5's fixture), so that is
+# what the mutation has to defeat; the all-zero fixture is run through the same
+# mutant to prove its DISCLOSURE bucket is riding the same roster.
+run "$NC" "$MIRROR_CV"; cp "$RUN_OUT" "$WORK/null-class-mut.json"
+[ "$(jqf "$WORK/null-class-mut.json" '.cost_basis.cross_vendor.comparable')" = "true" ] \
+  || fail "S6: with the class roster emptied the null fixture should read comparable — S5 is not riding the detection it claims to"
 run "$ZA" "$MIRROR_CV"; cp "$RUN_OUT" "$WORK/zero-all-mut.json"
-[ "$(jqf "$WORK/zero-all-mut.json" '.cost_basis.cross_vendor.comparable')" = "true" ] \
-  || fail "S6: with the class roster emptied the all-zero fixture should read comparable — S4 is not riding the detection it claims to"
 [ "$(jqf "$WORK/zero-all-mut.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.zero_on_every_record_token_classes | length')" = "0" ] \
-  || fail "S6: the mutant must see no unpriced class at all — otherwise the proof is measuring something else"
-ok "S6 mutation proof: emptying the token-class roster makes S4's all-zero class invisible — the unpriced-class check is load-bearing"
+  || fail "S6: the mutant must also see no all-zero class — otherwise S4's disclosure is riding something else"
+ok "S6 mutation proof: emptying the token-class roster makes S5's null class invisible (the axis wrongly reads comparable) and empties S4's disclosure bucket"
 
 count
 # Comparability is REFUSED, never assumed, when the records carry no vendor

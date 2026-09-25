@@ -751,6 +751,14 @@ jq -n \
   #                            for the class (key absent, or present as null).
   #   ZERO ON EVERY RECORD     every record carries 0.
   #
+  # THEY DO NOT WITHHOLD ALIKE (review round 2). UNMAPPED refuses in EVERY
+  # state — a delta that prices a gap at zero is not a measurement. ZERO ON
+  # EVERY RECORD refuses only when the arms are NOT on one provider, because
+  # the ambiguity below can only bite when the two arms envelopes can differ;
+  # under one provider both arms share one envelope shape, an all-zero class
+  # is a real cost fact the delta carries, and withholding there would defeat
+  # the same-vendor comparison this axis exists for. It is DISCLOSED instead.
+  #
   # The second is NOT a measurement, however much it looks like one. The only
   # writer of `candidate.tokens` in this pipeline —
   # workflows/scripts/model-comparison/replay.sh — builds the block with
@@ -812,12 +820,23 @@ jq -n \
      + (if ($c_zero | length) > 0
         then ["the candidate arm (\($c_zero | join(", ")))"] else [] end)
      | join(" and "))                                                   as $cv_zero_where
+  # THE REFUSE CONDITION, AND WHY THE TWO UNPRICED SHAPES DIFFER IN IT
+  # (temperloop#1742 review round 2). UNMAPPED refuses in EVERY state,
+  # same-provider included: a class carrying no value at all is a GAP, and a
+  # delta that prices a gap at zero is not a measurement. ZERO-ON-EVERY-RECORD
+  # does NOT refuse under same-provider, because the ambiguity it carries —
+  # measured zero vs a class replay.sh defaulted to 0 — only exists when the
+  # two arms VENDOR ENVELOPES CAN DIFFER. Under one provider both arms share
+  # one envelope shape, so an all-zero class is a real cost fact the delta must
+  # carry (a candidate arm that never created cache genuinely spent nothing on
+  # it), and withholding there would defeat the same-vendor comparison this
+  # axis exists for. In every other state the axis is already withheld on the
+  # provider verdict, and the zero classes are named in the reason beside it.
   | (($cv_state == "same-provider")
-     and (($cv_unmapped | length) == 0)
-     and (($cv_zero | length) == 0))                                    as $cv_comparable
+     and (($cv_unmapped | length) == 0))                                as $cv_comparable
   | ([
       (if $cv_state == "same-provider" and $cv_comparable then
-         "both arms name the SAME provider (\($bprov[0])) on their own records and every priced token class is present in both arms, so one SPEND_WEIGHT_* set prices both arms under the same real-world tariff and the weights cancel out of the delta. This is the ONLY state in which the cost delta below is a comparable figure"
+         "both arms name the SAME provider (\($bprov[0])) on their own records and every priced token class carries a value in both arms, so one SPEND_WEIGHT_* set prices both arms under the same real-world tariff and the weights cancel out of the delta. This is the ONLY state in which the cost delta below is a comparable figure"
        elif $cv_state == "same-provider" then
          "both arms name the same provider (\($bprov[0])), so the comparison is not split across vendors — but the cost axis is UNAVAILABLE all the same, for the reason that follows"
        elif $cv_state == "provider-differs" then
@@ -830,8 +849,10 @@ jq -n \
       (if ($cv_unmapped | length) > 0 then
          "token class(es) carrying NO VALUE on any record in \($cv_unmapped_where) — key absent, or present and null. The SPEND_WEIGHT_* multiply-add reads such a class as 0, so it is UNMAPPED: never measured. A delta computed with an unmapped class priced at zero is not a cost comparison"
        else empty end),
-      (if ($cv_zero | length) > 0 then
-         "token class(es) reading 0 on EVERY record in \($cv_zero_where). That is NOT reportable as a measurement of zero: workflows/scripts/model-comparison/replay.sh, the only writer of candidate.tokens here, builds the block with `<envelopeField> // 0` for all four classes, so a class the vendor envelope never carried is written as 0 rather than as null — which makes billed-zero and never-measured INDISTINGUISHABLE on these records. The axis is withheld rather than published over a class that may never have been priced at all (root cause filed as temperloop#2275; this producer does not edit replay.sh). Accepted cost of the fail-closed direction: a class that is genuinely and measurably zero across a short corpus withholds the axis too, until #2275 makes the two cases separable"
+      (if ($cv_zero | length) > 0 and $cv_comparable then
+         "DISCLOSURE, not a refusal: token class(es) reading 0 on EVERY record in \($cv_zero_where). Both arms ran against ONE provider and therefore one vendor envelope shape, so this is read as a MEASURED zero — a real cost fact the delta carries, not a hole in it. It is disclosed here, and in zero_on_every_record_token_classes per arm, because on these records it is still not textually distinguishable from a class workflows/scripts/model-comparison/replay.sh defaulted to 0 (it builds candidate.tokens with `<envelopeField> // 0` for all four classes); temperloop#2275 is what will let this producer tell the two apart"
+       elif ($cv_zero | length) > 0 then
+         "token class(es) reading 0 on EVERY record in \($cv_zero_where). With the arms NOT on one provider their vendor envelopes can differ, so an all-zero class here is not readable as a measured zero at all: replay.sh builds candidate.tokens with `<envelopeField> // 0` for all four classes, so a class the envelope never carried is written as 0 rather than as null (root cause filed as temperloop#2275; this producer does not edit replay.sh). The axis is already withheld on the provider verdict above; this names the classes a reader would otherwise take for measurements"
        else empty end)
     ] | join(". ") + ".")                                               as $cv_reason
   | {
@@ -845,9 +866,9 @@ jq -n \
       # test_comparison_report.sh S12 asserts (sorted) equality with
       # `cost_basis.weights | keys`.
       token_classes_priced: $tok_classes,
-      assumption: "SAME-TARIFF ASSUMPTION. Every figure on this cost axis applies ONE SPEND_WEIGHT_* weight set to BOTH arms. Those weights are RELATIVE PRICE MULTIPLIERS read off a single vendor price sheet, so the axis assumes both arms billed under the SAME real-world tariff. Within one vendor that assumption holds and the weights cancel out of the delta; across two vendors it does not, and the delta then reports one vendor priced at the other vendor ratios. This block CHECKS that assumption on every run rather than leaving it implicit. Note that weights_caveat beside it is a different and narrower caveat — a TEMPORAL one, about comparing figures across a SPEND_WEIGHT_* retune epoch — and says nothing about two arms priced under different tariffs inside a single run.",
+      assumption: "SAME-TARIFF ASSUMPTION. Every figure on this cost axis applies ONE SPEND_WEIGHT_* weight set to BOTH arms. It follows that an unpriced token class withholds this axis only where the same-tariff assumption is what makes it unreadable: a class with NO VALUE anywhere in an arm withholds in every state, while a class reading 0 on every record withholds only when the arms are not on one provider and is otherwise disclosed as a measured zero (see unmapped_vs_zero_note). Those weights are RELATIVE PRICE MULTIPLIERS read off a single vendor price sheet, so the axis assumes both arms billed under the SAME real-world tariff. Within one vendor that assumption holds and the weights cancel out of the delta; across two vendors it does not, and the delta then reports one vendor priced at the other vendor ratios. This block CHECKS that assumption on every run rather than leaving it implicit. Note that weights_caveat beside it is a different and narrower caveat — a TEMPORAL one, about comparing figures across a SPEND_WEIGHT_* retune epoch — and says nothing about two arms priced under different tariffs inside a single run.",
       weighting: "ONE weight set, both arms: input \($w_in), cache_read \($w_cr), cache_creation \($w_cc), output \($w_out). Not per-arm, by decision: per-arm pricing in a common currency is not built (temperloop#1742), because a second weight set would break the three-surface counting identity (batch.sh spend_reconciliation, emit-model-usage.sh, this producer).",
-      unmapped_vs_zero_note: "TWO SHAPES, ONE ZERO, NEITHER OF THEM A MEASUREMENT. An UNMAPPED class carries no value on any record in that arm — key absent, or present and null. A ZERO-ON-EVERY-RECORD class carries 0 on every record. It is tempting to read the second as `the vendor billed zero`, and on THESE records that reading is not available: workflows/scripts/model-comparison/replay.sh, the only writer of candidate.tokens in this pipeline, builds the block with `<envelopeField> // 0` for all four classes, so a class the vendor envelope never carried is written as 0 rather than as null. Billed-zero and never-measured are therefore indistinguishable here, and BOTH withhold the axis. They are still reported APART so the distinction survives in the output once the records can carry it — root cause filed as temperloop#2275 (emit null for a class the envelope never carried), deliberately out of this producer scope. Accepted cost: a genuinely zero class across a short corpus withholds the axis too; that is the fail-closed direction, and #2275 is what will let it be narrowed.",
+      unmapped_vs_zero_note: "TWO UNPRICED SHAPES, ONE ZERO IN THE ARITHMETIC, AND THEY DO NOT WITHHOLD ALIKE. THE RULE, in one sentence: a class with NO VALUE anywhere in an arm (UNMAPPED — key absent, or present and null) withholds the cost axis in EVERY state, because a delta that prices a gap at zero is not a measurement; a class reading 0 on every record (ZERO ON EVERY RECORD) withholds only when the arms are NOT on one provider, and under one provider it is DISCLOSED as a measured zero the delta legitimately carries. Why the asymmetry: the ambiguity in the all-zero case is that workflows/scripts/model-comparison/replay.sh, the only writer of candidate.tokens in this pipeline, builds the block with `<envelopeField> // 0` for all four classes, so a class the vendor envelope never carried is written as 0 rather than as null — and that ambiguity can only bite when the two arms VENDOR ENVELOPES CAN DIFFER. Under one provider they share one envelope shape, so an all-zero class is a real cost fact (an arm that never created cache genuinely spent nothing on it) and withholding there would defeat the same-vendor comparison this axis exists for. The two shapes are still reported in SEPARATE buckets so the distinction survives in the output; temperloop#2275 (emit null for a class the envelope never carried) is what will let this producer tell them apart textually, and is deliberately out of this producer scope.",
       spend_gate_note: "the replay pre-flight SPEND GATE (REPLAY_PREFLIGHT_CEILING_TOKENS, workflows/scripts/model-comparison/replay.sh preflight) is deliberately UNAFFECTED by this verdict and stays in house currency: a ceiling is a BUDGET CAP on what a batch may spend, not a comparison between two arms. The gate and the comparison are considered separately.",
       arm_tariffs: {
         baseline: {
