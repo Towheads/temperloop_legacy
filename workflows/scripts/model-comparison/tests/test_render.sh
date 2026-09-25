@@ -322,6 +322,73 @@ render --repo-root "$EMPTYREPO" --out "$WORK/empty.md"; expect_cannot_evaluate "
 [ ! -e "$WORK/empty.md" ] || fail "F3: no Markdown may be written when the producer skips"
 ok "F3 producer path: a repo with no arm files makes the producer skip, and the skip is CANNOT EVALUATE here"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# G — THE CROSS-VENDOR COST AXIS (temperloop#1742)
+# ═══════════════════════════════════════════════════════════════════════════
+# The VERDICT is the producer's; this file only formats it. Three properties:
+# an unavailable axis prints the producer's reason WHERE THE DELTA WAS; an
+# available one changes the page by exactly the one added line and nothing
+# else; and flipping the producer's verdict alone flips the rendering — so
+# the substitution rides the verdict rather than the renderer guessing from
+# a model name.
+
+count
+# The winner fixture is SAME-VENDOR (record() stamps provider "anthropic"),
+# so its rendering must differ from the SAME report with the cross_vendor
+# block deleted by exactly ONE line: the added disclosure. This is the
+# "renders byte-identically to today except for the added cross_vendor
+# block" acceptance, measured rather than asserted.
+[ "$(jq -r '.cost_basis.cross_vendor.comparable' "$WJSON")" = "true" ] \
+  || fail "G1 fixture precondition: the same-vendor winner fixture should read comparable"
+jq 'del(.cost_basis.cross_vendor)' "$WJSON" >"$WORK/nocv.json"
+render --in "$WJSON";           cp "$R_OUT" "$WORK/cv-with.md"
+render --in "$WORK/nocv.json";  cp "$R_OUT" "$WORK/cv-without.md"
+added="$(diff "$WORK/cv-without.md" "$WORK/cv-with.md" | grep -c '^> ')"
+removed="$(diff "$WORK/cv-without.md" "$WORK/cv-with.md" | grep -c '^< ')"
+[ "$added" = "1" ] && [ "$removed" = "0" ] \
+  || fail "G1: a same-vendor page must gain exactly the one cross-vendor line and change nothing else (added=$added removed=$removed): $(diff "$WORK/cv-without.md" "$WORK/cv-with.md")"
+grep -q '^- Cross-vendor cost axis: COMPARABLE — ' "$WORK/cv-with.md" \
+  || fail "G1: the added line must be the cross-vendor disclosure"
+ok "G1 same-vendor: the page is byte-identical to one rendered without the block, plus exactly the one added cross_vendor line"
+
+count
+# UNAVAILABLE: the producer's reason goes where the delta was. Injected onto
+# the real report rather than re-run, so this measures the RENDERER.
+jq '.cost_basis.cross_vendor.comparable = false
+    | .cost_basis.cross_vendor.state = "provider-differs"
+    | .cost_basis.cross_vendor.reason = "FIXTURE-REASON: the arms ran against different providers (anthropic vs openai)"' \
+   "$WJSON" >"$WORK/cv-unavailable.json"
+render --in "$WORK/cv-unavailable.json"; cp "$R_OUT" "$WORK/cv-unavailable.md"
+[ "$R_RC" -eq 0 ] || fail "G2: rc $R_RC: $(cat "$R_ERR")"
+grep -q 'Cost (descriptive, decides nothing): UNAVAILABLE for this comparison' "$WORK/cv-unavailable.md" \
+  || fail "G2: the Decision cost line must say the axis is unavailable"
+grep -q 'FIXTURE-REASON: the arms ran against different providers' "$WORK/cv-unavailable.md" \
+  || fail "G2: the producer's reason must be printed verbatim where the delta was"
+grep -q '^| cost per merged outcome (weighted units) |.*| unavailable |' "$WORK/cv-unavailable.md" \
+  || fail "G2: the at-a-glance delta cell must read unavailable, never a number: $(grep '^| cost per merged outcome' "$WORK/cv-unavailable.md")"
+# The delta is REPLACED, not annotated: the phrase that carries the number is
+# gone from the page entirely, so no reader can lift an incomparable figure
+# off it.
+if grep -q 'candidate minus baseline' "$WORK/cv-unavailable.md"; then
+  fail "G2: the numeric paired-mean delta must be GONE, not merely annotated: $(grep -n 'candidate minus baseline' "$WORK/cv-unavailable.md")"
+fi
+ok "G2 cross-vendor: the delta is replaced by the producer's named reason, in the Decision line and the at-a-glance cell"
+
+count
+# MUTATION PROOF: the ONLY difference between these two renders is the
+# producer's boolean. Flipping it back must restore the number, so the
+# substitution is driven by the verdict and by nothing else on the page.
+jq '.cost_basis.cross_vendor.comparable = true' "$WORK/cv-unavailable.json" >"$WORK/cv-flipped.json"
+render --in "$WORK/cv-flipped.json"; cp "$R_OUT" "$WORK/cv-flipped.md"
+if grep -q 'Cost (descriptive, decides nothing): UNAVAILABLE' "$WORK/cv-flipped.md"; then
+  fail "G3: flipping comparable back to true must restore the delta — the renderer is not reading the verdict"
+fi
+grep -q 'candidate minus baseline' "$WORK/cv-flipped.md" \
+  || fail "G3: the numeric delta line did not come back when the verdict said comparable"
+grep -q '^| cost per merged outcome (weighted units) |.*(paired mean) |' "$WORK/cv-flipped.md" \
+  || fail "G3: the at-a-glance delta cell did not come back"
+ok "G3 MUTATION PROOF: flipping cost_basis.cross_vendor.comparable alone flips the rendering both ways"
+
 count
 [ ! -e "$CANARY" ] || fail "CANARY FIRED: $(cat "$CANARY")"
 ok "canary: claude/gh/curl/wget were never invoked"

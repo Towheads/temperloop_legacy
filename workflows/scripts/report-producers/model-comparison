@@ -128,7 +128,9 @@
 #                   gets reported.
 #   cost_basis      which of the three non-interchangeable units the cost
 #                   figures are in — metered dollars vs token counts vs
-#                   subscription-usage share.
+#                   subscription-usage share — and, in its `cross_vendor`
+#                   sub-block, whether the unit is even comparable ACROSS the
+#                   two arms of this run.
 #
 # ── COST BASIS: COST-WEIGHTED TOKEN UNITS. NOT RAW. NOT DOLLARS. NOT A
 #    SUBSCRIPTION SHARE. ──────────────────────────────────────────────────
@@ -156,6 +158,28 @@
 # sourcing the same settings and applying the same one-line expression is the
 # only way both producers can be guaranteed to count a token the same way.
 # requestId dedup is N/A here for the same reason it is N/A at the emit site.
+#
+# ── THE SAME-TARIFF ASSUMPTION, AND WHERE IT BREAKS (temperloop#1742) ──────
+# One weight set, both arms. Those weights are relative PRICE MULTIPLIERS off
+# a single vendor price sheet, so every figure on this axis assumes both arms
+# billed under the SAME real-world tariff. Within one vendor that is correct
+# and load-bearing — the weights cancel out of the delta. Across two vendors
+# it is not: a different output:input ratio mis-states one arm systematically,
+# a class a vendor does not have prices as 0 rather than as UNMAPPED, and
+# cache_read (the dominant term by volume, weighted at a tenth) is the class
+# whose pricing model differs most between vendors.
+#
+# So `cost_basis.cross_vendor` publishes a per-run VERDICT — comparable
+# true/false, a named reason, and each arm's tariff facts — read off
+# candidate.provider (with candidate.model), the only vendor fact a replay
+# record carries. When it reads false, render.sh prints the reason WHERE THE
+# DELTA WOULD HAVE GONE rather than publishing an incomparable figure. Note
+# what it deliberately does NOT do: it never reprices anything. Per-arm
+# weights in a common currency are not built here — the currency choice is
+# open, and a second weight set would break the identity that keeps batch.sh
+# spend_reconciliation, emit-model-usage.sh and this producer counting a
+# token the same way. The pre-flight SPEND GATE is likewise untouched: a
+# ceiling is a budget cap in house currency, not a comparison.
 #
 # An optional DIRECTIONAL dollar OVERLAY is added when a price table resolves,
 # on the same two-tier override order report.sh already uses (a user
@@ -695,8 +719,121 @@ jq -n \
      else ($scored_models | map(select(($price_table[.] // null) != null))) end) as $priced_models
   | (if $price_table == null then $scored_models
      else ($scored_models | map(select(($price_table[.] // null) == null))) end) as $excluded_models
+
+  # ── THE CROSS-VENDOR COST AXIS (temperloop#1742) ───────────────────────
+  # ONE SPEND_WEIGHT_* set is applied to BOTH arms. That is correct and
+  # load-bearing for a SAME-VENDOR comparison, where both arms price
+  # identically and the weights cancel out of the delta. It is NOT defensible
+  # across vendors: a vendor whose output:input ratio is 3x or 10x rather than
+  # the configured one has its spend systematically mis-stated, and cache_read
+  # — the dominant term by volume, priced at a tenth — is the class whose
+  # pricing model differs most between vendors.
+  #
+  # So the axis DECLARES ITSELF UNAVAILABLE with a named reason rather than
+  # publishing an incomparable figure (the contract on temperloop#1742 allows
+  # either that or per-arm weights in a common currency). Per-arm pricing is
+  # deliberately NOT built here: it needs a currency choice the issue leaves
+  # open, and a second weight set would break the identity that keeps
+  # batch.sh spend_reconciliation, emit-model-usage.sh and this producer
+  # counting a token the same way. The VERDICT lives here, in the producer
+  # that already owns cost_basis; render.sh only formats it, exactly as it
+  # already formats weights_caveat.
+  #
+  # The only vendor fact a replay record carries is candidate.provider (with
+  # candidate.model beside it), so that is what the verdict is READ FROM —
+  # never inferred from a model name, and never assumed when unrecorded.
+  #
+  # UNMAPPED IS NOT ZERO. `wu` above reads `.candidate.tokens.<class> // 0`,
+  # so a class a vendor does not have prices as 0 — indistinguishable, in the
+  # arithmetic, from a vendor that BILLS zero for it. The two are separated
+  # HERE and reported apart: a class whose key is absent from every token
+  # block in an arm is UNMAPPED (never measured) and makes the axis
+  # unavailable; a class present and summing to zero is a measurement.
+  | (["input", "cache_read", "cache_creation", "output"]) as $tok_classes
+  | ($base | map(select(((.candidate // {}).tokens | type) == "object")
+                 | .candidate.tokens))                                  as $btok
+  | ($cand | map(select(((.candidate // {}).tokens | type) == "object")
+                 | .candidate.tokens))                                  as $ctok
+  | ($base | map((.candidate // {}).provider // null)
+           | map(select(. != null)) | unique)                           as $bprov
+  | ($cand | map((.candidate // {}).provider // null)
+           | map(select(. != null)) | unique)                           as $cprov
+  | (if ($btok | length) == 0 then []
+     else ($tok_classes | map(. as $k | select((($btok | map(has($k))) | any) | not)))
+     end)                                                               as $b_unmapped
+  | (if ($ctok | length) == 0 then []
+     else ($tok_classes | map(. as $k | select((($ctok | map(has($k))) | any) | not)))
+     end)                                                               as $c_unmapped
+  | (if ($btok | length) == 0 then []
+     else ($tok_classes | map(. as $k | select((($btok | map(has($k))) | any)
+                                               and (($btok | map(.[$k] // 0) | add // 0) == 0))))
+     end)                                                               as $b_zero
+  | (if ($ctok | length) == 0 then []
+     else ($tok_classes | map(. as $k | select((($ctok | map(has($k))) | any)
+                                               and (($ctok | map(.[$k] // 0) | add // 0) == 0))))
+     end)                                                               as $c_zero
+  | (if ($bprov | length) == 1 and ($cprov | length) == 1 and ($bprov[0] == $cprov[0])
+       then "same-provider"
+     elif ($bprov | length) == 0 or ($cprov | length) == 0
+       then "provider-unrecorded"
+     elif ($bprov | length) > 1 or ($cprov | length) > 1
+       then "provider-mixed"
+     else "provider-differs" end)                                       as $cv_state
+  | (($b_unmapped + $c_unmapped) | unique)                              as $cv_unmapped
+  | ((if ($b_unmapped | length) > 0
+        then ["the baseline arm (\($b_unmapped | join(", ")))"] else [] end)
+     + (if ($c_unmapped | length) > 0
+        then ["the candidate arm (\($c_unmapped | join(", ")))"] else [] end)
+     | join(" and "))                                                   as $cv_unmapped_where
+  | (($cv_state == "same-provider") and (($cv_unmapped | length) == 0)) as $cv_comparable
+  | ([
+      (if $cv_state == "same-provider" and $cv_comparable then
+         "both arms name the SAME provider (\($bprov[0])) on their own records and every priced token class is present in both arms, so one SPEND_WEIGHT_* set prices both arms under the same real-world tariff and the weights cancel out of the delta. This is the ONLY state in which the cost delta below is a comparable figure"
+       elif $cv_state == "same-provider" then
+         "both arms name the same provider (\($bprov[0])), so the comparison is not split across vendors — but the cost axis is UNAVAILABLE all the same, for the reason that follows"
+       elif $cv_state == "provider-differs" then
+         "THE ARMS RAN AGAINST DIFFERENT PROVIDERS (baseline \($bprov | join(", ")), candidate \($cprov | join(", "))), read off candidate.provider on the records themselves. One SPEND_WEIGHT_* weight set (input \($w_in), cache_read \($w_cr), cache_creation \($w_cc), output \($w_out)) is applied to BOTH arms, so the delta would price one vendor at the other vendor price ratios: a vendor whose output:input ratio is 3x or 10x rather than \($w_out):\($w_in) has its spend systematically mis-stated, and cache_read — the dominant term by volume at a tenth of the input weight — is the class whose pricing model differs most between vendors. Per-arm weights in a common currency are deliberately NOT built (temperloop#1742): the currency choice is an open question, and a second weight set would break the identity that keeps batch.sh spend_reconciliation, emit-model-usage.sh and this producer counting a token the same way"
+       elif $cv_state == "provider-mixed" then
+         "AT LEAST ONE ARM MIXES PROVIDERS across its own records (baseline \($bprov | join(", ")), candidate \($cprov | join(", "))), so there is no single per-arm tariff for this axis to compare at all"
+       else
+         "NO RECORD CARRIES candidate.provider on \(if ($bprov | length) == 0 and ($cprov | length) == 0 then "either arm" elif ($bprov | length) == 0 then "the baseline arm" else "the candidate arm" end), so this report cannot ESTABLISH that the two arms priced under the same tariff. candidate.provider (with candidate.model) is the only vendor fact a replay record carries, and comparability is REFUSED rather than assumed — an unestablished same-tariff assumption is exactly what this block exists to stop being published as a number"
+       end),
+      (if ($cv_unmapped | length) > 0 then
+         "token class(es) absent from EVERY token block in \($cv_unmapped_where): the SPEND_WEIGHT_* multiply-add reads an absent class as 0, so that class is UNMAPPED — never measured — which is a different fact from a vendor that BILLS zero for it (a class present and summing to zero, reported separately as billed_zero_token_classes). A delta computed with an unmapped class priced at zero is not a cost comparison"
+       else empty end)
+    ] | join(". ") + ".")                                               as $cv_reason
+  | {
+      comparable: $cv_comparable,
+      state: $cv_state,
+      reason: $cv_reason,
+      assumption: "SAME-TARIFF ASSUMPTION. Every figure on this cost axis applies ONE SPEND_WEIGHT_* weight set to BOTH arms. Those weights are RELATIVE PRICE MULTIPLIERS read off a single vendor price sheet, so the axis assumes both arms billed under the SAME real-world tariff. Within one vendor that assumption holds and the weights cancel out of the delta; across two vendors it does not, and the delta then reports one vendor priced at the other vendor ratios. This block CHECKS that assumption on every run rather than leaving it implicit. Note that weights_caveat beside it is a different and narrower caveat — a TEMPORAL one, about comparing figures across a SPEND_WEIGHT_* retune epoch — and says nothing about two arms priced under different tariffs inside a single run.",
+      weighting: "ONE weight set, both arms: input \($w_in), cache_read \($w_cr), cache_creation \($w_cc), output \($w_out). Not per-arm, by decision: per-arm pricing in a common currency is not built (temperloop#1742), because a second weight set would break the three-surface counting identity (batch.sh spend_reconciliation, emit-model-usage.sh, this producer).",
+      unmapped_vs_zero_note: "an UNMAPPED class was never measured in that arm — its key is absent from every token block there. A BILLED-ZERO class WAS measured and summed to zero. The multiply-add reads both as 0, which is precisely why they are reported apart here rather than collapsed into one number.",
+      spend_gate_note: "the replay pre-flight SPEND GATE (REPLAY_PREFLIGHT_CEILING_TOKENS, workflows/scripts/model-comparison/replay.sh preflight) is deliberately UNAFFECTED by this verdict and stays in house currency: a ceiling is a BUDGET CAP on what a batch may spend, not a comparison between two arms. The gate and the comparison are considered separately.",
+      arm_tariffs: {
+        baseline: {
+          provider: (if ($bprov | length) == 1 then $bprov[0] else null end),
+          providers_observed: $bprov,
+          models: ($base | map((.candidate // {}).model // null)
+                         | map(select(. != null)) | unique),
+          token_bearing_records_n: ($btok | length),
+          unmapped_token_classes: $b_unmapped,
+          billed_zero_token_classes: $b_zero
+        },
+        candidate: {
+          provider: (if ($cprov | length) == 1 then $cprov[0] else null end),
+          providers_observed: $cprov,
+          models: ($cand | map((.candidate // {}).model // null)
+                         | map(select(. != null)) | unique),
+          token_bearing_records_n: ($ctok | length),
+          unmapped_token_classes: $c_unmapped,
+          billed_zero_token_classes: $c_zero
+        }
+      }
+    }                                                                   as $cross_vendor
   | {
       arms: {baseline: ($base | armblock), candidate: ($cand | armblock)},
+      cross_vendor: $cross_vendor,
 
       execution_order: {
         basis: "ARM ORDER, and what it does to the arm effect. Before temperloop#1571 batch.sh ran the two arms in one FIXED order on every record — baseline first, candidate second — so ARM was perfectly confounded with EXECUTION POSITION and no N could separate them. The K#1262 A/A validation run, whose true arm effect is ZERO by construction, still showed a consistent second-arm advantage, so something real attaches to position; what that something is remains an open question and this block asserts no mechanism. batch.sh now counterbalances the order deterministically by record index, which is what makes the estimate below possible at all.",
@@ -1231,6 +1368,14 @@ report_json="$(jq -n \
         statement: "This report'"'"'s cost figures are TOKEN COUNTS — specifically COST-WEIGHTED token units derived from each record'"'"'s raw input/output/cache token classes via the SPEND_WEIGHT_* settings, never a RAW token sum. Token counts are the model-independent unit, comparable across providers that bill per token differently. They are NOT METERED DOLLARS (what a vendor actually billed for a call: a replay record carries no vendor cost field, so this producer has no metered figure to show) and NOT a SUBSCRIPTION-USAGE SHARE (quota consumed against a flat-rate plan such as Claude Max/Pro, which has no per-call dollar figure at all). These three units are not interchangeable, which is why this line names which one is in play on every run. The unit named above is BYTE-IDENTICAL to the one the replay spend gate (workflows/scripts/model-comparison/replay.sh preflight) authorizes a batch in, so the projected cost an operator approved and the cost reported here are directly reconcilable — before temperloop#1380 they were not, the gate having reported a raw sum under the same word.",
         weights: $d.arms.baseline.cost.weights,
         weights_caveat: "cost-weighted units are comparable only WITHIN one SPEND_WEIGHT_* retune epoch; after a weight retune, figures from before and after are not apples-to-apples and cannot be recomputed from these records alone",
+        # THE CROSS-VENDOR VERDICT (temperloop#1742). weights_caveat above is
+        # a TEMPORAL caveat — comparability across a retune epoch. This is the
+        # other one it never covered: whether the TWO ARMS of THIS run priced
+        # under the same real-world tariff. Derived beside the figures it
+        # qualifies; render.sh prints `reason` where the delta would go when
+        # `comparable` is false, the same way it already formats
+        # weights_caveat and the overlay reasons.
+        cross_vendor: $d.cross_vendor,
         list_price_overlay: {
           note: "an OPTIONAL directional dollar estimate layered on top of the token counts. A dated, hand-edited list-price table is not a bill: this is an estimate, never metered dollars.",
           table_in_effect: $price_source,

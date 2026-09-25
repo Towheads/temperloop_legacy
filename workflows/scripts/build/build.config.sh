@@ -1632,12 +1632,34 @@ fi
 # they authorized against the figure the report handed back. One unit now,
 # named identically on both sides.
 #
-# Two consequences worth stating out loud:
+# Three consequences worth stating out loud:
 #   * These values are only meaningful WITHIN one SPEND_WEIGHT_* retune
 #     epoch. Retune the weights and this per-replay figure needs re-deriving
 #     from the raw measurement below, because the same tokens then price
 #     differently. (Same caveat the report producer publishes as its
 #     `weights_caveat`.)
+#   * THE SAME-TARIFF ASSUMPTION (temperloop#1742). This unit assumes every
+#     figure denominated in it was BILLED UNDER THE SAME REAL-WORLD TARIFF.
+#     The SPEND_WEIGHT_* values are relative price multipliers read off ONE
+#     vendor price sheet, and ONE set is applied to BOTH arms of a
+#     comparison. Within a single vendor that is correct and load-bearing —
+#     both arms price identically and the weights cancel out of the delta.
+#     ACROSS VENDORS it does not hold: a vendor whose output:input ratio is
+#     3x or 10x rather than the configured one has its spend systematically
+#     mis-stated, a token class it does not have prices as 0 rather than as
+#     UNMAPPED, and cache_read (the dominant term by volume, weighted at a
+#     tenth) is the class whose pricing model differs most between vendors.
+#     The comparison report therefore CHECKS that assumption every run and
+#     declares its cost axis UNAVAILABLE with a named reason rather than
+#     publishing an incomparable delta — `cost_basis.cross_vendor` in
+#     workflows/scripts/report-producers/model-comparison, rendered by
+#     render.sh in place of the delta. Per-arm weights in a common currency
+#     are deliberately NOT built: the currency choice is open, and a second
+#     weight set would break the one-unit identity this block exists to hold
+#     (batch.sh spend_reconciliation, emit-model-usage.sh, the producer).
+#     NOTE the deliberate exemption directly below: the pre-flight SPEND
+#     GATE is a BUDGET CAP, not a comparison, so it stays in house currency
+#     under any tariff — a ceiling and a delta are considered separately.
 #   * Cost-weighted is the unit that corresponds to SPEND, which is what a
 #     spend gate is for. The dominant term in a real replay is cache_read
 #     (2.38M of 2.51M raw on the measurement below), which the default

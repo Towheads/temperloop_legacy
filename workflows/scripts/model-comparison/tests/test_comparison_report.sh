@@ -1717,6 +1717,170 @@ jq -e '.execution_order.robustness.statement | test("SURVIVES its own outliers")
   || fail "R3: a surviving decomposition must say so positively"
 ok "R3 a decomposition that survives its own outliers says so — the field is a finding, not a permanent alarm"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION S — THE CROSS-VENDOR COST AXIS (temperloop#1742)
+# ═══════════════════════════════════════════════════════════════════════════
+# ONE SPEND_WEIGHT_* set is applied to BOTH arms. That is correct within one
+# vendor (the weights cancel out of the delta) and indefensible across two.
+# The axis must therefore say WHICH case it is in, and declare itself
+# UNAVAILABLE with a named reason rather than publish an incomparable figure.
+# Two further properties are pinned here because both are silent failures:
+# an absent token class must read UNMAPPED and never as a vendor that bills
+# zero, and the verdict must be a DISCLOSURE — it may not move a single cost
+# number, or the three-surface weighting identity (batch.sh
+# spend_reconciliation, emit-model-usage.sh, this producer) would be broken
+# by the very block that exists to protect it.
+
+REPO_ROOT="$(cd -P "$SCRIPTS_DIR/../.." && pwd)"
+
+# The flattering run is SAME-VENDOR by construction (fill() stamps provider
+# "anthropic" on both arms), so it is the comparable-case fixture.
+count
+[ "$(jqf "$FLAT_OUT" '.cost_basis.cross_vendor.comparable')" = "true" ] \
+  || fail "S1: a same-vendor comparison must report cross_vendor.comparable true, got $(jqf "$FLAT_OUT" '.cost_basis.cross_vendor.comparable')"
+[ "$(jqf "$FLAT_OUT" '.cost_basis.cross_vendor.state')" = "same-provider" ] \
+  || fail "S1: expected state same-provider, got $(jqf "$FLAT_OUT" '.cost_basis.cross_vendor.state')"
+[ "$(jqf "$FLAT_OUT" '.cost_basis.cross_vendor.arm_tariffs.baseline.provider')" = "anthropic" ] \
+  || fail "S1: the baseline arm tariff must name the provider read off the records"
+[ "$(jqf "$FLAT_OUT" '.cost_basis.cross_vendor.arm_tariffs.candidate.provider')" = "anthropic" ] \
+  || fail "S1: the candidate arm tariff must name the provider read off the records"
+ok "S1 a same-vendor comparison reports the cost axis COMPARABLE and names each arm's tariff"
+
+# ── the cross-vendor fixture: byte-identical records, one provider changed ──
+# Built from the SAME fill() calls as the flattering run, so every token count
+# is identical and the ONLY difference is candidate.provider. That is what
+# makes S3 below a real no-arithmetic-change proof rather than a coincidence.
+XV="$WORK/crossvendor"
+mkrepo "$XV"
+fill "$WORK/xv-base.jsonl" claude-opus-4-8 24 5000 0
+fill "$WORK/xv-cand.jsonl" claude-sonnet-5 24 4200 90 8
+cp "$WORK/xv-base.jsonl" "$XV/.temperloop/model-comparison/baseline.jsonl"
+jq -c '.candidate.provider = "openai"' "$WORK/xv-cand.jsonl" \
+  >"$XV/.temperloop/model-comparison/candidate.jsonl"
+lake "$XV" pipeline-drive-safe retro-judge
+run "$XV"; cp "$RUN_OUT" "$WORK/crossvendor.json"
+
+count
+[ "$(jqf "$WORK/crossvendor.json" '.cost_basis.cross_vendor.comparable')" = "false" ] \
+  || fail "S2: two arms on different providers must report comparable false, got $(jqf "$WORK/crossvendor.json" '.cost_basis.cross_vendor.comparable')"
+[ "$(jqf "$WORK/crossvendor.json" '.cost_basis.cross_vendor.state')" = "provider-differs" ] \
+  || fail "S2: expected state provider-differs, got $(jqf "$WORK/crossvendor.json" '.cost_basis.cross_vendor.state')"
+jq -e '.cost_basis.cross_vendor.reason | test("anthropic") and test("openai")' "$WORK/crossvendor.json" >/dev/null 2>&1 \
+  || fail "S2: the reason must NAME both providers, got: $(jqf "$WORK/crossvendor.json" '.cost_basis.cross_vendor.reason')"
+jq -e '.cost_basis.cross_vendor.reason | test("candidate.provider")' "$WORK/crossvendor.json" >/dev/null 2>&1 \
+  || fail "S2: the reason must say WHICH record field the vendor fact was read from"
+[ "$(jqf "$WORK/crossvendor.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.provider')" = "openai" ] \
+  || fail "S2: arm_tariffs must carry the per-arm providers it judged on"
+ok "S2 a cross-vendor comparison declares the cost axis UNAVAILABLE with a named reason, not a published delta"
+
+count
+# THE VERDICT IS A DISCLOSURE, NOT A REPRICING. Every cost figure in the
+# cross-vendor report must be byte-identical to the same-vendor one built from
+# the same token counts: a single weight set still prices both arms, so
+# batch.sh spend_reconciliation, emit-model-usage.sh and this producer keep
+# counting a token the same way. If this assertion ever fails, the axis has
+# started repricing rather than reporting.
+[ "$(jq -S -c '.arms' "$FLAT_OUT")" = "$(jq -S -c '.arms' "$WORK/crossvendor.json")" ] \
+  || fail "S3: the cross-vendor verdict changed a per-arm cost figure — it must disclose, never reprice"
+[ "$(jq -S -c '.comparison.deltas' "$FLAT_OUT")" = "$(jq -S -c '.comparison.deltas' "$WORK/crossvendor.json")" ] \
+  || fail "S3: the cross-vendor verdict changed the paired deltas"
+[ "$(jq -S -c '.cost_basis.weights' "$FLAT_OUT")" = "$(jq -S -c '.cost_basis.weights' "$WORK/crossvendor.json")" ] \
+  || fail "S3: the cross-vendor verdict introduced a second weight set"
+ok "S3 the verdict is a DISCLOSURE: not one cost figure, delta or weight moves between the same- and cross-vendor runs"
+
+# ── an absent token class is UNMAPPED, never a vendor that bills zero ───────
+UM="$WORK/unmapped"
+mkrepo "$UM"
+cp "$WORK/xv-base.jsonl" "$UM/.temperloop/model-comparison/baseline.jsonl"
+jq -c 'del(.candidate.tokens.cache_creation)' "$WORK/xv-cand.jsonl" \
+  >"$UM/.temperloop/model-comparison/candidate.jsonl"
+lake "$UM" pipeline-drive-safe retro-judge
+run "$UM"; cp "$RUN_OUT" "$WORK/unmapped.json"
+
+ZB="$WORK/zerobilled"
+mkrepo "$ZB"
+cp "$WORK/xv-base.jsonl" "$ZB/.temperloop/model-comparison/baseline.jsonl"
+jq -c '.candidate.tokens.cache_creation = 0' "$WORK/xv-cand.jsonl" \
+  >"$ZB/.temperloop/model-comparison/candidate.jsonl"
+lake "$ZB" pipeline-drive-safe retro-judge
+run "$ZB"; cp "$RUN_OUT" "$WORK/zerobilled.json"
+
+count
+[ "$(jqf "$WORK/unmapped.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.unmapped_token_classes | join(",")')" = "cache_creation" ] \
+  || fail "S4: a class absent from every token block must be reported UNMAPPED, got $(jqf "$WORK/unmapped.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.unmapped_token_classes | tostring')"
+[ "$(jqf "$WORK/unmapped.json" '.cost_basis.cross_vendor.comparable')" = "false" ] \
+  || fail "S4: an unmapped class must make the axis unavailable — a delta computed with it priced at 0 IS pricing it at zero"
+jq -e '.cost_basis.cross_vendor.reason | test("UNMAPPED")' "$WORK/unmapped.json" >/dev/null 2>&1 \
+  || fail "S4: the reason must name the class as unmapped"
+ok "S4 a candidate arm with no cache_creation class at all reports it UNMAPPED and withholds the axis, never pricing it at zero"
+
+count
+# The distinction is the whole point: a vendor that BILLS zero was measured.
+[ "$(jqf "$WORK/zerobilled.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.unmapped_token_classes | length')" = "0" ] \
+  || fail "S5: a class present and summing to zero was measured — it must NOT read as unmapped"
+[ "$(jqf "$WORK/zerobilled.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.billed_zero_token_classes | join(",")')" = "cache_creation" ] \
+  || fail "S5: a present-and-zero class must be reported as billed-zero, got $(jqf "$WORK/zerobilled.json" '.cost_basis.cross_vendor.arm_tariffs.candidate.billed_zero_token_classes | tostring')"
+[ "$(jqf "$WORK/zerobilled.json" '.cost_basis.cross_vendor.comparable')" = "true" ] \
+  || fail "S5: a measured zero is a measurement — it must not withhold the axis"
+ok "S5 UNMAPPED and BILLED-ZERO are reported apart: the same 0 in the arithmetic, two different facts on the page"
+
+count
+# MUTATION PROOF: empty the class roster the unmapped check walks, so an
+# absent class can no longer be detected. S4's fixture must then read
+# comparable — proving S4 rides this detection and not something else.
+MIRROR_CV="$(mkmirror "$WORK/mcv")"
+perl -pi -e 's/^(\s*)\| \(\["input", "cache_read", "cache_creation", "output"\]\) as \$tok_classes$/$1| ([]) as \$tok_classes/' "$MIRROR_CV"
+grep -F '| ([]) as $tok_classes' "$MIRROR_CV" >/dev/null \
+  || fail "S6: the unmapped-detection mutation did not apply — the proof would be vacuous"
+run "$UM" "$MIRROR_CV"; cp "$RUN_OUT" "$WORK/unmapped-mut.json"
+[ "$(jqf "$WORK/unmapped-mut.json" '.cost_basis.cross_vendor.comparable')" = "true" ] \
+  || fail "S6: with the class roster emptied the unmapped fixture should read comparable — S4 is not riding the detection it claims to"
+ok "S6 mutation proof: emptying the token-class roster makes S4's absent class invisible — the unmapped check is load-bearing"
+
+count
+# Comparability is REFUSED, never assumed, when the records carry no vendor
+# fact at all. A same-tariff assumption nobody can check is exactly what this
+# block exists to stop being published as a number.
+NP="$WORK/noprovider"
+mkrepo "$NP"
+jq -c '.candidate.provider = null' "$WORK/xv-base.jsonl" >"$NP/.temperloop/model-comparison/baseline.jsonl"
+jq -c '.candidate.provider = null' "$WORK/xv-cand.jsonl" >"$NP/.temperloop/model-comparison/candidate.jsonl"
+lake "$NP" pipeline-drive-safe retro-judge
+run "$NP"; cp "$RUN_OUT" "$WORK/noprovider.json"
+[ "$(jqf "$WORK/noprovider.json" '.cost_basis.cross_vendor.state')" = "provider-unrecorded" ] \
+  || fail "S7: records with no provider must be reported as unrecorded, got $(jqf "$WORK/noprovider.json" '.cost_basis.cross_vendor.state')"
+[ "$(jqf "$WORK/noprovider.json" '.cost_basis.cross_vendor.comparable')" = "false" ] \
+  || fail "S7: an UNESTABLISHED same-tariff assumption must refuse the axis, not assume it"
+jq -e '.cost_basis.cross_vendor.reason | test("ESTABLISH")' "$WORK/noprovider.json" >/dev/null 2>&1 \
+  || fail "S7: the reason must say the assumption could not be established"
+ok "S7 with no provider on the records comparability is REFUSED rather than assumed"
+
+count
+# THE SAME-TARIFF ASSUMPTION IS STATED AT THE THREE SITES THE ISSUE NAMES.
+jq -e '.cost_basis.cross_vendor.assumption | test("SAME-TARIFF ASSUMPTION")' "$FLAT_OUT" >/dev/null 2>&1 \
+  || fail "S8: site 1 of 3 — the producer's cost_basis block must state the same-tariff assumption"
+grep -q 'SAME-TARIFF ASSUMPTION' "$SCRIPTS_DIR/build/build.config.sh" \
+  || fail "S8: site 2 of 3 — build.config.sh's cost-basis comment block must state the same-tariff assumption"
+grep -q 'same-tariff assumption' "$REPO_ROOT/docs/adr/0026-attribution-telemetry-coexists-with-transcript-cost.md" \
+  || fail "S8: site 3 of 3 — ADR 0026 must state the same-tariff assumption"
+ok "S8 the same-tariff assumption is stated at all three sites: the producer's cost_basis block, build.config.sh, and ADR 0026"
+
+count
+# THE SPEND GATE IS A BUDGET CAP, NOT A COMPARISON, AND IS UNCHANGED. The
+# pre-flight ceiling stays in house currency under any tariff; this verdict
+# must not have leaked into it, nor into either of the other two weighting
+# surfaces.
+grep -q 'REPLAY_PREFLIGHT_CEILING_TOKENS' "$MC_DIR/replay.sh" \
+  || fail "S9: the pre-flight spend ceiling disappeared from replay.sh"
+for untouched in "$MC_DIR/replay.sh" "$MC_DIR/batch.sh" "$SCRIPTS_DIR/emit-model-usage.sh"; do
+  if grep -q 'cross_vendor' "$untouched"; then
+    fail "S9: $untouched must be untouched by the cross-vendor verdict — the spend gate and the weighting surfaces are considered separately from the comparison"
+  fi
+done
+jq -e '.cost_basis.cross_vendor.spend_gate_note | test("REPLAY_PREFLIGHT_CEILING_TOKENS")' "$FLAT_OUT" >/dev/null 2>&1 \
+  || fail "S9: the block must state that the spend gate is deliberately unaffected"
+ok "S9 the pre-flight spend gate and the other two weighting surfaces are untouched, and the block says so"
+
 echo
 echo "test_comparison_report.sh: $pass/$total checks passed"
 [ "$pass" -eq "$total" ] || exit 1
