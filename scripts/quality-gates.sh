@@ -2411,8 +2411,10 @@ SERIAL_LANE_PINS=(
 # `make test-cli-subcommands` are no longer gates (they are glob-expanded per
 # script above), and the NEW long poles are the individual scripts that used to
 # hide inside them. Measured serially on the item's host, 2026-09-22 — the
-# numbers are the reason each line is here, not decoration:
-#   test_bounded_suite.sh 77s · test_configure.sh 71s · test_workflow.sh 57s ·
+# numbers are the reason each line is here, not decoration (test_bounded_suite.sh
+# re-measured 2026-09-24 at ~196s: its temperloop#2245 case runs the real
+# test_workflow.sh once, end to end, with stdin held open):
+#   test_bounded_suite.sh 196s · test_configure.sh 71s · test_workflow.sh 57s ·
 #   test_pipeline_drive.sh 52s · test_worktree.sh 31s · test_init.sh 28s ·
 #   test_pr.sh 16s · test_pipeline_cron.sh 15s · test_guard_arming_probe.sh 14s
 # Everything below those is single-digit seconds and needs no hint.

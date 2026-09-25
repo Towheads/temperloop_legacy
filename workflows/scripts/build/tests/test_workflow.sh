@@ -112,12 +112,18 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd ../../../.. && pwd)"
 # preamble by hand): `WF_TEST_SELF_BOUND=1 bash …/test_workflow.sh`.
 # ============================================================================
 if [ "${WF_TEST_SELF_BOUND:-}" != 1 ]; then
-  _wf_self="$REPO_ROOT/workflows/scripts/build/tests/test_workflow.sh"
+  # From BASH_SOURCE, not a literal name: a renamed copy re-execs ITSELF, never
+  # the original file this one was copied from.
+  _wf_self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   _wf_guard="$REPO_ROOT/workflows/scripts/build/bounded-suite.sh"
   if [ ! -f "$_wf_guard" ]; then
     echo "FAIL: $_wf_guard is missing — this suite refuses to run UNBOUNDED (temperloop#2245); it ships beside the wrapper" >&2
     exit 1
   fi
+  # Exported HERE too, not only by the wrapper: the wrapper's own export is
+  # what keeps make/gates from re-wrapping, but a wrapper that dropped it
+  # would otherwise send this preamble into suite→wrapper→suite recursion.
+  export WF_TEST_SELF_BOUND=1
   exec bash "$_wf_guard" --label test_workflow.sh-direct --case-source "$_wf_self" -- bash "$_wf_self" "$@"
 fi
 

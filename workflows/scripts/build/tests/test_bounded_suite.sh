@@ -753,7 +753,11 @@ pass "12b the bound is still wall-clock, not poll-count: a 2s bound over a 30s h
 # reproduction that only sometimes reproduces proves nothing either way.
 HELD="$TMPD/stdin-held-open.fifo"
 mkfifo "$HELD" || fail "13: could not create the FIFO that holds stdin open"
-sleep 600 > "$HELD" &
+# The feeder must outlive every arm below (13b's bound alone is 900s): a FIFO
+# with NO writer blocks its readers in open(), which would stall the suite
+# BEFORE it ever ran and read as the very hang under test. Reaped via
+# STRAY_PIDS on exit.
+sleep 100000 > "$HELD" &
 STRAY_PIDS+=("$!")
 
 # ARM (a) — the redirect, on the REAL preamble. The fixture is the suite's own
