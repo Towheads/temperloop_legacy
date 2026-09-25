@@ -743,33 +743,54 @@ jq -n \
   # candidate.model beside it), so that is what the verdict is READ FROM —
   # never inferred from a model name, and never assumed when unrecorded.
   #
-  # UNMAPPED IS NOT ZERO. `wu` above reads `.candidate.tokens.<class> // 0`,
-  # so a class a vendor does not have prices as 0 — indistinguishable, in the
-  # arithmetic, from a vendor that BILLS zero for it. The two are separated
-  # HERE and reported apart: a class whose key is absent from every token
-  # block in an arm is UNMAPPED (never measured) and makes the axis
-  # unavailable; a class present and summing to zero is a measurement.
+  # UNPRICED IS NOT ZERO — AND THE RECORDS CANNOT ALWAYS TELL THEM APART.
+  # `wu` above reads `.candidate.tokens.<class> // 0`, so a class a vendor
+  # does not have prices as 0. Two shapes reach that same 0:
+  #
+  #   UNMAPPED                 no record in the arm carries a non-null value
+  #                            for the class (key absent, or present as null).
+  #   ZERO ON EVERY RECORD     every record carries 0.
+  #
+  # The second is NOT a measurement, however much it looks like one. The only
+  # writer of `candidate.tokens` in this pipeline —
+  # workflows/scripts/model-comparison/replay.sh — builds the block with
+  # `<envelopeField> // 0` for ALL FOUR classes, so a class the vendor
+  # envelope never carried is written as 0 rather than as null. On these
+  # records "the vendor billed zero" and "the vendor has no such class" are
+  # therefore INDISTINGUISHABLE, and calling the all-zero case measured would
+  # be a false statement about measurement — exactly the silent zero this
+  # block exists to stop. Both are reported (apart, so the distinction
+  # survives once the records can carry it) and BOTH withhold the axis.
+  # Root cause, out of scope here and filed separately: temperloop#2275
+  # (emit null for a class the envelope never carried).
   | (["input", "cache_read", "cache_creation", "output"]) as $tok_classes
   | ($base | map(select(((.candidate // {}).tokens | type) == "object")
                  | .candidate.tokens))                                  as $btok
   | ($cand | map(select(((.candidate // {}).tokens | type) == "object")
                  | .candidate.tokens))                                  as $ctok
+  # Provider names are compared case-insensitively, and an EMPTY string is
+  # treated exactly like an absent one — "Anthropic" and "anthropic" are one
+  # vendor, and "" is not a vendor fact at all. Fail-closed either way: a
+  # normalisation that cannot be applied leaves the name out, which can only
+  # move the verdict toward `provider-unrecorded`, never toward comparable.
   | ($base | map((.candidate // {}).provider // null)
-           | map(select(. != null)) | unique)                           as $bprov
+           | map(select(type == "string")) | map(ascii_downcase)
+           | map(select(. != "")) | unique)                             as $bprov
   | ($cand | map((.candidate // {}).provider // null)
-           | map(select(. != null)) | unique)                           as $cprov
+           | map(select(type == "string")) | map(ascii_downcase)
+           | map(select(. != "")) | unique)                             as $cprov
   | (if ($btok | length) == 0 then []
-     else ($tok_classes | map(. as $k | select((($btok | map(has($k))) | any) | not)))
+     else ($tok_classes | map(. as $k | select((($btok | map((.[$k] // null) != null)) | any) | not)))
      end)                                                               as $b_unmapped
   | (if ($ctok | length) == 0 then []
-     else ($tok_classes | map(. as $k | select((($ctok | map(has($k))) | any) | not)))
+     else ($tok_classes | map(. as $k | select((($ctok | map((.[$k] // null) != null)) | any) | not)))
      end)                                                               as $c_unmapped
   | (if ($btok | length) == 0 then []
-     else ($tok_classes | map(. as $k | select((($btok | map(has($k))) | any)
+     else ($tok_classes | map(. as $k | select((($btok | map((.[$k] // null) != null)) | any)
                                                and (($btok | map(.[$k] // 0) | add // 0) == 0))))
      end)                                                               as $b_zero
   | (if ($ctok | length) == 0 then []
-     else ($tok_classes | map(. as $k | select((($ctok | map(has($k))) | any)
+     else ($tok_classes | map(. as $k | select((($ctok | map((.[$k] // null) != null)) | any)
                                                and (($ctok | map(.[$k] // 0) | add // 0) == 0))))
      end)                                                               as $c_zero
   | (if ($bprov | length) == 1 and ($cprov | length) == 1 and ($bprov[0] == $cprov[0])
@@ -780,12 +801,20 @@ jq -n \
        then "provider-mixed"
      else "provider-differs" end)                                       as $cv_state
   | (($b_unmapped + $c_unmapped) | unique)                              as $cv_unmapped
+  | (($b_zero + $c_zero) | unique)                                      as $cv_zero
   | ((if ($b_unmapped | length) > 0
         then ["the baseline arm (\($b_unmapped | join(", ")))"] else [] end)
      + (if ($c_unmapped | length) > 0
         then ["the candidate arm (\($c_unmapped | join(", ")))"] else [] end)
      | join(" and "))                                                   as $cv_unmapped_where
-  | (($cv_state == "same-provider") and (($cv_unmapped | length) == 0)) as $cv_comparable
+  | ((if ($b_zero | length) > 0
+        then ["the baseline arm (\($b_zero | join(", ")))"] else [] end)
+     + (if ($c_zero | length) > 0
+        then ["the candidate arm (\($c_zero | join(", ")))"] else [] end)
+     | join(" and "))                                                   as $cv_zero_where
+  | (($cv_state == "same-provider")
+     and (($cv_unmapped | length) == 0)
+     and (($cv_zero | length) == 0))                                    as $cv_comparable
   | ([
       (if $cv_state == "same-provider" and $cv_comparable then
          "both arms name the SAME provider (\($bprov[0])) on their own records and every priced token class is present in both arms, so one SPEND_WEIGHT_* set prices both arms under the same real-world tariff and the weights cancel out of the delta. This is the ONLY state in which the cost delta below is a comparable figure"
@@ -799,16 +828,26 @@ jq -n \
          "NO RECORD CARRIES candidate.provider on \(if ($bprov | length) == 0 and ($cprov | length) == 0 then "either arm" elif ($bprov | length) == 0 then "the baseline arm" else "the candidate arm" end), so this report cannot ESTABLISH that the two arms priced under the same tariff. candidate.provider (with candidate.model) is the only vendor fact a replay record carries, and comparability is REFUSED rather than assumed — an unestablished same-tariff assumption is exactly what this block exists to stop being published as a number"
        end),
       (if ($cv_unmapped | length) > 0 then
-         "token class(es) absent from EVERY token block in \($cv_unmapped_where): the SPEND_WEIGHT_* multiply-add reads an absent class as 0, so that class is UNMAPPED — never measured — which is a different fact from a vendor that BILLS zero for it (a class present and summing to zero, reported separately as billed_zero_token_classes). A delta computed with an unmapped class priced at zero is not a cost comparison"
+         "token class(es) carrying NO VALUE on any record in \($cv_unmapped_where) — key absent, or present and null. The SPEND_WEIGHT_* multiply-add reads such a class as 0, so it is UNMAPPED: never measured. A delta computed with an unmapped class priced at zero is not a cost comparison"
+       else empty end),
+      (if ($cv_zero | length) > 0 then
+         "token class(es) reading 0 on EVERY record in \($cv_zero_where). That is NOT reportable as a measurement of zero: workflows/scripts/model-comparison/replay.sh, the only writer of candidate.tokens here, builds the block with `<envelopeField> // 0` for all four classes, so a class the vendor envelope never carried is written as 0 rather than as null — which makes billed-zero and never-measured INDISTINGUISHABLE on these records. The axis is withheld rather than published over a class that may never have been priced at all (root cause filed as temperloop#2275; this producer does not edit replay.sh). Accepted cost of the fail-closed direction: a class that is genuinely and measurably zero across a short corpus withholds the axis too, until #2275 makes the two cases separable"
        else empty end)
     ] | join(". ") + ".")                                               as $cv_reason
   | {
       comparable: $cv_comparable,
       state: $cv_state,
       reason: $cv_reason,
+      # The roster the unmapped / zero-on-every-record checks walk, published
+      # so it can be held equal to the weight set MECHANICALLY rather than by
+      # eye: the two are separate literals in this file, and a class priced by
+      # `wu` but missing from this roster would be unpriceable-and-unchecked.
+      # test_comparison_report.sh S12 asserts (sorted) equality with
+      # `cost_basis.weights | keys`.
+      token_classes_priced: $tok_classes,
       assumption: "SAME-TARIFF ASSUMPTION. Every figure on this cost axis applies ONE SPEND_WEIGHT_* weight set to BOTH arms. Those weights are RELATIVE PRICE MULTIPLIERS read off a single vendor price sheet, so the axis assumes both arms billed under the SAME real-world tariff. Within one vendor that assumption holds and the weights cancel out of the delta; across two vendors it does not, and the delta then reports one vendor priced at the other vendor ratios. This block CHECKS that assumption on every run rather than leaving it implicit. Note that weights_caveat beside it is a different and narrower caveat — a TEMPORAL one, about comparing figures across a SPEND_WEIGHT_* retune epoch — and says nothing about two arms priced under different tariffs inside a single run.",
       weighting: "ONE weight set, both arms: input \($w_in), cache_read \($w_cr), cache_creation \($w_cc), output \($w_out). Not per-arm, by decision: per-arm pricing in a common currency is not built (temperloop#1742), because a second weight set would break the three-surface counting identity (batch.sh spend_reconciliation, emit-model-usage.sh, this producer).",
-      unmapped_vs_zero_note: "an UNMAPPED class was never measured in that arm — its key is absent from every token block there. A BILLED-ZERO class WAS measured and summed to zero. The multiply-add reads both as 0, which is precisely why they are reported apart here rather than collapsed into one number.",
+      unmapped_vs_zero_note: "TWO SHAPES, ONE ZERO, NEITHER OF THEM A MEASUREMENT. An UNMAPPED class carries no value on any record in that arm — key absent, or present and null. A ZERO-ON-EVERY-RECORD class carries 0 on every record. It is tempting to read the second as `the vendor billed zero`, and on THESE records that reading is not available: workflows/scripts/model-comparison/replay.sh, the only writer of candidate.tokens in this pipeline, builds the block with `<envelopeField> // 0` for all four classes, so a class the vendor envelope never carried is written as 0 rather than as null. Billed-zero and never-measured are therefore indistinguishable here, and BOTH withhold the axis. They are still reported APART so the distinction survives in the output once the records can carry it — root cause filed as temperloop#2275 (emit null for a class the envelope never carried), deliberately out of this producer scope. Accepted cost: a genuinely zero class across a short corpus withholds the axis too; that is the fail-closed direction, and #2275 is what will let it be narrowed.",
       spend_gate_note: "the replay pre-flight SPEND GATE (REPLAY_PREFLIGHT_CEILING_TOKENS, workflows/scripts/model-comparison/replay.sh preflight) is deliberately UNAFFECTED by this verdict and stays in house currency: a ceiling is a BUDGET CAP on what a batch may spend, not a comparison between two arms. The gate and the comparison are considered separately.",
       arm_tariffs: {
         baseline: {
@@ -818,7 +857,7 @@ jq -n \
                          | map(select(. != null)) | unique),
           token_bearing_records_n: ($btok | length),
           unmapped_token_classes: $b_unmapped,
-          billed_zero_token_classes: $b_zero
+          zero_on_every_record_token_classes: $b_zero
         },
         candidate: {
           provider: (if ($cprov | length) == 1 then $cprov[0] else null end),
@@ -827,7 +866,7 @@ jq -n \
                          | map(select(. != null)) | unique),
           token_bearing_records_n: ($ctok | length),
           unmapped_token_classes: $c_unmapped,
-          billed_zero_token_classes: $c_zero
+          zero_on_every_record_token_classes: $c_zero
         }
       }
     }                                                                   as $cross_vendor
@@ -1365,7 +1404,7 @@ report_json="$(jq -n \
         # REPLAY_COST_BASIS_UNIT; see this file header. Pinned mechanically
         # by model-comparison/tests/test_replay_preflight_cost_unit.sh.
         unit: "cost-weighted-token-units",
-        statement: "This report'"'"'s cost figures are TOKEN COUNTS — specifically COST-WEIGHTED token units derived from each record'"'"'s raw input/output/cache token classes via the SPEND_WEIGHT_* settings, never a RAW token sum. Token counts are the model-independent unit, comparable across providers that bill per token differently. They are NOT METERED DOLLARS (what a vendor actually billed for a call: a replay record carries no vendor cost field, so this producer has no metered figure to show) and NOT a SUBSCRIPTION-USAGE SHARE (quota consumed against a flat-rate plan such as Claude Max/Pro, which has no per-call dollar figure at all). These three units are not interchangeable, which is why this line names which one is in play on every run. The unit named above is BYTE-IDENTICAL to the one the replay spend gate (workflows/scripts/model-comparison/replay.sh preflight) authorizes a batch in, so the projected cost an operator approved and the cost reported here are directly reconcilable — before temperloop#1380 they were not, the gate having reported a raw sum under the same word.",
+        statement: "This report'"'"'s cost figures are TOKEN COUNTS — specifically COST-WEIGHTED token units derived from each record'"'"'s raw input/output/cache token classes via the SPEND_WEIGHT_* settings, never a RAW token sum. RAW token counts are the model-independent unit. The COST-WEIGHTED units published here are NOT raw, and they are comparable across the two arms only under the SAME-TARIFF ASSUMPTION — one weight set, read off one vendor price sheet, applied to both arms — which the sibling `cross_vendor` block checks on every run and which it declares this axis UNAVAILABLE for when it does not hold. They are NOT METERED DOLLARS (what a vendor actually billed for a call: a replay record carries no vendor cost field, so this producer has no metered figure to show) and NOT a SUBSCRIPTION-USAGE SHARE (quota consumed against a flat-rate plan such as Claude Max/Pro, which has no per-call dollar figure at all). These three units are not interchangeable, which is why this line names which one is in play on every run. The unit named above is BYTE-IDENTICAL to the one the replay spend gate (workflows/scripts/model-comparison/replay.sh preflight) authorizes a batch in, so the projected cost an operator approved and the cost reported here are directly reconcilable — before temperloop#1380 they were not, the gate having reported a raw sum under the same word.",
         weights: $d.arms.baseline.cost.weights,
         weights_caveat: "cost-weighted units are comparable only WITHIN one SPEND_WEIGHT_* retune epoch; after a weight retune, figures from before and after are not apples-to-apples and cannot be recomputed from these records alone",
         # THE CROSS-VENDOR VERDICT (temperloop#1742). weights_caveat above is

@@ -157,7 +157,12 @@ ok "A2 winner: the verdict is decision-first — inside ## Decision, near the to
 count
 jq -e '.schema_version == "model-comparison-summary-v1" and .winner == "candidate" and .winner_axis == "quality" and .verdict == "candidate_better" and .quality_below_min_sample == false and .baseline_models == ["claude-opus-5"] and .candidate_models == ["claude-sonnet-5"]' \
   "$WORK/winner.summary.json" >/dev/null || fail "A3: sidecar fields wrong: $(cat "$WORK/winner.summary.json")"
-ok "A3 sidecar: --summary-out carries winner, axis, verdict, floor flag and both arms' models"
+# cost_verdict travels with the two fields that say whether it is a
+# COMPARISON at all — on a same-vendor run, comparable with a null reason.
+jq -e '.cost_axis_comparable == true and .cost_axis_unavailable_reason == null' \
+  "$WORK/winner.summary.json" >/dev/null \
+  || fail "A3: the sidecar must qualify cost_verdict with the cross-vendor verdict: $(cat "$WORK/winner.summary.json")"
+ok "A3 sidecar: --summary-out carries winner, axis, verdict, floor flag, both arms' models, and the cross-vendor cost-axis verdict"
 
 count
 for f in $(bash "$SUT" schema | sed 's/^[^:]*: //'); do
@@ -372,7 +377,21 @@ grep -q '^| cost per merged outcome (weighted units) |.*| unavailable |' "$WORK/
 if grep -q 'candidate minus baseline' "$WORK/cv-unavailable.md"; then
   fail "G2: the numeric paired-mean delta must be GONE, not merely annotated: $(grep -n 'candidate minus baseline' "$WORK/cv-unavailable.md")"
 fi
-ok "G2 cross-vendor: the delta is replaced by the producer's named reason, in the Decision line and the at-a-glance cell"
+# …and the MACHINE-READABLE sidecar must not hand a consumer the very figure
+# the page just withheld (review round 1 [MEDIUM]): cost_verdict still rides,
+# but now flagged, with the reason beside it.
+render --in "$WORK/cv-unavailable.json" --summary-out "$WORK/cv-unavailable.summary.json"
+jq -e '.cost_axis_comparable == false' "$WORK/cv-unavailable.summary.json" >/dev/null \
+  || fail "G2: the sidecar must flag an incomparable cost axis: $(cat "$WORK/cv-unavailable.summary.json")"
+jq -e '.cost_axis_unavailable_reason | test("FIXTURE-REASON")' "$WORK/cv-unavailable.summary.json" >/dev/null \
+  || fail "G2: the sidecar must carry the producer's reason verbatim"
+jq -e 'has("cost_verdict")' "$WORK/cv-unavailable.summary.json" >/dev/null \
+  || fail "G2: cost_verdict must still be present — this is additive flagging, not a schema removal"
+for f in $(bash "$SUT" schema | sed 's/^[^:]*: //'); do
+  jq -e --arg f "$f" 'has($f)' "$WORK/cv-unavailable.summary.json" >/dev/null \
+    || fail "G2: sidecar lacks field '$f' promised by 'render.sh schema'"
+done
+ok "G2 cross-vendor: the delta is replaced by the producer's named reason, in the Decision line, the at-a-glance cell and the machine-readable sidecar"
 
 count
 # MUTATION PROOF: the ONLY difference between these two renders is the
@@ -388,6 +407,31 @@ grep -q 'candidate minus baseline' "$WORK/cv-flipped.md" \
 grep -q '^| cost per merged outcome (weighted units) |.*(paired mean) |' "$WORK/cv-flipped.md" \
   || fail "G3: the at-a-glance delta cell did not come back"
 ok "G3 MUTATION PROOF: flipping cost_basis.cross_vendor.comparable alone flips the rendering both ways"
+
+count
+# ONE PREDICATE, FAIL-CLOSED, BOTH SITES (review round 1 [LOW]). A
+# `comparable: null` — a shape the producer does not emit, and exactly the
+# shape a future one might — used to render inconsistently: the delta was
+# published (== false was untrue) while the provenance line already read
+# UNAVAILABLE. Both sites now read the same predicate, and anything that is
+# not an explicit `true` withholds.
+jq '.cost_basis.cross_vendor.comparable = null
+    | .cost_basis.cross_vendor.reason = "FIXTURE-NULL: comparability was not established"' \
+   "$WJSON" >"$WORK/cv-null.json"
+render --in "$WORK/cv-null.json" --summary-out "$WORK/cv-null.summary.json"
+cp "$R_OUT" "$WORK/cv-null.md"
+[ "$R_RC" -eq 0 ] || fail "G4: rc $R_RC: $(cat "$R_ERR")"
+grep -q 'Cost (descriptive, decides nothing): UNAVAILABLE for this comparison' "$WORK/cv-null.md" \
+  || fail "G4: a null verdict must withhold the delta, not publish it"
+grep -q '^- Cross-vendor cost axis: UNAVAILABLE — ' "$WORK/cv-null.md" \
+  || fail "G4: the provenance line must agree with the Decision line"
+if grep -q 'candidate minus baseline' "$WORK/cv-null.md"; then
+  fail "G4: the numeric delta leaked onto a page whose comparability was never established"
+fi
+jq -e '.cost_axis_comparable == null and (.cost_axis_unavailable_reason | test("FIXTURE-NULL"))' \
+  "$WORK/cv-null.summary.json" >/dev/null \
+  || fail "G4: the sidecar must carry the same fail-closed reading: $(cat "$WORK/cv-null.summary.json")"
+ok "G4 a comparable:null verdict withholds at BOTH render sites and in the sidecar — one fail-closed predicate, not three readings"
 
 count
 [ ! -e "$CANARY" ] || fail "CANARY FIRED: $(cat "$CANARY")"
