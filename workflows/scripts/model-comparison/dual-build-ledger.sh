@@ -150,6 +150,54 @@
 #   bar_pct/bar_n  DUAL_BUILD_CALIBRATION_BAR_PCT / _BAR_N, read symbolically
 #                  (§ NAMED-SETTING CONVENTION below) — never re-valued here.
 #
+# ── NULL-FLOOR MODE (temperloop#2271, epic #2237; split from #2209) ────────
+# `null-floor-record` / `null-floor-status` are the writer/reader pair for
+# the judge's A/A NOISE FLOOR: the margin distribution the pairwise judge
+# produces when BOTH arms ran the SAME model, so every preference it reports
+# there is noise by construction. The first two A/A instrument checks came
+# back confident and order-stable anyway (margins 17.5 and 17 —
+# temperloop#2209), so a later level's spike runs N >= 10 same-model judged
+# pairs and records the distribution through this writer, and a later item
+# still makes the level-pick and the report READ it through this status
+# subcommand (its two `outcome` literals join build-level.mjs's closed
+# outcome set in THAT item, never here). Writer and reader ship together so
+# a gitignored, untracked file can never carry a schema that exists only in
+# a spike note.
+#
+# THE PINNED PATH: `null-floor.json`, sibling to `rows.jsonl` and
+# `calibration.json` under the ledger dir — exactly the calibration.json
+# rule: no override flag of its own, it moves only when `--dir`/
+# `DUAL_BUILD_LEDGER_DIR` moves the whole ledger. Written atomically
+# (write-then-mv, the `_cal_write_status` idiom); every record call REPLACES
+# the file — it is a single current record, not an append stream. Shape
+# (this header is the ONE place it is authored; claude/presentation-plane.md's
+# row points here rather than restating it):
+#   schema_version         1 — assigned here, never caller-supplied
+#   n                      count of same-model judged pairs (integer >= 1)
+#   judge_model            the model id that judged the pairs
+#   arm_model              the model id BOTH arms ran — one field, because
+#                          an A/A run has only one by definition
+#   margins[]              one number per judged pair, the margin the judge
+#                          reported; at most n entries (a pair whose arm
+#                          failed has no margin — see arm_failure_rate)
+#   order_agreement_rate   0..1 — share of pairs whose preference survived a
+#                          swapped presentation order
+#   arm_failure_rate       0..1 — share of the n pairs that produced no
+#                          judged margin because an arm failed
+#   recorded_at            UTC ISO-8601, assigned here
+#
+# `null-floor-status` prints that file back as ONE JSON line with an in-band
+# `outcome` key prepended: `NULL_FLOOR` when the file exists, parses as a
+# single JSON object, carries every field above, and its `schema_version`
+# is one this reader knows; otherwise `NULL_FLOOR_UNAVAILABLE` with a
+# `reason` and the `path` it looked at. FAIL CLOSED: the unavailable verdict
+# is a named outcome on stdout AND exit status 1 — never an empty `{}` or a
+# silent exit 0 a caller could mistake for "no floor needed". A caller that
+# only checks the exit status sees the failure; a caller that parses stdout
+# sees why (the same JSON-plus-non-zero shape as ci-poll.sh's ERROR line).
+# An unresolvable ledger dir is the caller's error, not a data verdict, so
+# it still refuses through `_require_dir` like every other subcommand.
+#
 # ── EXPECTED-COUNT CHECK (temperloop#2072 acceptance) ───────────────────────
 # `read` always self-checks: every seq in 1..max(seq) must appear exactly
 # once, and every line must parse. A caller that additionally knows how many
@@ -196,6 +244,16 @@
 #       This store feeds NO derived state — see § JUDGE-REPEAT CORPUS.
 #   dual-build-ledger.sh repeat-read [--dir DIR] [--slug S]
 #       Prints the judge-repeat rows as one JSON array, optionally for one slug.
+#   dual-build-ledger.sh null-floor-record --n N --judge-model ID --arm-model ID
+#       --margins CSV --order-agreement-rate R --arm-failure-rate R [--dir DIR]
+#       Writes the pinned null-floor.json (atomically, replacing any prior
+#       record) and prints it. See § NULL-FLOOR MODE above for the shape.
+#   dual-build-ledger.sh null-floor-status [--dir DIR]
+#       Prints null-floor.json as one JSON line with `outcome: NULL_FLOOR`,
+#       or `outcome: NULL_FLOOR_UNAVAILABLE` + `reason` and exit 1 when it
+#       is absent, unparseable, missing a schema field, or of a
+#       `schema_version` this reader does not know (fail closed — see
+#       § NULL-FLOOR MODE above).
 #
 # `--dir` (or env `DUAL_BUILD_LEDGER_DIR`) overrides the ledger root; default
 # is `<invoking-repo-root>/.temperloop/model-comparison/dual-build`, where
@@ -222,7 +280,7 @@
 #   able to fork the kernel's own settings by editing a vendored copy.
 #
 #   DATA (LEDGER_DIR — rows.jsonl, archives/, calibration-pairs.jsonl,
-#   calibration.json, and archive-check's default `--repo`) resolves from
+#   calibration.json, null-floor.json, and archive-check's default `--repo`) resolves from
 #   `git rev-parse --show-toplevel` of the CWD, i.e. the repo actually being
 #   built/reported on. report.contract.md:65 fixes that invariant for the
 #   read side ("invoked with no arguments, cwd = the target repo"), and the
@@ -282,6 +340,11 @@ CALIBRATION_STATUS_FILE_NAME="calibration.json"
 # `.append.lock`, own file, own seq space, and NOTHING derived from it is read
 # back into calibration.json.
 REPEAT_FILE_NAME="judge-repeat.jsonl"
+# § NULL-FLOOR MODE above owns both of these — the PINNED null-floor.json
+# path and its own schema version (independent of the rows schema's
+# SCHEMA_VERSION so the two can move separately).
+NULL_FLOOR_FILE_NAME="null-floor.json"
+NULL_FLOOR_SCHEMA_VERSION=1
 
 die() { echo "dual-build-ledger.sh: $1" >&2; exit 1; }
 
@@ -1046,6 +1109,160 @@ cmd_calibrate_status() {
   _cal_write_status "$dir"
 }
 
+# ── NULL-FLOOR MODE helpers (temperloop#2271) — see § NULL-FLOOR MODE ───────
+
+# _nf_is_number <str> — true iff <str> is exactly one JSON number literal.
+# jq's own parser is the judge (so "17", "17.5", "-0.25", "1e3" pass; "",
+# "abc", "1,2" and a bare "nan" all fail) — the same parser that will later
+# read the value back, so what passes here is exactly what round-trips.
+#
+# Slurped (`-s`) and required to be EXACTLY one value: a bare `jq -e` on a
+# multi-value input ("1 2") reports only the LAST value, so it would pass
+# here and then fail later at `--argjson` with jq's own stderr instead of
+# this script's named refusal (review finding, temperloop#2271).
+_nf_is_number() {
+  jq -es 'length == 1 and (.[0] | type == "number" and isnan == false)' >/dev/null 2>&1 <<<"$1"
+}
+
+# _nf_is_rate <str> — exactly one JSON number in the closed interval 0..1.
+_nf_is_rate() {
+  jq -es 'length == 1 and (.[0] | type == "number" and isnan == false and . >= 0 and . <= 1)' >/dev/null 2>&1 <<<"$1"
+}
+
+# _nf_unavailable <path> <reason> — the ONE place the fail-closed verdict is
+# emitted: a single JSON line on stdout, exit status 1. Never returns.
+_nf_unavailable() {
+  jq -cn --arg path "$1" --arg reason "$2" \
+    '{outcome:"NULL_FLOOR_UNAVAILABLE", reason:$reason, path:$path}'
+  exit 1
+}
+
+cmd_null_floor_record() {
+  local dir="$LEDGER_DIR" n="" judge_model="" arm_model="" margins="" oar="" afr=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) [ $# -ge 2 ] || die "null-floor-record: --dir requires a path"; dir="$2"; shift 2 ;;
+      --n) [ $# -ge 2 ] || die "null-floor-record: --n requires a number"; n="$2"; shift 2 ;;
+      --judge-model) [ $# -ge 2 ] || die "null-floor-record: --judge-model requires a model id"; judge_model="$2"; shift 2 ;;
+      --arm-model) [ $# -ge 2 ] || die "null-floor-record: --arm-model requires a model id"; arm_model="$2"; shift 2 ;;
+      --margins) [ $# -ge 2 ] || die "null-floor-record: --margins requires a comma-separated list"; margins="$2"; shift 2 ;;
+      --order-agreement-rate) [ $# -ge 2 ] || die "null-floor-record: --order-agreement-rate requires a rate"; oar="$2"; shift 2 ;;
+      --arm-failure-rate) [ $# -ge 2 ] || die "null-floor-record: --arm-failure-rate requires a rate"; afr="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "null-floor-record: unknown argument $1" ;;
+    esac
+  done
+  # Required-argument guards outrank the ledger-dir refusal (same ordering
+  # rule as every sibling: a malformed call reports what the caller got
+  # wrong, not the environment).
+  [ -n "$n" ] || die "null-floor-record: --n is required"
+  [ -n "$judge_model" ] || die "null-floor-record: --judge-model is required"
+  [ -n "$arm_model" ] || die "null-floor-record: --arm-model is required"
+  [ -n "$margins" ] || die "null-floor-record: --margins is required"
+  [ -n "$oar" ] || die "null-floor-record: --order-agreement-rate is required"
+  [ -n "$afr" ] || die "null-floor-record: --arm-failure-rate is required"
+  _require_dir null-floor-record "$dir"
+
+  case "$n" in
+    ''|*[!0-9]*) die "null-floor-record: --n must be a positive integer (got '$n')" ;;
+  esac
+  # Width cap BEFORE the arithmetic: the digit-only guard above admits any
+  # length, and `$((10#$n))` silently wraps on an input past 2^63.
+  [ "${#n}" -le 9 ] || die "null-floor-record: --n is implausibly large (got '$n')"
+  # `10#` forces base-10 — same leading-zero footgun cmd_prune documents.
+  [ "$((10#$n))" -ge 1 ] || die "null-floor-record: --n must be at least 1 (got '$n')"
+  n=$((10#$n))
+  _nf_is_rate "$oar" || die "null-floor-record: --order-agreement-rate must be a number in 0..1 (got '$oar')"
+  _nf_is_rate "$afr" || die "null-floor-record: --arm-failure-rate must be a number in 0..1 (got '$afr')"
+
+  # One margin per comma; every entry must be a number and none may be
+  # empty, so "17,,18", ",17" AND a trailing "17,18," are all refused, not
+  # silently dropped. The loop is fed by a herestring over a parameter
+  # substitution (`${margins//,/$'\n'}`) rather than a `$(… | tr)` heredoc:
+  # command substitution strips trailing newlines, which turned the empty
+  # last field of "17,18," into nothing for `read` to see (review finding,
+  # temperloop#2271). An embedded newline is refused up front for the same
+  # reason — it would read as a field boundary the caller never typed.
+  # Accumulated through jq so the stored values are jq-canonical — exactly
+  # what null-floor-status will re-emit.
+  case "$margins" in
+    *$'\n'*) die "null-floor-record: --margins must be a single comma-separated line (got an embedded newline)" ;;
+  esac
+  local margins_json="[]" m count=0
+  while IFS= read -r m; do
+    _nf_is_number "$m" || die "null-floor-record: --margins entry '$m' is not a number (expected a comma-separated list of numbers, got '$margins')"
+    margins_json="$(jq -c --argjson m "$m" '. + [$m]' <<<"$margins_json")" \
+      || die "null-floor-record: could not build margins array"
+    count=$((count + 1))
+  done <<<"${margins//,/$'\n'}"
+  [ "$count" -ge 1 ] || die "null-floor-record: --margins must carry at least one margin"
+  [ "$count" -le "$n" ] \
+    || die "null-floor-record: --margins carries $count entries but --n is $n — a run cannot judge more pairs than it ran"
+
+  mkdir -p "$dir" || die "null-floor-record: cannot create ledger dir $dir"
+  local recorded_at out tmp
+  recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  out="$(jq -cn --argjson schema_version "$NULL_FLOOR_SCHEMA_VERSION" --argjson n "$n" \
+    --arg judge_model "$judge_model" --arg arm_model "$arm_model" \
+    --argjson margins "$margins_json" --argjson oar "$oar" --argjson afr "$afr" \
+    --arg recorded_at "$recorded_at" '
+    {
+      schema_version: $schema_version,
+      n: $n,
+      judge_model: $judge_model,
+      arm_model: $arm_model,
+      margins: $margins,
+      order_agreement_rate: $oar,
+      arm_failure_rate: $afr,
+      recorded_at: $recorded_at
+    }')" || die "null-floor-record: could not build record"
+  tmp="$dir/.${NULL_FLOOR_FILE_NAME}.tmp.$$"
+  # Explicit if/then, not `A && B || C` (SC2015) — same shape as
+  # _cal_write_status's write-then-mv.
+  if printf '%s\n' "$out" >"$tmp" && mv "$tmp" "$dir/$NULL_FLOOR_FILE_NAME"; then
+    :
+  else
+    rm -f "$tmp"
+    die "null-floor-record: failed writing $dir/$NULL_FLOOR_FILE_NAME"
+  fi
+  printf '%s\n' "$out"
+}
+
+cmd_null_floor_status() {
+  local dir="$LEDGER_DIR"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) [ $# -ge 2 ] || die "null-floor-status: --dir requires a path"; dir="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "null-floor-status: unknown argument $1" ;;
+    esac
+  done
+  _require_dir null-floor-status "$dir"
+  local f="$dir/$NULL_FLOOR_FILE_NAME"
+
+  [ -f "$f" ] || _nf_unavailable "$f" "no null-floor record at $f — nothing recorded yet (run null-floor-record)"
+  # `-s` slurps the WHOLE file into one array, so a truncated trailing
+  # object (crash mid-write of a non-atomic copy) or trailing garbage fails
+  # the parse outright instead of yielding the first object and ignoring
+  # the rest.
+  local docs
+  docs="$(jq -cs '.' "$f" 2>/dev/null)" || _nf_unavailable "$f" "$f is not valid JSON (truncated or corrupt)"
+  local ndocs
+  ndocs="$(jq 'length' <<<"$docs")"
+  [ "$ndocs" = "1" ] || _nf_unavailable "$f" "$f must hold exactly one JSON object, found $ndocs values"
+  local doc
+  doc="$(jq -c '.[0]' <<<"$docs")"
+  [ "$(jq -r 'type' <<<"$doc")" = "object" ] || _nf_unavailable "$f" "$f holds a JSON $(jq -r 'type' <<<"$doc"), not an object"
+  local missing
+  missing="$(jq -r '["schema_version","n","judge_model","arm_model","margins","order_agreement_rate","arm_failure_rate","recorded_at"] - keys | join(",")' <<<"$doc")"
+  [ -z "$missing" ] || _nf_unavailable "$f" "$f is missing schema field(s): $missing"
+  local sv
+  sv="$(jq -c '.schema_version' <<<"$doc")"
+  [ "$sv" = "$NULL_FLOOR_SCHEMA_VERSION" ] \
+    || _nf_unavailable "$f" "$f carries schema_version $sv; this reader knows schema_version $NULL_FLOOR_SCHEMA_VERSION"
+  jq -c '{outcome:"NULL_FLOOR"} + .' <<<"$doc"
+}
+
 cmd_purge() {
   local dir="$LEDGER_DIR" apply=0
   while [ $# -gt 0 ]; do
@@ -1135,6 +1352,8 @@ case "$cmd" in
   repeat-append) cmd_repeat_append "$@" ;;
   repeat-read) cmd_repeat_read "$@" ;;
   calibrate-status) cmd_calibrate_status "$@" ;;
+  null-floor-record) cmd_null_floor_record "$@" ;;
+  null-floor-status) cmd_null_floor_status "$@" ;;
   -h|--help) usage; exit 0 ;;
   "") usage >&2; exit 1 ;;
   *) echo "dual-build-ledger.sh: unknown subcommand '$cmd'" >&2; usage >&2; exit 1 ;;

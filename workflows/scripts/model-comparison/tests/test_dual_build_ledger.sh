@@ -49,6 +49,14 @@
 #         instead of test-applying against whatever checkout the script
 #         happens to ship in — and an explicit --repo, or a cwd that IS in a
 #         checkout, satisfies it (both states)
+#   32-35 null-floor-record / null-floor-status (temperloop#2271): the A/A
+#         noise-floor writer/reader pair — pinned sibling path with no flag
+#         of its own, atomic replace, every input refusal writes nothing;
+#         record → status round-trips byte-for-byte behind an `outcome`
+#         key; absent/truncated/malformed files ALL fail closed
+#         (NULL_FLOOR_UNAVAILABLE + reason on stdout AND exit non-zero);
+#         rows.jsonl / calibrate-status / read are byte-identical across
+#         the pair (inertness)
 #
 # Usage: bash workflows/scripts/model-comparison/tests/test_dual_build_ledger.sh
 set -uo pipefail
@@ -463,6 +471,159 @@ out="$(cd "$WORK" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" archive-check 2>&1
 [ "$rc" -ne 0 ] && [[ "$out" == *"usage: archive-check"* ]] \
   || fail "31c: a no-argument archive-check must report the usage error first (got rc=$rc: $out)"
 ok "31 archive-check refuses by name when --repo cannot be resolved, is satisfied by an explicit --repo or an in-checkout cwd, and still reports usage errors first"
+
+# ── 32-35. null-floor-record / null-floor-status (temperloop#2271) ─────────
+# The A/A noise-floor writer/reader pair (§ NULL-FLOOR MODE in the SUT's
+# header). § 32 the writer: the pinned sibling path under --dir AND under
+# DUAL_BUILD_LEDGER_DIR (no path flag of its own), atomic (no tmp file left
+# behind), every schema field present in the documented order, a second
+# record REPLACES the first, and EVERY input refusal is a negative case
+# that also writes nothing. § 33 round-trip: the status line is the record
+# line byte-for-byte behind a prepended `outcome` key — a pure string
+# compare, no jq re-serialization on the comparing side. § 34 fail-closed:
+# absent, truncated, empty, non-object, doubled, field-missing and
+# unknown-schema files ALL report NULL_FLOOR_UNAVAILABLE with a reason on
+# stdout AND exit non-zero (both channels), while the good file still
+# reports NULL_FLOOR (both states). § 35 inertness: rows.jsonl and
+# calibrate-status are byte-identical across a record+status pair.
+count
+DNF="$WORK/d-nullfloor"
+sut append --dir "$DNF" --row "$(row nf baseline)" >/dev/null || fail "32: seed append failed"
+rec="$(sut null-floor-record --dir "$DNF" --n 10 --judge-model judge-x --arm-model arm-y \
+  --margins "17.5,17,12.25,0,3" --order-agreement-rate 0.8 --arm-failure-rate 0.5)" \
+  || fail "32: null-floor-record failed"
+[ -f "$DNF/null-floor.json" ] || fail "32a: null-floor.json was not written sibling to rows.jsonl under --dir"
+printf '%s\n' "$rec" | cmp -s - "$DNF/null-floor.json" \
+  || fail "32b: the printed record and the file bytes differ"
+[ -z "$(find "$DNF" -name '.null-floor.json.tmp.*' -print)" ] \
+  || fail "32c: a write-then-mv temp file was left behind"
+[ "$(jq -r 'keys_unsorted | join(",")' <<<"$rec")" = "schema_version,n,judge_model,arm_model,margins,order_agreement_rate,arm_failure_rate,recorded_at" ] \
+  || fail "32d: schema fields/order differ from the header's documented shape (got $(jq -r 'keys_unsorted | join(",")' <<<"$rec"))"
+jq -e '.schema_version == 1 and .n == 10 and .judge_model == "judge-x" and .arm_model == "arm-y"
+  and .margins == [17.5,17,12.25,0,3] and .order_agreement_rate == 0.8 and .arm_failure_rate == 0.5
+  and (.recorded_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' >/dev/null <<<"$rec" \
+  || fail "32e: a schema field carries the wrong value: $rec"
+# The env seam moves it too — and there is no flag of its own to move it
+# elsewhere (an unknown flag is a usage error, same as every sibling).
+DNFE="$WORK/d-nullfloor-env"
+DUAL_BUILD_LEDGER_DIR="$DNFE" sut null-floor-record --n 1 --judge-model j --arm-model a \
+  --margins 4 --order-agreement-rate 1 --arm-failure-rate 0 >/dev/null \
+  || fail "32f: null-floor-record via DUAL_BUILD_LEDGER_DIR failed"
+[ -f "$DNFE/null-floor.json" ] || fail "32f: DUAL_BUILD_LEDGER_DIR did not relocate null-floor.json with the ledger"
+out="$(sut null-floor-record --dir "$DNF" --n 1 --judge-model j --arm-model a --margins 4 \
+  --order-agreement-rate 1 --arm-failure-rate 0 --null-floor-path "$WORK/elsewhere.json" 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [[ "$out" == *"unknown argument --null-floor-path"* ]] \
+  || fail "32g: a path override of its own must be refused as an unknown argument (got rc=$rc: $out)"
+# A second record REPLACES the first (single current record, not a stream).
+rec2="$(sut null-floor-record --dir "$DNF" --n 12 --judge-model judge-x --arm-model arm-y \
+  --margins "1,2" --order-agreement-rate 0.5 --arm-failure-rate 0)" || fail "32h: second record failed"
+printf '%s\n' "$rec2" | cmp -s - "$DNF/null-floor.json" || fail "32h: the second record did not replace the file"
+[ "$(wc -l <"$DNF/null-floor.json" | tr -d ' ')" = "1" ] || fail "32h: null-floor.json grew past one line"
+# Every refusal, each on a FRESH dir so "writes nothing" is provable.
+nf_refuses() {  # <label> <expected-stderr-substring> <args...>
+  local label="$1" want="$2"; shift 2
+  local d="$WORK/d-nf-refuse-$label" o r
+  o="$(sut null-floor-record --dir "$d" "$@" 2>&1)"; r=$?
+  [ "$r" -ne 0 ] || fail "32i-$label: must refuse (exit 0): $o"
+  [[ "$o" == *"$want"* ]] || fail "32i-$label: refusal must name '$want' (got: $o)"
+  [ ! -e "$d/null-floor.json" ] || fail "32i-$label: a refused record still wrote null-floor.json"
+}
+GOOD=(--n 5 --judge-model j --arm-model a --margins "1,2,3" --order-agreement-rate 1 --arm-failure-rate 0)
+nf_refuses missing-n "--n is required" --judge-model j --arm-model a --margins 1 --order-agreement-rate 1 --arm-failure-rate 0
+nf_refuses missing-judge "--judge-model is required" --n 1 --arm-model a --margins 1 --order-agreement-rate 1 --arm-failure-rate 0
+nf_refuses missing-arm "--arm-model is required" --n 1 --judge-model j --margins 1 --order-agreement-rate 1 --arm-failure-rate 0
+nf_refuses missing-margins "--margins is required" --n 1 --judge-model j --arm-model a --order-agreement-rate 1 --arm-failure-rate 0
+nf_refuses missing-oar "--order-agreement-rate is required" --n 1 --judge-model j --arm-model a --margins 1 --arm-failure-rate 0
+nf_refuses missing-afr "--arm-failure-rate is required" --n 1 --judge-model j --arm-model a --margins 1 --order-agreement-rate 1
+nf_refuses n-zero "--n must be at least 1" "${GOOD[@]}" --n 0
+nf_refuses n-alpha "--n must be a positive integer" "${GOOD[@]}" --n abc
+nf_refuses n-lt-margins "carries 3 entries but --n is 2" "${GOOD[@]}" --n 2
+nf_refuses margin-alpha "--margins entry 'abc' is not a number" "${GOOD[@]}" --margins 17,abc
+nf_refuses margin-empty "--margins entry '' is not a number" "${GOOD[@]}" --margins 17,,18
+nf_refuses margin-trailing-comma "--margins entry '' is not a number" "${GOOD[@]}" --margins 17,18,
+nf_refuses margin-leading-comma "--margins entry '' is not a number" "${GOOD[@]}" --margins ,17,18
+nf_refuses margin-newline "must be a single comma-separated line" "${GOOD[@]}" --margins "$(printf '17\n18')"
+nf_refuses margin-two-values "--margins entry '1 2' is not a number" "${GOOD[@]}" --margins "1 2,3"
+nf_refuses n-huge "--n is implausibly large" "${GOOD[@]}" --n 99999999999999999999
+nf_refuses afr-two-values "--arm-failure-rate must be a number in 0..1" "${GOOD[@]}" --arm-failure-rate "0 1"
+nf_refuses oar-high "--order-agreement-rate must be a number in 0..1" "${GOOD[@]}" --order-agreement-rate 1.5
+nf_refuses afr-neg "--arm-failure-rate must be a number in 0..1" "${GOOD[@]}" --arm-failure-rate -0.1
+nf_refuses afr-alpha "--arm-failure-rate must be a number in 0..1" "${GOOD[@]}" --arm-failure-rate abc
+# And the usage header lists both subcommands (discoverability).
+sut --help | grep 'null-floor-record' >/dev/null || fail "32j: --help does not list null-floor-record"
+sut --help | grep 'null-floor-status' >/dev/null || fail "32j: --help does not list null-floor-status"
+ok "32 null-floor-record writes the pinned sibling null-floor.json atomically under --dir/DUAL_BUILD_LEDGER_DIR (no flag of its own), in the documented shape, replacing a prior record, and refuses every malformed input without writing"
+
+count
+st="$(sut null-floor-status --dir "$DNF")"; rc=$?
+[ "$rc" -eq 0 ] || fail "33: null-floor-status on a good file must exit 0 (got $rc: $st)"
+[ "$(printf '%s\n' "$st" | wc -l | tr -d ' ')" = "1" ] || fail "33: status must print exactly one line"
+# Byte-for-byte: the status line IS the record line with `{"outcome":"NULL_FLOOR",`
+# spliced in for the record's opening brace — a plain string compare.
+[ "$st" = '{"outcome":"NULL_FLOOR",'"${rec2#\{}" ] \
+  || fail "33a: status is not the record byte-for-byte behind the outcome key:
+  record: $rec2
+  status: $st"
+[ "$(jq -r .outcome <<<"$st")" = "NULL_FLOOR" ] || fail "33b: outcome must be NULL_FLOOR"
+ok "33 null-floor-status round-trips the record byte-for-byte as one JSON line with outcome NULL_FLOOR"
+
+count
+nf_unavailable() {  # <label> <dir> <expected-reason-substring>
+  local label="$1" d="$2" want="$3" o r
+  o="$(sut null-floor-status --dir "$d" 2>/dev/null)"; r=$?
+  [ "$r" -ne 0 ] || fail "34-$label: must exit non-zero (fail closed), got exit 0: $o"
+  [ -n "$o" ] || fail "34-$label: stdout is empty — an empty failure is as unparseable as an empty success"
+  [ "$(printf '%s\n' "$o" | wc -l | tr -d ' ')" = "1" ] || fail "34-$label: must print exactly one line (got: $o)"
+  [ "$(jq -r .outcome <<<"$o")" = "NULL_FLOOR_UNAVAILABLE" ] || fail "34-$label: outcome must be NULL_FLOOR_UNAVAILABLE (got: $o)"
+  [[ "$(jq -r .reason <<<"$o")" == *"$want"* ]] || fail "34-$label: reason must name '$want' (got: $o)"
+  [ "$(jq -r .path <<<"$o")" = "$d/null-floor.json" ] || fail "34-$label: path must name the file looked at (got: $o)"
+}
+DNU="$WORK/d-nf-unavail"
+nf_unavailable absent "$DNU" "nothing recorded yet"
+mkdir -p "$DNU"
+head -c 40 "$DNF/null-floor.json" >"$DNU/null-floor.json"
+nf_unavailable truncated "$DNU" "not valid JSON"
+: >"$DNU/null-floor.json"
+nf_unavailable empty "$DNU" "exactly one JSON object, found 0"
+printf '[1,2]\n' >"$DNU/null-floor.json"
+nf_unavailable array "$DNU" "not an object"
+cat "$DNF/null-floor.json" "$DNF/null-floor.json" >"$DNU/null-floor.json"
+nf_unavailable doubled "$DNU" "exactly one JSON object, found 2"
+jq -c 'del(.margins) | del(.arm_model)' "$DNF/null-floor.json" >"$DNU/null-floor.json"
+nf_unavailable missing-fields "$DNU" "missing schema field(s): arm_model,margins"
+jq -c '.schema_version = 2' "$DNF/null-floor.json" >"$DNU/null-floor.json"
+nf_unavailable unknown-schema "$DNU" "carries schema_version 2"
+# Both states: the good file, copied verbatim, is NULL_FLOOR again.
+cp "$DNF/null-floor.json" "$DNU/null-floor.json"
+[ "$(sut null-floor-status --dir "$DNU" | jq -r .outcome)" = "NULL_FLOOR" ] \
+  || fail "34-restored: the good file copied back must report NULL_FLOOR"
+# The unresolvable-dir case is a caller error, refused by name like every
+# sibling — not silently a NULL_FLOOR_UNAVAILABLE verdict about the data.
+out="$(cd "$WORK" && env -u DUAL_BUILD_LEDGER_DIR bash "$SUT" null-floor-status 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [[ "$out" == *"no ledger dir"* ]] \
+  || fail "34-nodir: an unresolvable ledger dir must refuse by name (got rc=$rc: $out)"
+ok "34 null-floor-status fails closed — absent, truncated, empty, non-object, doubled, field-missing and unknown-schema files all print NULL_FLOOR_UNAVAILABLE with a reason AND exit non-zero; the good file is NULL_FLOOR"
+
+count
+# Inertness: the pair touches nothing else. Snapshot rows.jsonl and the
+# calibrate-status line, run record+status, compare bytes.
+DIN="$WORK/d-nf-inert"
+sut append --dir "$DIN" --row "$(row inert baseline)" >/dev/null || fail "35: seed append failed"
+sut append --dir "$DIN" --row "$(row inert candidate)" >/dev/null || fail "35: seed append failed"
+cp "$DIN/rows.jsonl" "$WORK/rows-before.jsonl"
+cal_before="$(DUAL_BUILD_CALIBRATION_BAR_PCT=70 DUAL_BUILD_CALIBRATION_BAR_N=20 sut calibrate-status --dir "$DIN")" \
+  || fail "35: calibrate-status (before) failed"
+cp "$DIN/calibration.json" "$WORK/calibration-before.json"
+sut null-floor-record --dir "$DIN" --n 3 --judge-model j --arm-model a --margins 1,2,3 \
+  --order-agreement-rate 1 --arm-failure-rate 0 >/dev/null || fail "35: null-floor-record failed"
+sut null-floor-status --dir "$DIN" >/dev/null || fail "35: null-floor-status failed"
+cmp -s "$DIN/rows.jsonl" "$WORK/rows-before.jsonl" || fail "35a: rows.jsonl changed across null-floor-record/status"
+cmp -s "$DIN/calibration.json" "$WORK/calibration-before.json" || fail "35b: calibration.json changed across null-floor-record/status"
+cal_after="$(DUAL_BUILD_CALIBRATION_BAR_PCT=70 DUAL_BUILD_CALIBRATION_BAR_N=20 sut calibrate-status --dir "$DIN")" \
+  || fail "35: calibrate-status (after) failed"
+[ "$cal_before" = "$cal_after" ] || fail "35c: calibrate-status output changed: before=$cal_before after=$cal_after"
+sut read --dir "$DIN" --expect 2 >/dev/null || fail "35d: read --expect 2 no longer passes over the same ledger"
+ok "35 the null-floor pair is inert — rows.jsonl, calibration.json, calibrate-status and read are byte-identical across a record+status call"
 
 printf '\ntest_dual_build_ledger.sh: %d/%d checks passed\n' "$pass" "$total"
 [ "$pass" -eq "$total" ] || exit 1

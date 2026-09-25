@@ -571,8 +571,8 @@ until `dual-build purge`/`prune` reclaims it.
 ways, on purpose. Its **settings** (`build.config.sh`) climb from the
 script's own on-disk location, so they always come from the kernel checkout
 and an adopter cannot fork them (the temperloop#980 boundary). Its **data** —
-`rows.jsonl`, `archives/`, `calibration-pairs.jsonl`, `calibration.json`, and
-`archive-check`'s default `--repo` — resolves from `git rev-parse
+`rows.jsonl`, `archives/`, `calibration-pairs.jsonl`, `calibration.json`,
+`null-floor.json`, and `archive-check`'s default `--repo` — resolves from `git rev-parse
 --show-toplevel` of the **cwd**, i.e. the repo actually being built, matching
 `report.contract.md`'s "invoked with cwd = the target repo" invariant that the
 read-side producer already followed. Until #2119 the data followed the
