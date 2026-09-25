@@ -55,6 +55,15 @@
 #      names the one pid it killed, and sends the operator to `ps` — while the
 #      normal path still makes the strong claim, so the case cannot be passed by
 #      deleting the sentence.
+#  13  STDIN HELD OPEN (temperloop#2245): with stdin a never-closing source —
+#      the incident's shape, a `cat` blocked 11h on a socket — (a) the suite's
+#      own `exec </dev/null` makes a stdin-reading child read EOF (the same
+#      probe blocks to the bound with that line removed, so the held-open
+#      source is real); (b) the REAL suite, invoked DIRECTLY outside this
+#      wrapper, terminates green; (c) that direct invocation is SELF-BOUND — a
+#      2s bound kills it through this wrapper's report under its own label —
+#      and the wrapped make/gates path never wraps twice (a mutant wrapper
+#      that stops exporting WF_TEST_SELF_BOUND=1 provably does).
 
 set -uo pipefail
 
@@ -720,6 +729,141 @@ t1="$(date +%s)"
 [ "$rc" -eq 137 ] || fail "12b: the bound must still fire with exit 137 under the new cadence, got $rc"
 [ $((t1 - t0)) -lt 15 ] || fail "12b: a 2s bound took $((t1 - t0))s to fire — the cadence changed the bound"
 pass "12b the bound is still wall-clock, not poll-count: a 2s bound over a 30s hang fires in $((t1 - t0))s with exit 137"
+
+# ---------------------------------------------------------------------------
+# 13: STDIN HELD OPEN — the suite terminates, and a DIRECT run is self-bound
+#     (temperloop#2245)
+# ---------------------------------------------------------------------------
+# The incident: test_workflow.sh, run DIRECTLY (outside this wrapper) by an
+# unattended mutation-test run, hit a `cat` that inherited the suite's stdin —
+# a socket that never reaches EOF — and blocked for 11 hours with no verdict.
+# The `cat` itself was an unescaped backtick in a test body (fixed at source,
+# with the suite's own #2245 guard refusing the shape). What THIS case pins is
+# the two layers that make the CLASS unreachable, each with its own arm:
+#   (a) the suite redirects its OWN stdin from /dev/null, so any child that
+#       falls back to stdin reads EOF instead of waiting on the caller's socket;
+#   (b) a direct invocation re-execs itself under this wrapper — behind the
+#       WF_TEST_SELF_BOUND=1 the wrapper exports, so make/gates never wrap
+#       twice — so a hang (a) does not reach is still bounded and named.
+#
+# The never-closing source is a FIFO whose writer is a `sleep` that never
+# writes: a reader on it blocks exactly like the incident's socket. It is
+# deliberately NOT a background shell — the hang was intermittent under those
+# (the same mode completed both before and after the incident), and a
+# reproduction that only sometimes reproduces proves nothing either way.
+HELD="$TMPD/stdin-held-open.fifo"
+mkfifo "$HELD" || fail "13: could not create the FIFO that holds stdin open"
+sleep 600 > "$HELD" &
+STRAY_PIDS+=("$!")
+
+# ARM (a) — the redirect, on the REAL preamble. The fixture is the suite's own
+# text up to and including its `exec </dev/null`, followed by a probe that
+# reads stdin. WF_TEST_SELF_BOUND=1 skips the self-bound re-exec so only the
+# redirect is under test; the outer wrapper is there so a regression fails at
+# a bound instead of hanging this suite. The RED control is the same fixture
+# with that one line dropped: it MUST block until the bound, or the held-open
+# source is not actually holding anything and the green arm is vacuous.
+exec_line="$(grep -n '^exec </dev/null$' "$WORKFLOW_SUITE" | head -1 | cut -d: -f1)"
+[ -n "$exec_line" ] \
+  || fail "13a: test_workflow.sh no longer redirects its OWN stdin from /dev/null (no column-0 'exec </dev/null' line) — a future child that falls back to stdin can re-arm the #2245 hang"
+{ head -n "$exec_line" "$WORKFLOW_SUITE"; printf '%s\n' 'cat' 'echo "PROBE-DONE"'; } > "$TMPD/stdin-probe.sh"
+{ head -n "$((exec_line - 1))" "$WORKFLOW_SUITE"; printf '%s\n' 'cat' 'echo "PROBE-DONE"'; } > "$TMPD/stdin-probe-unfixed.sh"
+
+rc=0
+t0=$SECONDS
+WF_TEST_SELF_BOUND=1 BUILD_SUITE_TIMEOUT_SECS=20 bash "$GUARD" --label stdin-probe -- \
+  bash "$TMPD/stdin-probe.sh" < "$HELD" >"$TMPD/o13a" 2>"$TMPD/e13a" || rc=$?
+a_elapsed=$((SECONDS - t0))
+[ "$rc" -eq 0 ] \
+  || fail "13a GREEN: with the suite's own stdin redirected, a stdin-reading child must read EOF at once and exit 0; got $rc after ${a_elapsed}s (stderr: $(tail -3 "$TMPD/e13a"))"
+grep -q 'PROBE-DONE' "$TMPD/o13a" \
+  || fail "13a GREEN: the probe never reached the line after its stdin read"
+
+mrc=0
+t0=$SECONDS
+WF_TEST_SELF_BOUND=1 BUILD_SUITE_TIMEOUT_SECS=3 bash "$GUARD" --label stdin-probe-unfixed -- \
+  bash "$TMPD/stdin-probe-unfixed.sh" < "$HELD" >"$TMPD/o13a-red" 2>"$TMPD/e13a-red" || mrc=$?
+a_red_elapsed=$((SECONDS - t0))
+[ "$mrc" -eq 137 ] \
+  || fail "13a RED: with the 'exec </dev/null' line removed the identical probe should block on the held-open stdin until the 3s bound (137), got $mrc after ${a_red_elapsed}s — either the FIFO is not holding stdin open (this arm's harness is inert) or something other than the redirect closes it"
+grep -q 'PROBE-DONE' "$TMPD/o13a-red" \
+  && fail "13a RED: the unfixed probe got PAST its stdin read, so the held-open source delivered EOF and the green arm above proves nothing"
+pass "13a the suite redirects its own stdin from /dev/null: a child that falls back to stdin reads EOF (exit 0 in ${a_elapsed}s); with that one line dropped the same child blocks on the held-open source until the bound (137 in ${a_red_elapsed}s)"
+
+# ARM (b) — the REAL suite, invoked DIRECTLY (not through this wrapper: the
+# incident's own mode), with stdin the never-closing source. It must run to a
+# green verdict. `env -u` strips the WF_TEST_SELF_BOUND=1 and
+# SUITE_PROGRESS_FILE this suite inherits when it is itself wrapped, so the
+# direct path is genuinely the one exercised. The bound is generous: this arm
+# measures termination, and the suite's own runtime is ~1 min unloaded.
+mkdir -p "$TMPD/direct"
+rc=0
+t0=$SECONDS
+env -u WF_TEST_SELF_BOUND -u SUITE_PROGRESS_FILE TMPDIR="$TMPD/direct" BUILD_SUITE_TIMEOUT_SECS=900 \
+  bash "$WORKFLOW_SUITE" < "$HELD" >"$TMPD/o13b" 2>"$TMPD/e13b" || rc=$?
+b_elapsed=$((SECONDS - t0))
+[ "$rc" -eq 0 ] \
+  || fail "13b: test_workflow.sh run DIRECTLY with stdin held open must terminate GREEN; exit $rc after ${b_elapsed}s (stderr tail: $(tail -5 "$TMPD/e13b"))"
+grep -q '^All test_workflow.sh cases passed' "$TMPD/o13b" \
+  || fail "13b: the direct run exited 0 without the suite's own closing verdict line — it did not run to the end"
+pass "13b the real test_workflow.sh, invoked directly with stdin held open by a never-closing FIFO, runs to its green verdict in ${b_elapsed}s"
+
+# ARM (c) — the direct invocation is SELF-BOUND. A 2s bound must kill the
+# ~1 min suite through this wrapper's own report, under the direct-run label:
+# without the re-exec, BUILD_SUITE_TIMEOUT_SECS means nothing to a bare bash
+# and the suite runs to completion with exit 0.
+mkdir -p "$TMPD/direct-bound"
+rc=0
+t0=$SECONDS
+env -u WF_TEST_SELF_BOUND -u SUITE_PROGRESS_FILE TMPDIR="$TMPD/direct-bound" BUILD_SUITE_TIMEOUT_SECS=2 \
+  bash "$WORKFLOW_SUITE" </dev/null >"$TMPD/o13c" 2>"$TMPD/e13c" || rc=$?
+c_elapsed=$((SECONDS - t0))
+[ "$rc" -eq 137 ] \
+  || fail "13c: a DIRECT invocation must re-exec under the wrapper and honor the bound — expected 137 from a 2s bound, got $rc after ${c_elapsed}s (a bare bash ignores BUILD_SUITE_TIMEOUT_SECS and runs the whole suite)"
+[ "$c_elapsed" -lt 30 ] \
+  || fail "13c: the 2s bound took ${c_elapsed}s to fire on the direct invocation"
+grep -q "TIMEOUT: 'test_workflow.sh-direct'" "$TMPD/e13c" \
+  || fail "13c: the breach must be reported under the direct-run label so an operator can tell a bare run from a make/gates one; stderr: $(grep TIMEOUT "$TMPD/e13c")"
+grep -q 'CASE THAT WAS RUNNING' "$TMPD/e13c" \
+  || fail "13c: the direct run's breach must go through the wrapper's running-case report"
+
+# NO DOUBLE WRAP. The wrapped path (exactly how the Makefile invokes it) must
+# create ONE wrapper scratch dir; a mutant wrapper that stops exporting
+# WF_TEST_SELF_BOUND=1 makes the suite re-exec under the real wrapper inside
+# it, i.e. TWO. Counted live by a watcher over a private TMPDIR while each run
+# lasts, since both dirs are swept on exit.
+NOEXPORT_MUTANT="$TMPD/noexport-guard.sh"
+grep -v '^export WF_TEST_SELF_BOUND=1$' "$GUARD" > "$NOEXPORT_MUTANT"
+if diff -q "$GUARD" "$NOEXPORT_MUTANT" >/dev/null 2>&1; then
+  fail "13c: the wrapper no longer exports WF_TEST_SELF_BOUND=1 in its expected shape — the wrapped make/gates path would re-exec and wrap TWICE, and this discrimination is inert"
+fi
+WRAP_MAX=0
+wrap_count_run() {  # wrap_count_run <guard-path> -> WRAP_MAX = most wrapper scratch dirs seen alive at once
+  local guard="$1" dir="$TMPD/wrapcount" n wpid
+  rm -rf "$dir"; mkdir -p "$dir"
+  # `env -u` as in arms (b)/(c): when THIS harness is itself wrapped, it has
+  # inherited WF_TEST_SELF_BOUND=1, and a mutant that stops exporting the
+  # variable would still pass it through — the red arm could never wrap twice.
+  env -u WF_TEST_SELF_BOUND -u SUITE_PROGRESS_FILE TMPDIR="$dir" BUILD_SUITE_TIMEOUT_SECS=2 \
+    bash "$guard" --label test-build-workflow \
+    --case-source "$WORKFLOW_SUITE" -- bash "$WORKFLOW_SUITE" </dev/null >/dev/null 2>&1 &
+  wpid=$!
+  WRAP_MAX=0
+  while kill -0 "$wpid" 2>/dev/null; do
+    n="$(find "$dir" -mindepth 1 -maxdepth 1 -name 'bounded-suite.*' 2>/dev/null | wc -l | tr -d ' ')"
+    [ "$n" -gt "$WRAP_MAX" ] && WRAP_MAX="$n"
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+  wait "$wpid" 2>/dev/null
+  return 0
+}
+wrap_count_run "$GUARD";           green_wraps="$WRAP_MAX"
+wrap_count_run "$NOEXPORT_MUTANT"; red_wraps="$WRAP_MAX"
+[ "$green_wraps" -eq 1 ] \
+  || fail "13c: the wrapped path created $green_wraps wrapper scratch dirs at once — expected exactly 1; more means the suite re-wrapped itself inside make's wrapper, fewer means the watcher saw nothing and this check is vacuous"
+[ "$red_wraps" -eq 2 ] \
+  || fail "13c: the mutant that stops exporting WF_TEST_SELF_BOUND=1 should have made the suite wrap TWICE (saw $red_wraps) — the guard variable is not what stops the re-exec, so the green count proves nothing"
+pass "13c a direct invocation is self-bound: a 2s bound kills it through the wrapper's report under the 'test_workflow.sh-direct' label in ${c_elapsed}s; the wrapped path wraps exactly once (1 scratch dir alive), and a wrapper that stops exporting WF_TEST_SELF_BOUND=1 wraps twice (2)"
 
 echo ""
 echo "All test_bounded_suite.sh cases passed."

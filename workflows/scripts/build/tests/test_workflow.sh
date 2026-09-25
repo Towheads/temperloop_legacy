@@ -92,6 +92,48 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd ../../../.. && pwd)"
+
+# ============================================================================
+# temperloop#2245 — a DIRECT invocation of this suite is SELF-BOUND.
+#
+# `make test-build-workflow` and the scripts/quality-gates.sh slice already run
+# this file under workflows/scripts/build/bounded-suite.sh (temperloop#2184),
+# which kills the run at $BUILD_SUITE_TIMEOUT_SECS and names the case that was
+# RUNNING. The 11-hour hang was a `bash …/test_workflow.sh` typed by hand from
+# an unattended mutation-test run — OUTSIDE that wrapper, so no bound existed
+# and nothing ever went red. The wrapper exports WF_TEST_SELF_BOUND=1 to the
+# command it launches; when that variable is unset, this preamble re-execs the
+# suite under the wrapper itself, so the wrapped make/gates path is byte-
+# identical (it never re-wraps) and the bare path gains the same bound. It sits
+# here, BEFORE anything is allocated, because `exec` never runs the EXIT trap:
+# a re-exec after `mktemp -d` below would leak the scratch dir every run.
+#
+# Escape hatch — a run that must stay raw (a debugger attached, stepping the
+# preamble by hand): `WF_TEST_SELF_BOUND=1 bash …/test_workflow.sh`.
+# ============================================================================
+if [ "${WF_TEST_SELF_BOUND:-}" != 1 ]; then
+  _wf_self="$REPO_ROOT/workflows/scripts/build/tests/test_workflow.sh"
+  _wf_guard="$REPO_ROOT/workflows/scripts/build/bounded-suite.sh"
+  if [ ! -f "$_wf_guard" ]; then
+    echo "FAIL: $_wf_guard is missing — this suite refuses to run UNBOUNDED (temperloop#2245); it ships beside the wrapper" >&2
+    exit 1
+  fi
+  exec bash "$_wf_guard" --label test_workflow.sh-direct --case-source "$_wf_self" -- bash "$_wf_self" "$@"
+fi
+
+# temperloop#2245 — THIS SUITE NEVER READS STDIN, so no child of it may either.
+# The hang's mechanism was a stray `cat` that inherited the suite's stdin (a
+# socket under an unattended runner, never reaching EOF) and blocked forever.
+# That site is fixed (the #2245 backtick guard below refuses the shape at
+# source), but the class is not: any future `cat "$empty_var"`, an `xargs` with
+# no input, or a subprocess that falls back to stdin would re-arm the same
+# hang. Redirecting the suite's OWN stdin from /dev/null means every child it
+# ever spawns — including a command substitution bash runs while merely
+# expanding an argument, which is where the live `cat` ran — reads EOF at once
+# instead of waiting on a caller's socket. A caller-side `</dev/null` cannot
+# give that guarantee: it protects one invocation, not the suite.
+exec </dev/null
+
 MJS="$REPO_ROOT/claude/workflows/build-level.mjs"
 [ -f "$MJS" ] || { echo "FAIL: build-level.mjs not found at $MJS" >&2; exit 1; }
 
