@@ -224,6 +224,12 @@ bash workflows/scripts/build/bounded-suite.sh --label * -- bash workflows/script
 # (scripts/quality-gates.sh's own comment explains why it exists alongside
 # the make test-build glob coverage above) needs its own row too, since
 # check-gate-paths.sh requires exactly one row per gate command.
+# The turn-end wake guarantee (temperloop#2210): its own row ON TOP OF the
+# family glob above, because this suite also executes the worker-gate command
+# claude/workflows/build-level.mjs GENERATES and pins /build 4b's armed-wake
+# wiring — neither path is in the family row, so a diff touching only the
+# engine or only the command doc would not select the one gate that checks it.
+bash workflows/scripts/build/bounded-suite.sh --label test_wake_guard.sh -- bash workflows/scripts/build/tests/test_wake_guard.sh	workflows/scripts/build/wake-guard.sh workflows/scripts/build/gate.sh workflows/scripts/build/build.config.sh workflows/scripts/config/setting-registry.tsv workflows/scripts/build/tests/test_wake_guard.sh claude/workflows/build-level.mjs claude/commands/build.md workflows/scripts/config/mandatory-step-registry.tsv
 bash workflows/scripts/build/bounded-suite.sh --label test_state_graph.sh -- bash workflows/scripts/build/tests/test_state_graph.sh	workflows/scripts/build/state-graph.sh workflows/scripts/build/tests/test_state_graph.sh workflows/scripts/board/lib/cache.sh workflows/scripts/board/lib/board.sh workflows/scripts/config/ontology-registry.tsv workflows/scripts/config/join-keys-lib.sh
 bash workflows/scripts/build/bounded-suite.sh --label test_state_graph_local.sh -- bash workflows/scripts/build/tests/test_state_graph_local.sh	workflows/scripts/build/state-graph.sh workflows/scripts/build/tests/test_state_graph_local.sh workflows/scripts/board/lib/cache.sh workflows/scripts/board/lib/board.sh workflows/scripts/config/ontology-registry.tsv workflows/scripts/config/join-keys-lib.sh workflows/scripts/lib/knowledge_store.sh
 # `state-graph.sh query <name>` (temperloop#1910 L6): pure functions of a

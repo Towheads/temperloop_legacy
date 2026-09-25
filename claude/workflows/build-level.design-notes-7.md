@@ -1158,3 +1158,85 @@ side breached on its own.
  The dual-build path is where the record is consumed MACHINE-side — by a tally
  that picks a winner — which is why the refusal lives here.
 ```
+
+## killNotDetachWatchdog — one watchdog, and why it cannot depend on what it watches (temperloop#2210)
+<a id="why-it-is-one-function-and-not-two-copies-bash-timeout-detach"></a>
+
+```text
+ WHY IT IS ONE FUNCTION AND NOT TWO COPIES. `Bash timeout:` DETACHES, it does
+ not kill — a 500s-bounded command was moved to the background at its bound
+ and then ran UNBOUNDED for 12.5h on epic #2065. The only thing that actually
+ stops that is a watchdog compiled INTO the command text, so it rides along
+ into the detached process and fires there. This file now arms one in two
+ places (the #1071 machinery-step bound below, and the worker's own scoped
+ gate), and a second hand-rolled copy is how one of them silently loses the
+ property the other keeps.
+
+ THE WATCHDOG DOES NOT DEPEND ON WHAT IT WATCHES. The #2065 post-mortem's
+ third cause was a guard written as `until ! pgrep -f <pattern>` — it asked
+ the WATCHED process's own liveness for permission to fire, so the hang took
+ the guard down with it. This one knows exactly one fact, a pid: it never
+ greps for a command pattern, never re-reads the child's state, and never
+ waits on the child's cooperation. It sleeps for the bound and signals.
+
+ Kill ORDER is load-bearing, and the obvious order is wrong — see the design
+ note carried at the #1071 call site below. Children are ENUMERATED (by
+ parent pid, not by pattern) BEFORE the parent dies, because reparenting
+ makes them unfindable the moment it does.
+
+ `</dev/null >/dev/null 2>&1` at the subshell boundary is the foundation#861
+ pipe-leak fix: without it the watchdog's `sleep` inherits the write end of
+ any command substitution wrapping the call, and every FAST call stalls for
+ the full bound on an EOF the orphaned sleep is holding open.
+ `opts.group` — for a command started under `set -m`, whose pid IS therefore
+ its own process-group id, so ONE signal reaps the WHOLE tree. Without it the
+ kill reaches the direct child and its immediate children only, which is
+ enough for a machinery step (a single helper script) but NOT for the worker's
+ scoped gate, whose suite fans out a pool of grandchildren — exactly the
+ orphaned process trees bounded-suite.sh was written for. The group signal is
+ emitted BEFORE the single-pid kill and both are kept: a host where job
+ control could not give the child its own group degrades to the direct-child
+ kill rather than to nothing. Omitting `opts` leaves the single-pid kill
+ alone, which is what the #1071 machinery-step bound wants.
+
+ THE WATCHDOG ITSELF GETS A GROUP TOO, and that is what `retireWatchdog`
+ exists for. `set -m` around the `( … ) &` makes the SUBSHELL a process-group
+ leader. Without it, retiring a watchdog that is no longer needed — the FAST
+ path, i.e. almost every call — with a bare `kill "$wd"` signals only the
+ subshell: its `sleep` is a separate child OF that subshell, so it is
+ reparented to init and idles for the FULL ceiling. One stray `sleep` per
+ bounded step, per poll, accumulating across a level. The header's claim that
+ the bound "leaves nothing detached behind" is only true once the retire is a
+ GROUP kill, so `retireWatchdog` emits `kill -- -"$wd" || kill "$wd"` — group
+ first, bare pid as the same degrade-not-disappear fallback the bound itself
+ uses.
+```
+
+## The worker scoped-gate liveness bound (temperloop#2210)
+<a id="the-failure-this-bounds-workergatecmd-hands-the-worker-one-gate"></a>
+
+```text
+ THE FAILURE THIS BOUNDS. workerGateCmd() below hands the worker ONE gate
+ invocation and tells it to raise the Bash tool's `timeout` parameter. That
+ parameter DETACHES, it does not kill: at the bound the Bash tool moves the
+ command to the background and the worker's turn ends, so a `quality-gates.sh`
+ that WEDGES keeps running with nobody waiting on it and nothing that will
+ ever stop it. Measured cost on epic #2065: one such run went 12.5 HOURS, and
+ on epic #2133 level 0 fourteen concurrent `quality-gates.sh` trees were
+ inventoried, six stacked in ONE worktree — so the next run there contended
+ with its own predecessors and reported false REDs that both passed in clean
+ isolation with no code change between. The worker's sentinel meanwhile sat at
+ `{"state":"running"}` forever, which is indistinguishable from a gate that is
+ merely slow. That ambiguity IS the defect.
+
+ THE BOUND IS THE #1071 CEILING, NOT A NEW SETTING. The worker's gate is one
+ step of the workflow's work, so it takes the workflow's own per-step
+ wall-clock liveness ceiling — already repo-sized, already floored at one
+ CI-poll/gate slice + 300s, already tunable through the named
+ BUILD_MACHINERY_STEP_CEILING_SECS setting handed in as
+ input.machineryStepCeilingSecs. Minting a second number here would be a
+ tunable this file owns twice. It deliberately sits ABOVE the harness's
+ foreground Bash ceiling: the Bash tool detaches first, and the compiled
+ watchdog — which rode along INTO the detached process — is what then kills
+ it. A bound at or below the detach point would never get the chance.
+```

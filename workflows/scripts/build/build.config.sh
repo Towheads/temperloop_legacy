@@ -303,6 +303,31 @@ fi
 # the run_in_background + ScheduleWakeup path).
 : "${BUILD_HEADLESS_POLL_TIMEOUT:=540}"  # foreground CI/MERGED poll bound (s), headless path
 
+# ── The ARMED WAKE (temperloop#2210) ────────────────────────────────────────
+# The merge queue and CI are PULL-ONLY: nothing notifies an orchestrator that a
+# PR merged, went green, or fell BEHIND. A turn that ends with in-flight work
+# and NO armed wake source therefore never learns anything again — silence is
+# indistinguishable from "still running". The /build of epic #2065 stalled that
+# way three times (~20 min, 12.5 h, and once more), each caught by the operator
+# asking rather than by any mechanism. `wake-guard.sh arm` closes it by making
+# the wait a BLOCKING, bounded, foreground poll, which a turn structurally
+# cannot end in front of. These two settings size that poll.
+#
+# INTERVAL: how often the armed wake re-reads merge state. 30s is the same
+# floor ci-poll.sh enforces in 3g — there is no reason to poll tighter than the
+# queue lands, and each read spends an API request.
+: "${BUILD_WAKE_POLL_INTERVAL:=30}"      # armed-wake merge-state read interval (s)
+# TIMEOUT: a LIVENESS bound on ONE armed-wake call — how long that call may
+# block before handing control back — kept under the ~10-min Bash foreground
+# cap, same sizing reason as BUILD_HEADLESS_POLL_TIMEOUT just above.
+#
+# THIS IS NOT THE QUEUE CEILING, deliberately. How long a PR may legitimately
+# sit in the merge queue is BUILD_QUEUE_TIMEOUT, whose sizing is a separate
+# open question (temperloop#2055) this setting does not pre-empt: a caller that
+# wants the full queue ceiling CHAINS armed calls up to BUILD_QUEUE_TIMEOUT and
+# never widens one call past the foreground cap.
+: "${BUILD_WAKE_POLL_TIMEOUT:=540}"      # bound on ONE armed-wake call (s)
+
 # ── Command-spec prose settings (prose-tunables-migration, temperloop#164/#169
 #    D3 follow-up) ──────────────────────────────────────────────────────────
 # These settings back a value that previously lived ONLY in a command spec's
@@ -2032,7 +2057,7 @@ fi
 export BUILD_QUOTA_PAUSE_PCT BUILD_QUOTA_CACHE BUILD_QUOTA_WAIT_BUFFER \
        BUILD_SUITE_TIMEOUT_SECS \
        BUILD_QUOTA_MAX_AGE BUILD_MERGE_GATE_WINDOW BUILD_QUEUE_TIMEOUT BUILD_QUEUE_STALL_AFTER \
-       BUILD_HEADLESS_POLL_TIMEOUT \
+       BUILD_HEADLESS_POLL_TIMEOUT BUILD_WAKE_POLL_INTERVAL BUILD_WAKE_POLL_TIMEOUT \
        BUILD_MERGE_BACKEND BUILD_COMBINED_TREE_PRECHECK BUILD_MERGE_AS_YOU_GO \
        PIPELINE_DRIVE_CONCURRENCY EPIC_MIN_SUBUNITS DISPLAY_TZ \
        STATE_GRAPH_MAX_AGE_S STATE_GRAPH_QUERY_SLOW_MS STATE_GRAPH_SOAK_DAYS STATE_GRAPH_SOAK_STALE_DAYS \

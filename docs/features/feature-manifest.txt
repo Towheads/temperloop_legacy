@@ -137,6 +137,8 @@ merge-gate docs/managed-merge-queue.md
 merge-gate workflows/scripts/build/gate.sh
 merge-gate workflows/scripts/build/ci-poll.sh
 merge-gate workflows/scripts/build/tests/test_gate.sh
+merge-gate workflows/scripts/build/wake-guard.sh
+merge-gate workflows/scripts/build/tests/test_wake_guard.sh
 merge-gate workflows/scripts/build/tests/test_ci_poll.sh
 merge-gate workflows/scripts/board/pr-enqueue.sh
 merge-gate workflows/scripts/board/tests/test_pr_enqueue.sh
