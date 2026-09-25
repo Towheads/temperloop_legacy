@@ -251,7 +251,9 @@
 #   dual-build-ledger.sh null-floor-status [--dir DIR]
 #       Prints null-floor.json as one JSON line with `outcome: NULL_FLOOR`,
 #       or `outcome: NULL_FLOOR_UNAVAILABLE` + `reason` and exit 1 when it
-#       is absent, unparseable, or missing a schema field (fail closed).
+#       is absent, unparseable, missing a schema field, or of a
+#       `schema_version` this reader does not know (fail closed — see
+#       § NULL-FLOOR MODE above).
 #
 # `--dir` (or env `DUAL_BUILD_LEDGER_DIR`) overrides the ledger root; default
 # is `<invoking-repo-root>/.temperloop/model-comparison/dual-build`, where
@@ -1113,13 +1115,18 @@ cmd_calibrate_status() {
 # jq's own parser is the judge (so "17", "17.5", "-0.25", "1e3" pass; "",
 # "abc", "1,2" and a bare "nan" all fail) — the same parser that will later
 # read the value back, so what passes here is exactly what round-trips.
+#
+# Slurped (`-s`) and required to be EXACTLY one value: a bare `jq -e` on a
+# multi-value input ("1 2") reports only the LAST value, so it would pass
+# here and then fail later at `--argjson` with jq's own stderr instead of
+# this script's named refusal (review finding, temperloop#2271).
 _nf_is_number() {
-  jq -e 'type == "number" and isnan == false' >/dev/null 2>&1 <<<"$1"
+  jq -es 'length == 1 and (.[0] | type == "number" and isnan == false)' >/dev/null 2>&1 <<<"$1"
 }
 
-# _nf_is_rate <str> — a JSON number in the closed interval 0..1.
+# _nf_is_rate <str> — exactly one JSON number in the closed interval 0..1.
 _nf_is_rate() {
-  jq -e 'type == "number" and isnan == false and . >= 0 and . <= 1' >/dev/null 2>&1 <<<"$1"
+  jq -es 'length == 1 and (.[0] | type == "number" and isnan == false and . >= 0 and . <= 1)' >/dev/null 2>&1 <<<"$1"
 }
 
 # _nf_unavailable <path> <reason> — the ONE place the fail-closed verdict is
@@ -1159,6 +1166,9 @@ cmd_null_floor_record() {
   case "$n" in
     ''|*[!0-9]*) die "null-floor-record: --n must be a positive integer (got '$n')" ;;
   esac
+  # Width cap BEFORE the arithmetic: the digit-only guard above admits any
+  # length, and `$((10#$n))` silently wraps on an input past 2^63.
+  [ "${#n}" -le 9 ] || die "null-floor-record: --n is implausibly large (got '$n')"
   # `10#` forces base-10 — same leading-zero footgun cmd_prune documents.
   [ "$((10#$n))" -ge 1 ] || die "null-floor-record: --n must be at least 1 (got '$n')"
   n=$((10#$n))
@@ -1166,18 +1176,25 @@ cmd_null_floor_record() {
   _nf_is_rate "$afr" || die "null-floor-record: --arm-failure-rate must be a number in 0..1 (got '$afr')"
 
   # One margin per comma; every entry must be a number and none may be
-  # empty (so "17,,18" and a trailing comma are refused, not silently
-  # dropped). Accumulated through jq so the stored values are jq-canonical
-  # — exactly what null-floor-status will re-emit.
+  # empty, so "17,,18", ",17" AND a trailing "17,18," are all refused, not
+  # silently dropped. The loop is fed by a herestring over a parameter
+  # substitution (`${margins//,/$'\n'}`) rather than a `$(… | tr)` heredoc:
+  # command substitution strips trailing newlines, which turned the empty
+  # last field of "17,18," into nothing for `read` to see (review finding,
+  # temperloop#2271). An embedded newline is refused up front for the same
+  # reason — it would read as a field boundary the caller never typed.
+  # Accumulated through jq so the stored values are jq-canonical — exactly
+  # what null-floor-status will re-emit.
+  case "$margins" in
+    *$'\n'*) die "null-floor-record: --margins must be a single comma-separated line (got an embedded newline)" ;;
+  esac
   local margins_json="[]" m count=0
   while IFS= read -r m; do
     _nf_is_number "$m" || die "null-floor-record: --margins entry '$m' is not a number (expected a comma-separated list of numbers, got '$margins')"
     margins_json="$(jq -c --argjson m "$m" '. + [$m]' <<<"$margins_json")" \
       || die "null-floor-record: could not build margins array"
     count=$((count + 1))
-  done <<EOF
-$(printf '%s' "$margins" | tr ',' '\n')
-EOF
+  done <<<"${margins//,/$'\n'}"
   [ "$count" -ge 1 ] || die "null-floor-record: --margins must carry at least one margin"
   [ "$count" -le "$n" ] \
     || die "null-floor-record: --margins carries $count entries but --n is $n — a run cannot judge more pairs than it ran"

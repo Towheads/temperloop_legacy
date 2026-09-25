@@ -540,6 +540,12 @@ nf_refuses n-alpha "--n must be a positive integer" "${GOOD[@]}" --n abc
 nf_refuses n-lt-margins "carries 3 entries but --n is 2" "${GOOD[@]}" --n 2
 nf_refuses margin-alpha "--margins entry 'abc' is not a number" "${GOOD[@]}" --margins 17,abc
 nf_refuses margin-empty "--margins entry '' is not a number" "${GOOD[@]}" --margins 17,,18
+nf_refuses margin-trailing-comma "--margins entry '' is not a number" "${GOOD[@]}" --margins 17,18,
+nf_refuses margin-leading-comma "--margins entry '' is not a number" "${GOOD[@]}" --margins ,17,18
+nf_refuses margin-newline "must be a single comma-separated line" "${GOOD[@]}" --margins "$(printf '17\n18')"
+nf_refuses margin-two-values "--margins entry '1 2' is not a number" "${GOOD[@]}" --margins "1 2,3"
+nf_refuses n-huge "--n is implausibly large" "${GOOD[@]}" --n 99999999999999999999
+nf_refuses afr-two-values "--arm-failure-rate must be a number in 0..1" "${GOOD[@]}" --arm-failure-rate "0 1"
 nf_refuses oar-high "--order-agreement-rate must be a number in 0..1" "${GOOD[@]}" --order-agreement-rate 1.5
 nf_refuses afr-neg "--arm-failure-rate must be a number in 0..1" "${GOOD[@]}" --arm-failure-rate -0.1
 nf_refuses afr-alpha "--arm-failure-rate must be a number in 0..1" "${GOOD[@]}" --arm-failure-rate abc
