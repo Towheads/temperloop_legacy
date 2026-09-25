@@ -1043,3 +1043,46 @@ failing to catch a leak — becomes *visible* rather than merely possible,
 since under two genuinely different models a leak is indistinguishable from
 a real quality difference. A real candidate-vs-baseline comparison is
 separate, later work, run once this instrument is trusted.
+
+**What the A/A runs actually found, and the repeat sweep that follows
+(temperloop#2209, #2266).** Two A/A runs have now reached a judged verdict, and
+both produced a *confident, order-stable* preference between two samples of the
+same model — `margin 17.5`, then `margin 17`, `order_agreement: true` both
+times. Rotating the presentation order flipped neither, so neither is position
+bias. That number is what the instrument reports when there is no model
+difference to find, and it is the floor any future A/B margin has to clear
+before it means anything.
+
+Characterising that floor properly means separating two quantities that are
+easy to conflate:
+
+| | the question | cost |
+|---|---|---|
+| **judge repeat variance** | the same two diffs, judged N times — is `margin 17` stable, or one draw from a wide distribution? | **no builds** |
+| **sample-to-sample floor** | *different* same-model diffs — what margin does the judge invent when nothing differs? | k fresh builds |
+
+Only the second needs the build machinery. The first is nearly free, because
+`judge.sh pairwise` takes two **stored records** and never touches a worktree —
+so an archived pair can be re-judged indefinitely.
+`workflows/scripts/model-comparison/judge-repeat.sh` does exactly that: it
+reconstructs both records from the ledger's own `format-patch` archives
+(`sweep`, or `records` to inspect what it would send without sending it) and
+re-judges the pair N times, then `report` summarises the margin distribution,
+the order-agreement rate, and a fair-coin sign test over decisive verdicts —
+statistics from `stats.sh`, never hand-rolled.
+
+Three properties of that corpus are deliberate. It lives in its own
+`judge-repeat.jsonl` store, **never** `calibration-pairs.jsonl`: ADR 0041 pins
+that file to blind *human* pairs and derives `calibration.json`'s `n` from it,
+so recording a machine re-judge there would move the calibration bar without a
+human having looked at anything. A repeat whose two position orders disagree is
+recorded as the `tie`/`margin 0` that `judge.sh` makes it, never dropped —
+dropping it would pull the reported mean away from zero and flatter the
+instrument. And every row carries each arm's `start_order`, which a single pair
+holds constant and therefore cannot test: it is recorded now so the k-arm study
+can ask whether the arm built *first* wins more often, without a schema
+migration. That question is live — the replay side found a consistent
+second-arm advantage in its own A/A validation and now counterbalances arm
+order on every pair, while dual-build records `start_order` and checks nothing.
+Judge *position* bias is already controlled by the AB/BA rotation; execution
+order is not.

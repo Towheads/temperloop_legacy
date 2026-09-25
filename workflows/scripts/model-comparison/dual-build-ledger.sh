@@ -187,6 +187,15 @@
 #       and prints the recorded calibration-pairs.jsonl row.
 #   dual-build-ledger.sh calibrate-status [--dir DIR]
 #       (Re)computes and writes the pinned calibration.json, and prints it.
+#   dual-build-ledger.sh repeat-append --row '<json>'|- [--dir DIR]
+#       Appends ONE judge-repeat row to judge-repeat.jsonl (temperloop#2266) —
+#       the corpus for the judge REPEAT-VARIANCE study: the same stored pair
+#       re-judged N times, to separate the judge's own run-to-run variance from
+#       sample-to-sample variance. `schema_version`/`seq` are assigned here and
+#       are refused if the caller supplies them, exactly as `append` does.
+#       This store feeds NO derived state — see § JUDGE-REPEAT CORPUS.
+#   dual-build-ledger.sh repeat-read [--dir DIR] [--slug S]
+#       Prints the judge-repeat rows as one JSON array, optionally for one slug.
 #
 # `--dir` (or env `DUAL_BUILD_LEDGER_DIR`) overrides the ledger root; default
 # is `<invoking-repo-root>/.temperloop/model-comparison/dual-build`, where
@@ -265,6 +274,14 @@ ARCHIVES_SUBDIR="archives"
 # and the PINNED calibration.json path this item's acceptance names.
 CALIBRATION_PAIRS_FILE_NAME="calibration-pairs.jsonl"
 CALIBRATION_STATUS_FILE_NAME="calibration.json"
+# § JUDGE-REPEAT CORPUS (temperloop#2266) — a THIRD store, deliberately not the
+# calibration-pairs one. ADR 0041 pins calibration-pairs.jsonl to BLIND HUMAN
+# pairs and computes calibration.json's `n` from it; a machine re-judge is not a
+# human label, so recording one there would move the calibration bar without a
+# human ever having looked at anything. Same directory, same single
+# `.append.lock`, own file, own seq space, and NOTHING derived from it is read
+# back into calibration.json.
+REPEAT_FILE_NAME="judge-repeat.jsonl"
 
 die() { echo "dual-build-ledger.sh: $1" >&2; exit 1; }
 
@@ -947,6 +964,75 @@ cmd_calibrate_record() {
   printf '%s\n' "$row"
 }
 
+cmd_repeat_append() {
+  local dir="$LEDGER_DIR" row=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) [ $# -ge 2 ] || die "repeat-append: --dir requires a path"; dir="$2"; shift 2 ;;
+      --row) [ $# -ge 2 ] || die "repeat-append: --row requires JSON or -"; row="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "repeat-append: unknown argument $1" ;;
+    esac
+  done
+  [ -n "$row" ] || die "repeat-append: --row '<json>'|- is required"
+  [ "$row" != "-" ] || row="$(cat)"
+  printf '%s' "$row" | jq -e . >/dev/null 2>&1 || die "repeat-append: --row is not valid JSON"
+  # Same refusal as `append`: these two are assigned by the ledger, never by a
+  # caller, so a caller that thinks it owns them is a bug to surface, not a
+  # value to silently overwrite.
+  printf '%s' "$row" | jq -e 'has("schema_version") or has("seq")' >/dev/null 2>&1 \
+    && die "repeat-append: the row carries schema_version and/or seq — both are assigned by the ledger, never supplied"
+  for f in slug preference order_agreement judge_model; do
+    printf '%s' "$row" | jq -e --arg f "$f" 'has($f)' >/dev/null 2>&1 \
+      || die "repeat-append: the row is missing required field '$f'"
+  done
+  _require_dir repeat-append "$dir"
+
+  local repeat_file="$dir/$REPEAT_FILE_NAME"
+  _lock_acquire "$dir" || die "repeat-append: could not acquire the append lock"
+  trap '_lock_release "$dir"; exit 1' EXIT INT TERM
+
+  local max next_seq created_at op host out
+  max="$(_ledger_max_seq "$repeat_file")"
+  next_seq=$((max + 1))
+  created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  op="$(_operator_default)"
+  host="$(_host_default)"
+  out="$(printf '%s' "$row" | jq -c \
+    --argjson sv "$SCHEMA_VERSION" --argjson seq "$next_seq" \
+    --arg created_at "$created_at" --arg op "$op" --arg host "$host" '
+    {schema_version: $sv, seq: $seq, created_at: $created_at}
+      + .
+      + {operator: (.operator // $op), host: (.host // $host)}')" \
+    || { _lock_release "$dir"; die "repeat-append: could not build the row"; }
+
+  printf '%s\n' "$out" >>"$repeat_file" || { _lock_release "$dir"; die "repeat-append: write failed to $repeat_file"; }
+  _lock_release "$dir"
+  trap - EXIT INT TERM
+  printf '%s\n' "$out"
+}
+
+cmd_repeat_read() {
+  local dir="$LEDGER_DIR" slug=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) [ $# -ge 2 ] || die "repeat-read: --dir requires a path"; dir="$2"; shift 2 ;;
+      --slug) [ $# -ge 2 ] || die "repeat-read: --slug requires a value"; slug="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "repeat-read: unknown argument $1" ;;
+    esac
+  done
+  _require_dir repeat-read "$dir"
+  local repeat_file="$dir/$REPEAT_FILE_NAME"
+  [ -f "$repeat_file" ] || { printf '[]\n'; return 0; }
+  if [ -n "$slug" ]; then
+    jq -sc --arg s "$slug" '[.[] | select(.slug == $s)]' "$repeat_file" \
+      || die "repeat-read: $repeat_file is not valid JSONL"
+  else
+    jq -sc '.' "$repeat_file" || die "repeat-read: $repeat_file is not valid JSONL"
+  fi
+}
+
 cmd_calibrate_status() {
   local dir="$LEDGER_DIR"
   while [ $# -gt 0 ]; do
@@ -1046,6 +1132,8 @@ case "$cmd" in
   prune) cmd_prune "$@" ;;
   calibrate-sample) cmd_calibrate_sample "$@" ;;
   calibrate-record) cmd_calibrate_record "$@" ;;
+  repeat-append) cmd_repeat_append "$@" ;;
+  repeat-read) cmd_repeat_read "$@" ;;
   calibrate-status) cmd_calibrate_status "$@" ;;
   -h|--help) usage; exit 0 ;;
   "") usage >&2; exit 1 ;;
