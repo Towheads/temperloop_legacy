@@ -7,9 +7,9 @@
 # and the winner (or exactly why no winner is named) in the first lines, one
 # table of the figures that matter, then the honesty block — sample floor,
 # intervals, detectable effect, order effect, corpus window, gate versions,
-# cost basis, emit coverage — and a short list of what would change the
-# verdict. Nothing here is a second report: it is the producer's report,
-# laid out for a reader instead of for jq.
+# cost basis, cross-vendor comparability, emit coverage — and a short list
+# of what would change the verdict. Nothing here is a second report: it is
+# the producer's report, laid out for a reader instead of for jq.
 #
 # ── DERIVES NO STATISTIC, INVENTS NO FIGURE ─────────────────────────────
 # Every number on the page is copied from the producer's JSON. The only
@@ -23,6 +23,13 @@
 # because the producer's three withholding conditions (sample floor, order-
 # effect cleanliness, verdict direction) are the whole point of that key and
 # a renderer that re-derived it would silently undo them (temperloop#1606).
+# The same rule governs the CROSS-VENDOR cost verdict (temperloop#1742):
+# `cost_basis.cross_vendor.comparable` is the producer's call, and when it
+# reads false this file prints the producer's stated reason IN PLACE OF the
+# cost delta — in the Decision line and in the at-a-glance cell. It never
+# infers incomparability from a model name or a provider string of its own,
+# and a report carrying no `cross_vendor` block renders exactly as it did
+# before the block existed.
 #
 # ── FAIL-CLOSED, LIKE THE REST OF THE MODULE ────────────────────────────
 # The producer is a report.d drop-in and therefore exits 0 with one
@@ -84,7 +91,7 @@ ce() { cannot_evaluate_emit "render.sh" "$1"; return $?; }
 in_file="" records_dir="" repo_root="" out_file="" summary_out=""
 if [ "${1:-}" = "schema" ]; then
   cat <<EOF
-$SUMMARY_SCHEMA fields: schema_version generated_at_utc report_generated_at_utc baseline_models candidate_models verdict winner winner_axis winner_withheld_reason quality_paired_n quality_min_sample quality_below_min_sample quality_comparison_is_clean cost_verdict cost_paired_n records_dir report_md
+$SUMMARY_SCHEMA fields: schema_version generated_at_utc report_generated_at_utc baseline_models candidate_models verdict winner winner_axis winner_withheld_reason quality_paired_n quality_min_sample quality_below_min_sample quality_comparison_is_clean cost_verdict cost_paired_n cost_axis_comparable cost_axis_unavailable_reason records_dir report_md
 EOF
   exit 0
 fi
@@ -172,6 +179,21 @@ def bullet($s): "- " + $s;
 | (models($b)) as $bm | (models($c)) as $cm
 | ($q.paired // {}) as $qp | ($q.unpaired // {}) as $qu
 | ($q.execution_order // {}) as $qo
+# THE CROSS-VENDOR COST VERDICT (temperloop#1742) — read, never re-derived.
+# The producer owns it (it owns cost_basis); this file only formats it, the
+# same way it already formats weights_caveat and the overlay reasons. An
+# OLDER report that carries no cross_vendor block renders exactly as before:
+# every use below is guarded on presence, so nothing is invented for a JSON
+# that never made the call.
+# ONE predicate, read at BOTH sites below (the Decision/table substitution and
+# the Run-provenance line), and FAIL-CLOSED: anything that is not an explicit
+# `true` — false, or a null the producer should never emit — reads as
+# unavailable. A report with NO cross_vendor block at all is the separate,
+# earlier case: $cv is null, $cv_unavailable is false, and the page renders
+# exactly as it did before the block existed.
+| (.cost_basis.cross_vendor // null) as $cv
+| (($cv != null) and ($cv.comparable != true)) as $cv_unavailable
+| (if $cv == null then null else ($cv.reason // "no reason stated") end) as $cv_reason
 | (
     if $winner != null then
       "**Winner: " + $winner + "** (" + (if $winner == "candidate" then $cm else $bm end) + ") — decided on the " + ($cost.winner_axis // "quality") + " axis."
@@ -197,7 +219,11 @@ def bullet($s): "- " + $s;
   $headline,
   "",
   bullet("**Quality (decides):** candidate " + (($qp.absolute_delta) | signed) + " judge points vs baseline on " + (($qp.n // 0) | tostring) + " paired outcomes (" + ($qp.baseline_mean | na) + " → " + ($qp.candidate_mean | na) + "; relative " + (if $qp.relative_delta_pct == null then "n/a" else (($qp.relative_delta_pct | r1 | tostring) + "%") end) + "); 95% CI " + ci($q.confidence_interval) + "; verdict `" + ($q.verdict // "n/a") + "`."),
-  bullet("**Cost (descriptive, decides nothing):** candidate minus baseline " + ($cost.confidence_interval.mean | signed) + " cost-weighted units per merged outcome on " + (($cost.paired_outcomes_n // 0) | tostring) + " paired outcomes (negative = candidate cheaper); 95% CI " + ci($cost.confidence_interval) + "; verdict `" + ($cost.verdict // "n/a") + "`."),
+  (if $cv_unavailable then
+     bullet("**Cost (descriptive, decides nothing): UNAVAILABLE for this comparison.** " + $cv_reason)
+   else
+     bullet("**Cost (descriptive, decides nothing):** candidate minus baseline " + ($cost.confidence_interval.mean | signed) + " cost-weighted units per merged outcome on " + (($cost.paired_outcomes_n // 0) | tostring) + " paired outcomes (negative = candidate cheaper); 95% CI " + ci($cost.confidence_interval) + "; verdict `" + ($cost.verdict // "n/a") + "`.")
+   end),
   (if $cost.winner_withheld_reason != null then bullet("**Why no winner:** " + ($cost.winner_withheld_reason | tostring)) else empty end),
   (if ($q.below_min_sample == true) and ($q.inconclusive_note // null) != null then bullet("**Floor note:** " + ($q.inconclusive_note | tostring)) else empty end),
   bullet("**Transferability:** " + ($cost.transferability // "not stated")),
@@ -208,7 +234,7 @@ def bullet($s): "- " + $s;
   "|---|---|---|---|---|",
   "| judge quality, paired mean (points) | " + ($qp.baseline_mean | na) + " | " + ($qp.candidate_mean | na) + " | " + ($qp.absolute_delta | signed) + " | decides the winner; n=" + (($qp.n // 0) | tostring) + " |",
   "| judge quality, unpaired mean (points) | " + ($qu.baseline_mean | na) + " (n=" + (($qu.baseline_judged_n // 0) | tostring) + ") | " + ($qu.candidate_mean | na) + " (n=" + (($qu.candidate_judged_n // 0) | tostring) + ") | " + ($qu.absolute_delta | signed) + " | context only |",
-  "| cost per merged outcome (weighted units) | " + ($b.cost.cost_per_merged_outcome | na) + " | " + ($c.cost.cost_per_merged_outcome | na) + " | " + ($cost.confidence_interval.mean | signed) + " (paired mean) | descriptive |",
+  "| cost per merged outcome (weighted units) | " + ($b.cost.cost_per_merged_outcome | na) + " | " + ($c.cost.cost_per_merged_outcome | na) + " | " + (if $cv_unavailable then "unavailable" else ($cost.confidence_interval.mean | signed) + " (paired mean)" end) + " | " + (if $cv_unavailable then "not comparable — see Decision and Run provenance" else "descriptive" end) + " |",
   "| merged outcomes (pass / scored) | " + (($b.quality.pass_n // 0) | tostring) + " / " + (($b.quality.scored_n // 0) | tostring) + " (" + ($b.quality.pass_rate | pct) + ") | " + (($c.quality.pass_n // 0) | tostring) + " / " + (($c.quality.scored_n // 0) | tostring) + " (" + ($c.quality.pass_rate | pct) + ") | — | could-have-merged rate |",
   "| gate passed / ran | " + (($b.gate_outcomes.passed_n // 0) | tostring) + " / " + (($b.gate_outcomes.ran_n // 0) | tostring) + " | " + (($c.gate_outcomes.passed_n // 0) | tostring) + " / " + (($c.gate_outcomes.ran_n // 0) | tostring) + " | — | mechanical quality gate |",
   "| rework rate (gate failed) | " + ($b.intervention_rework.rework_rate | pct) + " | " + ($c.intervention_rework.rework_rate | pct) + " | — | proxy, not a human log |",
@@ -252,6 +278,7 @@ def bullet($s): "- " + $s;
   bullet("Corpus window: " + (if .corpus_window.window_unavailable_reason != null then ("not available — " + (.corpus_window.window_unavailable_reason | tostring)) else ((.corpus_window.records_n // 0) | tostring) + " records, PRs " + ((.corpus_window.pr_lowest // "?") | tostring) + "–" + ((.corpus_window.pr_highest // "?") | tostring) + ", replayed " + (.corpus_window.replayed_from_local // "?") + " → " + (.corpus_window.replayed_to_local // "?") + " " + (.corpus_window.display_timezone // "") end) + "."),
   bullet("Gate versions: " + (if .gate_versions.versions_unavailable_reason != null then ("not available — " + (.gate_versions.versions_unavailable_reason | tostring)) else ((.gate_versions.distinct_n // 0) | tostring) + " distinct (gate script, base) pair(s): " + ((.gate_versions.pairs // []) | map((.gate_script // "?") + " @ " + ((.base // "?") | tostring | .[0:8])) | join("; ")) end) + "."),
   bullet("Cost basis: " + (.cost_basis.unit // "?") + "; weights input " + ((.cost_basis.weights.input // "?") | tostring) + ", cache_read " + ((.cost_basis.weights.cache_read // "?") | tostring) + ", cache_creation " + ((.cost_basis.weights.cache_creation // "?") | tostring) + ", output " + ((.cost_basis.weights.output // "?") | tostring) + ". " + (.cost_basis.weights_caveat // "")),
+  (if $cv != null then bullet("Cross-vendor cost axis: " + (if $cv_unavailable then "UNAVAILABLE — " else "COMPARABLE — " end) + $cv_reason + " " + ($cv.assumption // "")) else empty end),
   bullet("Dollar overlay: " + (if (.cost_basis.list_price_overlay.estimate_usd // null) != null then ("~$" + (.cost_basis.list_price_overlay.estimate_usd | commas) + " (" + (.cost_basis.list_price_overlay.staleness // "staleness not stated") + "; priced: " + ((.cost_basis.list_price_overlay.priced_models // []) | join(", ")) + "; excluded: " + ((.cost_basis.list_price_overlay.excluded_models // []) | if length == 0 then "none" else join(", ") end) + ")") else ("not available — " + (.cost_basis.list_price_overlay.estimate_usd_unavailable_reason // .cost_basis.list_price_overlay.staleness // "no price table resolved" | tostring)) end) + "."),
   bullet("Emit coverage: " + (if (.emit_coverage.zero_is_structural // false) == true then ("structural zero — " + (.emit_coverage.zero_statement // "no emit-feasible seat ran during this comparison" | tostring)) elif (.emit_coverage.coverage_pct // null) != null then ((.emit_coverage.coverage_pct | tostring) + "% (" + ((.emit_coverage.observed_seats // 0) | tostring) + " of " + ((.emit_coverage.feasible_seats // 0) | tostring) + " emit-feasible seats observed)") else ("not available — " + (.emit_coverage.unavailable_reason // "no reason stated" | tostring)) end) + "."),
   "",
@@ -299,6 +326,28 @@ if [ -n "$summary_out" ]; then
      quality_comparison_is_clean: .quality_comparison.execution_order.comparison_is_clean,
      cost_verdict: (.comparison.verdict // null),
      cost_paired_n: (.comparison.paired_outcomes_n // null),
+     # cost_verdict above is arithmetic over whatever the two arms cost.
+     # These two say whether that arithmetic is a COMPARISON at all, so a
+     # machine consumer can REFUSE to lift a figure the rendered page
+     # withholds. Note cost_verdict itself still rides, deliberately: nulling
+     # an existing sidecar key would change its semantics for readers that
+     # already consume it. The figure is FLAGGED here, not withheld — acting
+     # on the flag is the consumer job. Same fail-closed predicate the page
+     # uses: anything that
+     # is not an explicit true carries a reason. ADDITIVE under the unchanged
+     # model-comparison-summary-v1 schema id — two new keys, none removed,
+     # none re-typed (temperloop#1742 review round 1).
+     # has()-guarded, never the // operator: jq treats a genuine `false` as
+     # absent, so `// null` would report an INCOMPARABLE axis as merely
+     # unknown — the one reading this field exists to prevent. (Same trap the
+     # confidence_interval.degenerate field above is guarded against.)
+     cost_axis_comparable:
+       ((.cost_basis.cross_vendor // {})
+        | if (type == "object") and has("comparable") then .comparable else null end),
+     cost_axis_unavailable_reason:
+       (if (.cost_basis.cross_vendor // null) == null then null
+        elif (.cost_basis.cross_vendor.comparable == true) then null
+        else (.cost_basis.cross_vendor.reason // "no reason stated") end),
      records_dir: (.records_dir // null),
      report_md: (if $md == "" then null else $md end)}' "$raw" >"$scratch/summary.json" 2>"$scratch/jq.err"; then
     ce "sidecar rendering failed: $(head -c 400 "$scratch/jq.err")"; exit 2

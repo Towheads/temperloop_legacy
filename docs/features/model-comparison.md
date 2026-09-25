@@ -821,7 +821,8 @@ non-JSON input, or a `schema_version` it does not understand is `CANNOT
 EVALUATE` at exit 2 with no Markdown written — a rendering of nothing would
 read as a report. The optional `--summary-out` sidecar
 (`model-comparison-summary-v1`: arms, verdict, winner or withheld reason,
-paired N against the floor) is the feed the `/telemetry` and `/check-in`
+paired N against the floor, and whether the cost axis is comparable — with
+the reason when it is not) is the feed the `/telemetry` and `/check-in`
 surfacing item (temperloop#2061) reads, so a finished comparison can reach
 the daily brief without anyone re-parsing Markdown.
 

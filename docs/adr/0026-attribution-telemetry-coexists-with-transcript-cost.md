@@ -91,3 +91,23 @@ not overturn the headline ownership that clause protects.
 - The disjointness is asserted mechanically, not by convention: a fixture
   proves the profiler's default `--format json` output is byte-identical
   with the side channel absent.
+- **The shared weighting carries a same-tariff assumption, and it is checked
+  rather than assumed** (temperloop#1742). The clause above — the attribution
+  stream inherits ADR 0020's cache-class weighting so the two producers "can
+  never disagree about how a token is counted" — buys that agreement with one
+  `SPEND_WEIGHT_*` set shared by every surface. Those weights are *relative
+  price multipliers read off a single vendor price sheet*, so any figure
+  denominated in them assumes the spend it summarises was **billed under the
+  same real-world tariff**. Within one vendor that holds, and in a comparison
+  the weights cancel out of the delta. Across two vendors it does not: a
+  different output:input ratio systematically mis-states one arm, and a token
+  class a vendor does not have prices as 0 rather than as *unmapped*. The
+  model-comparison producer therefore publishes a `cost_basis.cross_vendor`
+  verdict on every run and declares its cost axis **unavailable, with a named
+  reason**, rather than publishing a delta priced at one vendor's ratios.
+  Per-arm weights in a common currency are deliberately not built: a second
+  weight set would break the counting identity this ADR's "can never
+  disagree" clause depends on. Nothing about this rides the attribution
+  stream — the verdict is read off `candidate.provider` on the replay records
+  by the transcript-side producer, which keeps ownership of the figure it
+  qualifies.
