@@ -456,6 +456,16 @@ KERNEL_GATES=(
   # applies/rejects verdict, purge/prune, and the two named survival
   # fixtures (a machinery_version bump; a worktree add+remove).
   "bash workflows/scripts/model-comparison/tests/test_dual_build_ledger.sh"
+  # model-comparison: the judge REPEAT-VARIANCE sweep (temperloop#2266, the
+  # cheap half of temperloop#2209's noise-floor work) — judge-repeat.sh
+  # reconstructs a judge record pair from the ledger's own format-patch
+  # archives and re-judges it N times, so the judge's own run-to-run variance
+  # is separable from sample-to-sample variance without rebuilding anything.
+  # The suite is hermetic (recorded runner only, plus a canary `claude` on PATH
+  # that must never fire) and carries the isolation assertion that matters:
+  # a sweep writes NO calibration state, because a machine re-judge is not a
+  # blind human pair and must not move ADR 0041's calibration bar.
+  "bash workflows/scripts/model-comparison/tests/test_judge_repeat.sh"
   # model-comparison: the blind judge-calibration mode (temperloop#2082,
   # epic #2065 "new-work dual-build harness", ADR 0041) — dual-build-
   # ledger.sh's `calibrate-sample` / `calibrate-record` / `calibrate-status`
