@@ -133,21 +133,20 @@ fi
 # PR's time in the queue before it stops waiting and reports TIMEOUT.
 #
 # SIZING RULE (temperloop#2055): this value must exceed TWICE the slowest
-# healthy `checks` run across the repos that vendor this kernel. A queue round
-# trip runs `checks` twice — once on the PR branch, once on the merge_group
-# trial branch — so a ceiling below that doubled time makes TIMEOUT
-# structurally unreachable as a signal: a perfectly healthy PR runs the clock
-# out by construction, and a verdict that fires on healthy and stuck alike is
-# evidence of neither. Sized against the measured round trips (two `checks`
-# runs each): temperloop on the CI VM ~9 min, foundation on the VM ~12 min,
-# foundation on GitHub-hosted runners — the one-lane fallback, and the slowest
-# healthy case on record — ~42 min, from a `checks` job measured at 21 min per
-# run on 2026-09-15. Re-measure and raise this before onboarding a repo whose
-# `checks` job is slower than that; do not lower it to fit temperloop alone.
+# healthy `checks` run in the repo this kernel drives. A queue round trip runs
+# `checks` twice — once on the PR branch, once on the merge_group trial branch
+# — so a ceiling below that doubled time makes TIMEOUT structurally
+# unreachable as a signal: a perfectly healthy PR runs the clock out by
+# construction, and a verdict that fires on healthy and stuck alike is evidence
+# of neither. Sized against the slowest healthy `checks` run on record — ~21
+# min per run, so a ~42 min round trip, measured 2026-09-15. MEASURE YOUR OWN
+# and raise this if your `checks` job is slower than that; the per-repo
+# measurements behind the current value are on temperloop#2055.
 #
-# ACCEPTED TRADE: a wider ceiling reports a genuine stall LATER — up to 60 min
-# after enqueue rather than 30. That is affordable because the clock is no
-# longer the whole verdict: a deadline TIMEOUT carries `gate.sh diagnose-queue`'s
+# ACCEPTED TRADE: a wider ceiling reports a genuine stall LATER — up to the
+# full ceiling after enqueue, where the previous default allowed only half of
+# it. That is affordable because the clock is no longer the whole verdict: a
+# deadline TIMEOUT carries `gate.sh diagnose-queue`'s
 # classification as `reason` plus the full `diagnosis` (temperloop#1178), so a
 # slow-but-healthy QUEUED is distinguishable from a stall at the moment it
 # fires; and a zero-progress stall is NAMED at BUILD_QUEUE_STALL_AFTER below —
